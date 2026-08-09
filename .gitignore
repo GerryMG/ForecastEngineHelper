@@ -1,0 +1,92 @@
+# ─── Entorno virtual y dependencias ────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ─── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ─── Jupyter ───────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+.jupyter/
+.virtual_documents/
+# Notebooks ejecutados por el pipeline (nbconvert --inplace deja las salidas
+# con datos reales adentro). Los del repo van sin ejecutar.
+*.nbconvert.ipynb
+*.executed.ipynb
+
+# ─── Credenciales y conexión a Oracle ──────────────────────────────────────
+# Las credenciales van SIEMPRE por variable de entorno, nunca en el repo.
+.env
+.env.*
+!.env.example
+# tnsnames.ora, sqlnet.ora, listener.ora
+*.ora
+wallet/
+*.sso
+*.p12
+*.pfx
+*.jks
+*.key
+*.pem
+
+# ─── Datos ─────────────────────────────────────────────────────────────────
+# Nada de ventas ni SKs de clientes en el repo. Si alguna vez necesitás
+# versionar un archivo de ejemplo, forzalo con: git add -f muestra.csv
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.parquet
+*.pkl
+*.pickle
+*.feather
+*.dmp
+data/
+datos/
+salidas/
+output/
+
+# ─── Logs ──────────────────────────────────────────────────────────────────
+*.log
+logs/
+FC_LOG*.txt
+
+# ─── Prophet / cmdstanpy ───────────────────────────────────────────────────
+# Artefactos de compilación de Stan, si alguna vez quedan en el proyecto
+*.stan
+*.hpp
+httpstan/
+.cmdstan/
+
+# ─── Editores ──────────────────────────────────────────────────────────────
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── Sistema operativo ─────────────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+.DS_Store
