@@ -16,9 +16,14 @@ Variables de entorno:
     FC_MAX_WORKERS                      tope de procesos, para el límite del pod (opcional)
     FC_LOG_FILE                         archivo de log además de stdout (opcional)
 
-Origen y destino son dos conexiones distintas: pueden ser otro usuario, otro
-esquema u otra base. Si no definís las variables del destino, se usan las del
-origen y queda avisado en el log.
+Origen y destino son dos conexiones distintas y obligatorias. La tabla de salida
+vive en el esquema del destino y el usuario de origen no la ve: por eso cada
+función declara con qué conexión trabaja y falla si le pasás la otra, en vez de
+morir con un ORA-00942 confuso a mitad de la corrida.
+
+    conexión de ORIGEN   ->  leer_fuente()
+    conexión de DESTINO  ->  validar_tabla(), leer_salida_anterior(),
+                             leer_tabla_destino(), guardar()
 
 FORMATO DE LA TABLA DE SALIDA
 -----------------------------
@@ -69,13 +74,14 @@ from forecast_engine import ForecastConfig, available_models, floor_to_freq, shi
 # ═══════════════════════════════════════════════════════════════════════════
 #  1. CONEXIONES  (origen y destino son distintos)
 # ═══════════════════════════════════════════════════════════════════════════
+# Origen: sólo lee la métrica real. No ve la tabla de forecast.
 ORA_USER = os.getenv("ORA_USER", "APP_LECTURA")
 ORA_PASSWORD = os.getenv("ORA_PASSWORD", "")
 ORA_DSN = os.getenv("ORA_DSN", "srv-origen.midominio.com:1521/DWH")
 
-# Destino: si no están las variables, cae al origen y avisa por log.
-ORA_DEST_USER = os.getenv("ORA_DEST_USER") or ORA_USER
-ORA_DEST_PASSWORD = os.getenv("ORA_DEST_PASSWORD") or ORA_PASSWORD
+# Destino: el único que ve y escribe la tabla de forecast.
+ORA_DEST_USER = os.getenv("ORA_DEST_USER", "")
+ORA_DEST_PASSWORD = os.getenv("ORA_DEST_PASSWORD", "")
 ORA_DEST_DSN = os.getenv("ORA_DEST_DSN") or ORA_DSN
 
 # Sólo si necesitás modo thick (base 11g, wallet, Kerberos):
@@ -214,30 +220,55 @@ def configurar_logging(nombre: str) -> logging.Logger:
     return logging.getLogger(nombre)
 
 
+_ROL = "_fc_rol"     # marca que se le pone a la conexión para no confundirlas
+
+
 def _conectar(usuario: str, password: str, dsn: str, rol: str):
     if ORACLE_CLIENT_LIB and not getattr(_conectar, "_thick", False):
         oracledb.init_oracle_client(lib_dir=ORACLE_CLIENT_LIB)
         _conectar._thick = True
+    sufijo = "" if rol == "origen" else "_DEST"
+    if not usuario:
+        raise RuntimeError(f"Falta el usuario de {rol} (ORA{sufijo}_USER)")
     if not password:
-        raise RuntimeError(f"Falta la password del {rol} "
-                           f"({'ORA_PASSWORD' if rol == 'origen' else 'ORA_DEST_PASSWORD'})")
+        raise RuntimeError(f"Falta la password de {rol} (ORA{sufijo}_PASSWORD)")
     # con fetch_decimals en False, NUMBER(n,0) vuelve como int y el resto como float:
     # así una SK numérica conserva su valor exacto en las dos lecturas.
     oracledb.defaults.fetch_decimals = False
     conn = oracledb.connect(user=usuario, password=password, dsn=dsn)
     conn.autocommit = False
+    try:
+        setattr(conn, _ROL, rol)
+    except AttributeError:      # por si el driver no admite atributos extra
+        pass
     return conn
 
 
+def _exigir(conn, rol: str, que: str) -> None:
+    """Corta si la conexión no es la que corresponde para esa operación."""
+    actual = getattr(conn, _ROL, None)
+    if actual is None:
+        log.warning("%s: conexión sin identificar, no puedo verificar que sea la de %s", que, rol)
+    elif actual != rol:
+        raise RuntimeError(
+            f"{que} necesita la conexión de {rol} y recibió la de {actual}. "
+            + ("La tabla de salida vive en el esquema del destino y el usuario de origen no la ve: "
+               "usá `conexion_destino()`." if rol == "destino" else
+               "La fuente se lee con `conexion_origen()`."))
+
+
 def conexion_origen():
-    """Base de donde se lee la métrica real."""
+    """Base de donde se lee la métrica real. NO ve la tabla de forecast."""
     return _conectar(ORA_USER, ORA_PASSWORD, ORA_DSN, "origen")
 
 
 def conexion_destino():
-    """Base donde vive la tabla de forecast. Puede ser otro usuario u otra base."""
-    if (ORA_DEST_USER, ORA_DEST_DSN) == (ORA_USER, ORA_DSN):
-        log.warning("no hay conexión de destino configurada (ORA_DEST_*): se usa la de origen")
+    """Base donde vive la tabla de forecast. Es la única que la ve."""
+    if not ORA_DEST_USER:
+        raise RuntimeError(
+            "Falta ORA_DEST_USER. La tabla de salida está en otro esquema, al que el usuario de "
+            "origen no tiene acceso: hay que configurar ORA_DEST_USER, ORA_DEST_PASSWORD y "
+            "ORA_DEST_DSN (si el destino está en la misma base, alcanza con las dos primeras).")
     return _conectar(ORA_DEST_USER, ORA_DEST_PASSWORD, ORA_DEST_DSN, "destino")
 
 
@@ -297,18 +328,30 @@ def validar_tabla(conn, cfg: ForecastConfig) -> None:
     Se llama al principio de la corrida: es mucho mejor enterarse acá que
     después de media hora de cálculo con un ORA-00904.
     """
+    _exigir(conn, "destino", f"validar_tabla({TABLA_SALIDA})")
     owner, _, tabla = TABLA_SALIDA.rpartition(".")
+    # ALL_TAB_COLUMNS (no USER_TAB_COLUMNS) para que también funcione si la tabla
+    # es de otro esquema y el usuario de destino la ve por grant o sinónimo.
+    sql = "SELECT OWNER, COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = :t"
+    params = {"t": tabla.upper()}
     if owner:
-        sql = ("SELECT COLUMN_NAME FROM ALL_TAB_COLUMNS "
-               "WHERE OWNER = :o AND TABLE_NAME = :t")
-        params = {"o": owner.upper(), "t": tabla.upper()}
-    else:
-        sql = "SELECT COLUMN_NAME FROM USER_TAB_COLUMNS WHERE TABLE_NAME = :t"
-        params = {"t": tabla.upper()}
-    existentes = {r[0].upper() for r in _fetch_df(conn, sql, params).itertuples(index=False)}
+        sql += " AND OWNER = :o"
+        params["o"] = owner.upper()
+    encontrado = _fetch_df(conn, sql, params)
+    if len(encontrado):
+        duenos = sorted(set(encontrado["OWNER"]))
+        if len(duenos) > 1:
+            propio = [d for d in duenos if d.upper() == ORA_DEST_USER.upper()]
+            elegido = propio[0] if propio else duenos[0]
+            log.warning("hay %d tablas %s visibles (%s): se valida contra %s",
+                        len(duenos), tabla, ", ".join(duenos), elegido)
+            encontrado = encontrado[encontrado["OWNER"] == elegido]
+        log.info("tabla de salida: %s.%s", encontrado["OWNER"].iloc[0], tabla.upper())
+    existentes = {c.upper() for c in encontrado["COLUMN_NAME"]} if len(encontrado) else set()
     if not existentes:
-        raise RuntimeError(f"La tabla {TABLA_SALIDA} no existe o no es visible para {ORA_USER}.\n"
-                           f"Creala con:\n\n{ddl_sugerido(cfg)}")
+        raise RuntimeError(
+            f"El usuario de destino ({ORA_DEST_USER}) no ve la tabla {TABLA_SALIDA}: "
+            f"no existe o le falta el grant.\nSi hay que crearla:\n\n{ddl_sugerido(cfg)}")
     faltan = [(c, t) for c, t in columnas_requeridas(cfg) if c.upper() not in existentes]
     if faltan:
         alter = ", ".join(f"{c} {t}" for c, t in faltan)
@@ -346,6 +389,7 @@ def _normalizar_categorias(df: pd.DataFrame, cfg: ForecastConfig) -> pd.DataFram
 
 def leer_fuente(conn, cfg: ForecastConfig) -> pd.DataFrame:
     """Trae la métrica real desde la tabla de origen."""
+    _exigir(conn, "origen", "leer_fuente()")
     t0 = time.time()
     df = _fetch_df(conn, SQL_FUENTE)
     if df.empty:
@@ -388,6 +432,7 @@ def leer_tabla_destino(conn, cfg: ForecastConfig, meses: int | None = None,
     `meses` limita hacia atrás desde el mes en curso; `filtro` es un predicado
     SQL extra (ej. "SK_CLIENTE IN (900001, 900002)").
     """
+    _exigir(conn, "destino", "leer_tabla_destino()")
     cols = ([c.upper() for c in cfg.category_cols] + [FECHA_DB]
             + [c for c in _renombres(cfg)]
             + ([COLUMNAS_FIJAS["actualizado"]] if COLUMNAS_FIJAS.get("actualizado") else []))
@@ -420,6 +465,7 @@ def a_nombres_motor(df: pd.DataFrame, cfg: ForecastConfig) -> pd.DataFrame:
 
 def leer_salida_anterior(conn, cfg: ForecastConfig) -> pd.DataFrame | None:
     """Trae la salida de la corrida anterior, ya con los nombres que espera run()."""
+    _exigir(conn, "destino", "leer_salida_anterior()")
     renombres = _renombres(cfg)
     cols = [c.upper() for c in cfg.category_cols] + [FECHA_DB] + list(renombres)
     sql = (f"SELECT {', '.join(cols)}\n  FROM {TABLA_SALIDA}\n"
@@ -549,6 +595,7 @@ def guardar(conn, df_out: pd.DataFrame, cfg: ForecastConfig,
     Todo en una transacción: si el INSERT falla, el DELETE se deshace y la tabla
     queda como estaba. Ver `resolver_desde` para las opciones del rango.
     """
+    _exigir(conn, "destino", f"guardar() en {TABLA_SALIDA}")
     if df_out.empty:
         log.warning("no hay nada para guardar")
         return 0
