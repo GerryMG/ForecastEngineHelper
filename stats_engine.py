@@ -98,6 +98,11 @@ class StatsConfig:
     max_clientes_ajuste: Optional[int] = 20_000
     #: hilos para el ajuste y la probabilidad de actividad (None = todos los CPUs del pod)
     hilos_actividad: Optional[int] = None
+    #: categorías que segmentan la actividad: un modelo por cada combinación de valores
+    #: (vacío = un modelo para todo el panel). Tienen que estar en `categorias`.
+    segmentos_actividad: Sequence[str] = ()
+    #: un segmento con menos grupos que esto usa los parámetros del panel completo
+    min_clientes_segmento: int = 1_000
     incluir_historial: bool = True     #: armar BD_HISTORIAL
     decimales_historial: int = 2
     verbose: int = 1
@@ -116,7 +121,10 @@ class StatsConfig:
             raise ValueError("idd_unidad debe ser gon, grados o radianes")
         if self.modelo_actividad not in MODELOS_ACTIVIDAD:
             raise ValueError(f"modelo_actividad debe ser uno de {list(MODELOS_ACTIVIDAD)}")
-        faltan = [v for v in self.variantes if v not in self.dias_ventana or v not in self.meses_ventana]
+        fuera = [c for c in self.segmentos_actividad if c not in self.categorias]
+        if fuera:
+            raise ValueError(f"segmentos_actividad {fuera} tienen que estar en categorias {list(self.categorias)}")
+        faltan =[v for v in self.variantes if v not in self.dias_ventana or v not in self.meses_ventana]
         if faltan:
             raise ValueError(f"Variantes sin ventana definida: {faltan}")
 
@@ -175,6 +183,7 @@ class Contexto:
         self.margen = margen
         self.G = n_grupos
         self.hash_grupo: Optional[np.ndarray] = None    # identifica al grupo entre corridas
+        self.segmento: Optional[np.ndarray] = None      # segmento de actividad de cada grupo
 
     # -- helpers vectorizados ------------------------------------------------ #
     def suma(self, grupos: np.ndarray, valores: np.ndarray, mascara=None) -> np.ndarray:
@@ -282,32 +291,108 @@ class Contexto:
                          minlength=self.G * 12).reshape(self.G, 12)
         return self.media_std(n, s, ss)
 
-    # -- actividad (modelo ajustado una sola vez) ----------------------------- #
+    # -- actividad (un ajuste por segmento, o uno para todo el panel) ---------- #
     @cached_property
     def actividad(self) -> np.ndarray:
+        """P(activo) por grupo. Sin segmentos, un modelo para todo el panel. Con segmentos,
+        cada uno usa sus propios parámetros; si es chico (min_clientes_segmento) o su
+        ajuste quedó en el borde, usa los del panel completo (GLOBAL)."""
+        cfg = self.cfg
+        modelo = cfg.modelo_actividad
+        nombres = _NOMBRES_PARAMS[modelo]
         x = self.dias_compra - 1
         tx = (self.ultima - self.primera).astype(float)
         T = (self.f.d_ayer - self.primera).astype(float)
-        modelo = self.cfg.modelo_actividad
-        muestra = self.muestra_ajuste()
-        t0 = time.time()
-        params = ajustar_actividad(x[muestra], tx[muestra], T[muestra], modelo,
-                                   hilos=self.cfg.hilos_actividad)
-        self.parametros_actividad = dict(zip(_NOMBRES_PARAMS[modelo], params))
-        LOGGER.info("%s ajustado sobre %s de %s grupos en %.1fs: %s", MODELOS_ACTIVIDAD[modelo],
-                    f"{int(muestra.sum()):,}", f"{self.G:,}", time.time() - t0,
-                    ", ".join(f"{k}={v:.4f}" for k, v in self.parametros_actividad.items()))
-        return prob_activo(params, x, tx, T, modelo, hilos=self.cfg.hilos_actividad)
+        self.parametros_actividad: Dict[str, Dict[str, float]] = {}
+        self.detalle_actividad: List[Dict[str, Any]] = []
+        self.segmento_usado = np.full(self.G, "GLOBAL", dtype=object)
+        prob = np.empty(self.G)
 
-    def muestra_ajuste(self) -> np.ndarray:
-        """Grupos que participan del ajuste. La pertenencia sale de un hash de las
-        claves, no de un sorteo: un mismo cliente queda dentro o fuera todos los días,
-        así la probabilidad no oscila sólo porque cambió la muestra."""
+        def ajustar(nombre: str, mascara: Optional[np.ndarray], hilos: Optional[int] = cfg.hilos_actividad):
+            muestra = self.muestra_ajuste(mascara)
+            info: Dict[str, Any] = {}
+            t0 = time.time()
+            params = ajustar_actividad(x[muestra], tx[muestra], T[muestra], modelo,
+                                       hilos=hilos, info=info, etiqueta=nombre)
+            LOGGER.info("%s [%s] ajustado sobre %s de %s grupos en %.1fs: %s", MODELOS_ACTIVIDAD[modelo],
+                        nombre, f"{int(muestra.sum()):,}",
+                        f"{self.G if mascara is None else int(mascara.sum()):,}", time.time() - t0,
+                        ", ".join(f"{k}={v:.4f}" for k, v in zip(nombres, params)))
+            return params, info
+
+        def globales():
+            if "GLOBAL" not in self.parametros_actividad:
+                params, _ = ajustar("GLOBAL", None)
+                self.parametros_actividad["GLOBAL"] = dict(zip(nombres, params))
+            return tuple(self.parametros_actividad["GLOBAL"].values())
+
+        def anotar(segmento, n, usado, motivo, params):
+            fila = {"segmento": segmento, "grupos": n, "parametros": usado, "motivo": motivo,
+                    **dict(zip(nombres, params))}
+            if modelo == "pareto":
+                r, alpha, s, beta = params
+                fila["compra_cada_dias"] = alpha / r       # 1 / tasa media de compra
+                fila["vida_media_dias"] = beta / s          # 1 / tasa media de abandono
+            self.detalle_actividad.append(fila)
+
+        if self.segmento is None:
+            params = globales()
+            prob[:] = prob_activo(params, x, tx, T, modelo, hilos=cfg.hilos_actividad)
+            anotar("GLOBAL", self.G, "GLOBAL", "", params)
+            return prob
+
+        codigos, etiquetas = pd.factorize(self.segmento, sort=True)
+        orden = np.argsort(codigos, kind="stable")
+        bordes = np.r_[0, np.cumsum(np.bincount(codigos, minlength=len(etiquetas)))]
+        miembros = [orden[bordes[k]:bordes[k + 1]] for k in range(len(etiquetas))]
+        grandes = [k for k, idx in enumerate(miembros) if len(idx) >= cfg.min_clientes_segmento]
+
+        # los segmentos se ajustan en paralelo, repartiendo los CPUs entre ellos
+        cpus = cfg.hilos_actividad or _cpus_disponibles()
+        por_ajuste = max(1, cpus // max(len(grandes), 1))
+
+        def ajustar_segmento(k):
+            mascara = np.zeros(self.G, dtype=bool)
+            mascara[miembros[k]] = True
+            return ajustar(etiquetas[k], mascara, por_ajuste)
+
+        if cpus > 1 and len(grandes) > 1:
+            with ThreadPoolExecutor(min(cpus, len(grandes))) as pool:
+                ajustes = dict(zip(grandes, pool.map(ajustar_segmento, grandes)))
+        else:
+            ajustes = {k: ajustar_segmento(k) for k in grandes}
+
+        for k, seg in enumerate(etiquetas):
+            idx = miembros[k]
+            n = len(idx)
+            if k not in ajustes:
+                motivo = f"{n:,} grupos, menos que min_clientes_segmento ({cfg.min_clientes_segmento:,})"
+            else:
+                params, info = ajustes[k]
+                motivo =(f"ajuste en el borde ({', '.join(info['en_borde'])}): el segmento casi no "
+                          f"muestra abandono, o todos abandonan") if info["en_borde"] else ""
+            if motivo:
+                LOGGER.info("segmento [%s] usa los parámetros GLOBAL: %s", seg, motivo)
+                params, usado = globales(), "GLOBAL"
+            else:
+                self.parametros_actividad[seg] = dict(zip(nombres, params))
+                usado = seg
+            prob[idx] = prob_activo(params, x[idx], tx[idx], T[idx], modelo, hilos=cfg.hilos_actividad)
+            self.segmento_usado[idx] = usado
+            anotar(seg, n, usado, motivo, params)
+        return prob
+
+    def muestra_ajuste(self, mascara: Optional[np.ndarray] = None) -> np.ndarray:
+        """Grupos que participan del ajuste (dentro de `mascara`, si viene). La pertenencia
+        sale de un hash de las claves, no de un sorteo: un mismo cliente queda dentro o
+        fuera todos los días, así la probabilidad no oscila sólo porque cambió la muestra."""
+        todos = np.ones(self.G, dtype=bool) if mascara is None else mascara
+        n = int(todos.sum())
         n_max = self.cfg.max_clientes_ajuste
-        if not n_max or self.G <= n_max or self.hash_grupo is None:
-            return np.ones(self.G, dtype=bool)
+        if not n_max or n <= n_max or self.hash_grupo is None:
+            return todos
         u = (self.hash_grupo >> np.uint64(11)).astype(np.float64) / float(2 ** 53)
-        return u < n_max / self.G
+        return todos & (u < n_max / n)
 
 
 # --------------------------------------------------------------------------- #
@@ -623,6 +708,11 @@ def prob_inactivo_col(ctx: Contexto) -> np.ndarray:
     return 1.0 - ctx.actividad
 
 
+def segmento_actividad_col(ctx: Contexto) -> np.ndarray:
+    ctx.actividad
+    return ctx.segmento_usado
+
+
 def _log_a0_pareto(r, alpha, s, beta, x, tx, T):
     """log A0 de Pareto/NBD (Fader, Hardie & Lee 2005, nota de implementación).
 
@@ -669,9 +759,10 @@ def _log_verosimilitud(p, x, tx, T, modelo):
     return a1 + a2 + np.logaddexp(a3, a4)
 
 
-def ajustar_actividad(x, tx, T, modelo: str = "pareto",
-                      hilos: Optional[int] = None) -> Tuple[float, float, float, float]:
-    """Ajusta el modelo de actividad por máxima verosimilitud sobre todo el panel.
+def ajustar_actividad(x, tx, T, modelo: str = "pareto", hilos: Optional[int] = None,
+                      info: Optional[dict] = None, etiqueta: str = "") -> Tuple[float, float, float, float]:
+    """Ajusta el modelo de actividad por máxima verosimilitud sobre los grupos recibidos.
+    Si viene `info`, deja ahí `convergio` y `en_borde` (parámetros pegados al límite).
 
     x  = compras repetidas (días de compra - 1)
     tx = días entre la primera y la última compra
@@ -707,13 +798,16 @@ def ajustar_actividad(x, tx, T, modelo: str = "pareto",
     finally:
         if pool is not None:
             pool.shutdown()
+    donde = f" [{etiqueta}]" if etiqueta else ""
     if not res.success:
-        LOGGER.warning("el ajuste de actividad no convergió del todo: %s", res.message)
-    en_borde = np.abs(res.x) > 11.5
-    if en_borde.any():
-        LOGGER.warning("el ajuste de actividad quedó en el borde (%s): los datos casi no muestran "
+        LOGGER.warning("el ajuste de actividad%s no convergió del todo: %s", donde, res.message)
+    en_borde = [n for n, b in zip(_NOMBRES_PARAMS[modelo], np.abs(res.x) > 11.5) if b]
+    if info is not None:
+        info.update(convergio=bool(res.success), en_borde=en_borde)
+    if en_borde:
+        LOGGER.warning("el ajuste de actividad%s quedó en el borde (%s): los datos casi no muestran "
                        "abandono, o todos abandonan, y las probabilidades se concentran en 0 o 1",
-                       ", ".join(np.array(_NOMBRES_PARAMS[modelo])[en_borde]))
+                       donde, ", ".join(en_borde))
     q = np.exp(res.x)
     if modelo == "pareto":
         return float(q[0]), float(q[1] * escala), float(q[2]), float(q[3] * escala)
@@ -887,7 +981,15 @@ def catalogo(cfg: Optional[StatsConfig] = None) -> List[Metrica]:
 
     # G. Actividad
     modelo = MODELOS_ACTIVIDAD[cfg.modelo_actividad]
-    add("MT_PROB_ACTIVO", f"Probabilidad de que el cliente siga activo (modelo {modelo} ajustado sobre todo el panel).", prob_activo_col)
+    seg = list(cfg.segmentos_actividad)
+    alcance = (f"ajustado por segmento de {', '.join(seg)}; ver BD_SEGMENTO_ACTIVIDAD" if seg
+               else "ajustado sobre todo el panel")
+    add("MT_PROB_ACTIVO", f"Probabilidad de que el cliente siga activo (modelo {modelo} {alcance}).", prob_activo_col)
+    add("BD_SEGMENTO_ACTIVIDAD",
+        (f"Parámetros usados para MT_PROB_ACTIVO: el segmento ({' | '.join(seg)}) o GLOBAL si el segmento tiene "
+         f"menos de {cfg.min_clientes_segmento:,} grupos o su ajuste no fue confiable." if seg
+         else "Parámetros usados para MT_PROB_ACTIVO: GLOBAL (sin segmentación)."),
+        segmento_actividad_col, tipo="VARCHAR2(400)")
 
     # E. Años
     add("MT_ANIO_INICIAL", "Año calendario de la primera compra.", anio_inicial)
@@ -988,6 +1090,12 @@ class StatsEngine:
                        np.add.reduceat(margen[orden], nuevo),
                        int(g.max()) + 1)
         ctx.hash_grupo = pd.util.hash_pandas_object(cats[claves], index=False).to_numpy(np.uint64)
+        if cfg.segmentos_actividad:
+            etiqueta = None
+            for c in cfg.segmentos_actividad:
+                txt = cats[c].astype(str).where(cats[c].notna(), "(sin dato)")
+                etiqueta = txt if etiqueta is None else etiqueta + " | " + txt
+            ctx.segmento = etiqueta.to_numpy(dtype=object)
         return ctx, cats
 
     def run(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1014,6 +1122,10 @@ class StatsEngine:
         LOGGER.info("estadísticas: %s filas x %d columnas en %.1fs", f"{len(out):,}",
                     out.shape[1], time.time() - t_inicio)
         return out
+
+    def actividad_segmentos(self) -> pd.DataFrame:
+        """Después de run(): parámetros de cada segmento, cuáles se usaron y por qué."""
+        return pd.DataFrame(getattr(self.ctx, "detalle_actividad", []))
 
     def tiempos(self, top: int = 10) -> pd.Series:
         """Qué columnas tardaron más (las compartidas se cargan a la primera que las usa)."""

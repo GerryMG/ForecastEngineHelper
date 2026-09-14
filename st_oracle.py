@@ -88,6 +88,13 @@ CATEGORIAS = ["SK_CLIENTE", "BD_CLIENTE"]
 # Tipo Oracle de cada categoría. Por defecto: SK_/BK_ -> NUMBER, BD_ -> VARCHAR2(200).
 TIPOS_CATEGORIA: dict = {}
 
+# Probabilidad de actividad por segmento: un modelo por cada combinación de valores de estas
+# categorías. Tienen que estar en CATEGORIAS (y en SQL_FUENTE). [] = un modelo para todo el panel.
+# Para un atributo del cliente usá una descripción BD_ (ej. "BD_CANAL"): agregar una clave SK_/BK_
+# cambia el grano de la tabla (una fila por cliente y canal), salvo que ya sea parte de él.
+SEGMENTOS_ACTIVIDAD: list = []
+MIN_CLIENTES_SEGMENTO = 1_000     # un segmento más chico usa los parámetros del panel completo
+
 COL_FECHA = "FECHA"
 COL_VENTA = "MT_VENTA"
 COL_MARGEN = "MT_MARGEN"          # margen bruto en USD (venta - costo)
@@ -140,7 +147,9 @@ def build_config(fecha_ejecucion: str | None = None) -> StatsConfig:
         margen_escala=100.0,      # márgenes en %
 
         modelo_actividad="pareto",     # el mejor en las pruebas; alternativas: mbgnbd, bgnbd
-        max_clientes_ajuste=20_000,    # los 4 parámetros se estiman sobre esta muestra estable
+        max_clientes_ajuste=20_000,    # los 4 parámetros se estiman sobre esta muestra estable (por segmento)
+        segmentos_actividad=SEGMENTOS_ACTIVIDAD,
+        min_clientes_segmento=MIN_CLIENTES_SEGMENTO,
 
         incluir_historial=True,   # la incremental lo necesita
         decimales_historial=2,
@@ -490,12 +499,31 @@ def anotar(out: pd.DataFrame, cfg: StatsConfig, plan: Plan, fuente: pd.DataFrame
 
 
 # ─── escritura ──────────────────────────────────────────────────────────────
+ORACLE_NUMBER_MIN = 1e-130           # |x| menor que esto (y distinto de 0) Oracle no lo representa
+ORACLE_NUMBER_MAX = 9.99999999e125   # |x| desde 1e126 tampoco
+
+
+def _rango_oracle(a: np.ndarray) -> Tuple[np.ndarray, int, int]:
+    """Lleva los floats al rango de NUMBER: casi cero -> 0, enormes -> ±máximo.
+    Devuelve (array, cuántos casi cero, cuántos enormes). NaN/inf no se tocan."""
+    abs_ = np.abs(a)
+    chicos = (abs_ < ORACLE_NUMBER_MIN) & (abs_ > 0)
+    grandes = np.isfinite(a) & (abs_ > ORACLE_NUMBER_MAX)
+    if chicos.any() or grandes.any():
+        a = a.copy()
+        a[chicos] = 0.0
+        a[grandes] = np.sign(a[grandes]) * ORACLE_NUMBER_MAX
+    return a, int(chicos.sum()), int(grandes.sum())
+
+
 def _a_python(arr: np.ndarray, tipo: str) -> list:
-    """Columna -> valores que oracledb entiende. NaN/inf -> None."""
+    """Columna -> valores que oracledb entiende. NaN/inf -> None; fuera de rango -> dentro."""
     if tipo == "NUMBER":
         if arr.dtype.kind in "iu":
             return arr.astype(object).tolist()
         a = pd.to_numeric(pd.Series(arr), errors="coerce").to_numpy(float)
+        with np.errstate(invalid="ignore"):
+            a = _rango_oracle(a)[0]
         o = a.astype(object)
         o[~np.isfinite(a)] = None
         return o.tolist()
@@ -529,6 +557,15 @@ def guardar(conn, df: pd.DataFrame, cfg: StatsConfig) -> int:
     sql = (f"INSERT INTO {TABLA_DESTINO} ({', '.join(nombres)}, FECHA_CARGA)\n"
            f"VALUES ({', '.join(f':{i + 1}' for i in range(len(nombres)))}, SYSDATE)")
     datos = [df[c].to_numpy() for c in nombres]
+    ajustes = {}
+    for c, a, t in zip(nombres, datos, tipos):
+        if t == "NUMBER" and a.dtype.kind == "f":
+            with np.errstate(invalid="ignore"):
+                _, chicos, grandes = _rango_oracle(a)
+            if chicos or grandes:
+                ajustes[c] = f"{chicos} casi cero -> 0, {grandes} fuera de máximo"
+    if ajustes:
+        log.warning("valores fuera del rango de Oracle NUMBER ajustados: %s", ajustes)
 
     t0 = time.time()
     try:
@@ -559,10 +596,11 @@ def guardar(conn, df: pd.DataFrame, cfg: StatsConfig) -> int:
 def resumen(motor: StatsEngine, df: pd.DataFrame) -> None:
     log.info("%s filas x %d columnas | corte %s", f"{len(df):,}", df.shape[1],
              motor.fechas.ayer.date())
-    params = getattr(motor.ctx, "parametros_actividad", None)
-    if params:
-        log.info("modelo de actividad %s: %s", MODELOS_ACTIVIDAD[motor.cfg.modelo_actividad],
-                 ", ".join(f"{k}={v:.4f}" for k, v in params.items()))
+    seg = motor.actividad_segmentos()
+    if len(seg):
+        propios = int((seg["parametros"] != "GLOBAL").sum())
+        log.info("actividad %s: %d segmento(s), %d con parámetros propios, %d con GLOBAL",
+                 MODELOS_ACTIVIDAD[motor.cfg.modelo_actividad], len(seg), propios, len(seg) - propios)
     nulos = df.isna().mean().sort_values(ascending=False)
     nulos = nulos[nulos > 0].head(8)
     if len(nulos):
