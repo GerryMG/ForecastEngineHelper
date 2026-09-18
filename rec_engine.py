@@ -123,17 +123,30 @@ class RecConfig:
     verbose: int = 1
 
     # -- derivados ---------------------------------------------------------- #
+    @staticmethod
+    def _separar(columnas: Sequence[str]) -> Tuple[List[str], List[str]]:
+        """(claves, descripciones). Por convención SK_/BK_ agrupan y BD_ describen.
+
+        Si no hay ninguna SK_/BK_, se agrupa por todas: "recomendar a nivel BD_SUBMARCA"
+        quiere decir que esa columna ES la clave, no una descripción de otra cosa.
+        """
+        cols = [str(c) for c in columnas]
+        claves = [c for c in cols if not c.upper().startswith("BD_")]
+        if not claves:
+            return cols, []
+        return claves, [c for c in cols if c.upper().startswith("BD_")]
+
     def claves_entidad(self) -> List[str]:
-        return [c for c in self.entidad if not str(c).upper().startswith("BD_")]
+        return self._separar(self.entidad)[0]
 
     def desc_entidad(self) -> List[str]:
-        return [c for c in self.entidad if str(c).upper().startswith("BD_")]
+        return self._separar(self.entidad)[1]
 
     def claves_item(self) -> List[str]:
-        return [c for c in self.item if not str(c).upper().startswith("BD_")]
+        return self._separar(self.item)[0]
 
     def desc_item(self) -> List[str]:
-        return [c for c in self.item if str(c).upper().startswith("BD_")]
+        return self._separar(self.item)[1]
 
     def columnas(self) -> List[str]:
         cols = list(self.entidad) + list(self.item) + list(self.segmentos) + [
@@ -145,10 +158,10 @@ class RecConfig:
         return cols
 
     def validate(self) -> None:
-        if not self.claves_entidad():
-            raise ValueError("entidad necesita al menos una categoría clave (SK_/BK_)")
-        if not self.claves_item():
-            raise ValueError("item necesita al menos una categoría clave (SK_/BK_)")
+        if not list(self.entidad):
+            raise ValueError("entidad no puede estar vacía: es a quién se le recomienda")
+        if not list(self.item):
+            raise ValueError("item no puede estar vacío: es qué se recomienda")
         repetidas = set(self.claves_entidad()) & set(self.claves_item())
         if repetidas:
             raise ValueError(f"las claves {sorted(repetidas)} están en entidad y en item")
@@ -330,6 +343,10 @@ def preparar(df: pd.DataFrame, cfg: RecConfig, fechas: Fechas) -> Panel:
     if df.empty:
         raise ValueError("No quedan filas hasta ayer")
 
+    for que, columnas in (("entidad", cfg.claves_entidad()), ("item", cfg.claves_item())):
+        vacias = [c for c in columnas if df[c].isna().all()]
+        if vacias:
+            raise ValueError(f"las columnas {vacias} de {que} vienen todas nulas: revisá el SQL")
     ent, entidades = _codificar(df, cfg.claves_entidad())
     item, items = _codificar(df, cfg.claves_item())
     entidades = pd.concat([entidades, _ultimo_valor(df, ent, len(entidades), cfg.desc_entidad(), dia)], axis=1)
@@ -1178,13 +1195,25 @@ def explorar(df: pd.DataFrame, cfg_base: RecConfig,
     from dataclasses import replace
     from itertools import product
 
+    if isinstance(niveles_item, str) or (niveles_item and isinstance(niveles_item[0], str)):
+        raise ValueError("niveles_item es una lista DE LISTAS: [[\"BK_SUBMARCA\", \"BD_SUBMARCA\"], "
+                         "[\"BK_FAMILIA\", \"BD_FAMILIA\"]]")
     rejilla = dict(rejilla or {})
+    desconocidas = [k for k in rejilla if k not in cfg_base.__dataclass_fields__]
+    if desconocidas:
+        raise ValueError(f"la rejilla tiene llaves que no son parámetros: {desconocidas}. "
+                         f"Se pueden barrer, por ejemplo: afinidad, min_soporte, min_penetracion, "
+                         f"min_entidades_segmento, k_vecinos, k_factores, k_clusters, dias_afinidad")
     claves = list(rejilla)
     combos = [dict(zip(claves, valores)) for valores in product(*(rejilla[k] for k in claves))] or [{}]
     niveles = [list(n) for n in (niveles_item or [list(cfg_base.item)])]
     filas = []
     for nivel in niveles:
+        faltan = [c for c in nivel if c not in df.columns]
+        if faltan:
+            raise KeyError(f"el nivel {nivel} pide columnas que no están en la fuente: {faltan}")
         cfg_nivel = replace(cfg_base, item=nivel, seleccion="backtest", verbose=0)
+        cfg_nivel.validate()
         f = Fechas.desde(cfg_base.fecha_ejecucion)
         t0 = time.time()
         panel = preparar(df, cfg_nivel, f)
