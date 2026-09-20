@@ -130,7 +130,8 @@ ETIQUETAS_TAMANO = ["CHICO", "MEDIANO", "GRANDE", "TOP"]
 # ═══════════════════════════════════════════════════════════════════════════
 #  3. PARÁMETROS DEL CÁLCULO
 # ═══════════════════════════════════════════════════════════════════════════
-DIAS_AFINIDAD = 365            # ventana con la que se arma la matriz de compras
+DIAS_AFINIDAD = 365            # ventana de la matriz de compras. 0 = TODA la historia
+FECHA_INICIO_FUENTE = "1900-01-01"   # desde dónde leer cuando DIAS_AFINIDAD = 0
 DIAS_BACKTEST = 90             # tramo final que se reserva para medir aciertos
 MIN_ENTIDADES_SEGMENTO = 200   # menos que esto y el segmento sube de nivel
 MIN_SOPORTE = 5                # entidades del segmento que tienen que comprar el ítem
@@ -146,6 +147,36 @@ PESOS: dict = {}               # sólo para seleccion="ponderado", por ejemplo {
 TIPOS_RECOMENDACION = ("CRUZADA", "REPOSICION", "BRECHA")
 FACTOR_REPOSICION = 1.5        # silencio mayor a esto x su intervalo típico = atrasado
 BRECHA_RATIO = 0.5             # compra menos de la mitad de lo que le dedican sus pares
+
+# ── Cómo se estima el valor ────────────────────────────────────────────────
+# Los tres tipos se miden igual: USD esperados en los próximos HORIZONTE_DIAS. Así el
+# ranking compara lo mismo y no mezcla "lo que gasta un par al año" con "lo que dejó de
+# comprar en 300 días".
+HORIZONTE_DIAS = 90
+# Cuánta evidencia de los pares se le presta al cliente con poca historia propia.
+# 3 significa "sus datos valen tanto como los del segmento cuando tiene 3 intervalos".
+# 0 = no prestar nada.
+PESO_PRIOR_PARES = 3.0
+# Multiplicar por la probabilidad de que la compra ocurra (recompra en reposición, tasa de
+# adopción medida por el backtest en cruzada).
+USAR_PROBABILIDAD = True
+# Pesar la afinidad por recencia: lo de hace N días pesa la mitad. 0 = todo pesa igual.
+VIDA_MEDIA_AFINIDAD_DIAS = 0
+# Por qué se ordena la lista de cada cliente:
+#   "esperado" : USD por probabilidad. Asigna bien el esfuerzo del vendedor.
+#   "bruto"    : el tamaño de la oportunidad sin descontar la probabilidad. Deja arriba a
+#                los clientes muy atrasados, que son campañas de recuperación.
+ORDENAR_POR = "esperado"
+PISO_PROB = 0.0       # piso de la probabilidad; 0,05 le deja una chance mínima a lo muy atrasado
+MIN_CASOS_RECUPERACION = 30   # casos para creerle a la curva de un ítem; con menos, la del panel
+
+# ── Cuánta evidencia se exige ──────────────────────────────────────────────
+MIN_COMPRAS_REPOSICION = 2     # días de compra del par. Con 1 no hay ritmo propio pero el
+                               # segmento lo presta; subilo a 3 si querés ser conservador
+MAX_CV_INTERVALO = 1.0         # qué tan irregular puede ser el ritmo PROPIO. None = no filtrar
+MIN_DIAS_COMPRA_ENTIDAD = 3    # días de compra de la entidad para recomendarle algo
+TOPE_POTENCIAL_POR_HISTORICO = 1.5   # veces el propio ritmo de compra del ítem. 0 = sin tope
+TOPE_POTENCIAL_RELATIVO = 1.0        # veces su compra total en el mismo lapso. 0 = sin tope
 
 
 def build_config(fecha_ejecucion: str | None = None, seleccion: str | None = None) -> RecConfig:
@@ -185,6 +216,18 @@ def build_config(fecha_ejecucion: str | None = None, seleccion: str | None = Non
         incluir_tipos=TIPOS_RECOMENDACION,
         factor_reposicion=FACTOR_REPOSICION,
         brecha_ratio=BRECHA_RATIO,
+        min_compras_reposicion=MIN_COMPRAS_REPOSICION,
+        max_cv_intervalo=MAX_CV_INTERVALO,
+        min_dias_compra_entidad=MIN_DIAS_COMPRA_ENTIDAD,
+        horizonte_dias=HORIZONTE_DIAS,
+        peso_prior_pares=PESO_PRIOR_PARES,
+        usar_probabilidad=USAR_PROBABILIDAD,
+        vida_media_afinidad_dias=VIDA_MEDIA_AFINIDAD_DIAS,
+        ordenar_por=ORDENAR_POR,
+        piso_prob=PISO_PROB,
+        min_casos_recuperacion=MIN_CASOS_RECUPERACION,
+        tope_potencial_por_historico=TOPE_POTENCIAL_POR_HISTORICO,
+        tope_potencial_relativo=TOPE_POTENCIAL_RELATIVO,
     )
 
 
@@ -366,8 +409,11 @@ def validar_tabla(conn, cfg: RecConfig) -> None:
 
 # ─── lectura ────────────────────────────────────────────────────────────────
 def ventana(cfg: RecConfig) -> Tuple[pd.Timestamp, pd.Timestamp]:
-    """Desde cuándo hay que leer la fuente: la afinidad más el tramo del backtest."""
+    """Desde cuándo hay que leer la fuente: la afinidad más el tramo del backtest.
+    Con DIAS_AFINIDAD = 0 se lee toda la historia desde FECHA_INICIO_FUENTE."""
     f = Fechas.desde(cfg.fecha_ejecucion)
+    if not cfg.dias_afinidad:
+        return pd.Timestamp(FECHA_INICIO_FUENTE).normalize(), f.hoy
     dias = cfg.dias_afinidad + (cfg.dias_backtest if cfg.seleccion == "backtest" else 0)
     return (f.ayer - pd.Timedelta(days=dias - 1)).normalize(), f.hoy
 

@@ -70,7 +70,8 @@ Variables de entorno: `ST_MODO`, `ST_RELEER_MESES`, `ST_RELEER_DESDE`, `ST_FECHA
 
 | Perilla | Qué hace | Default |
 |---|---|---|
-| `DIAS_AFINIDAD` | ventana con la que se arma la matriz | 365 |
+| `DIAS_AFINIDAD` | ventana con la que se arma la matriz. **0 = toda la historia** | 365 |
+| `FECHA_INICIO_FUENTE` | desde dónde leer cuando `DIAS_AFINIDAD = 0` | 1900-01-01 |
 | `DIAS_BACKTEST` | tramo final reservado para medir aciertos | 90 |
 | `MIN_ENTIDADES_SEGMENTO` | menos que esto y el segmento sube de nivel | 200 |
 | `MIN_SOPORTE`, `MIN_PENETRACION` | cuántas entidades del segmento tienen que comprar el ítem | 5 / 2% |
@@ -81,6 +82,38 @@ Variables de entorno: `ST_MODO`, `ST_RELEER_MESES`, `ST_RELEER_DESDE`, `ST_FECHA
 | `TIPOS_RECOMENDACION` | CRUZADA, REPOSICION, BRECHA | las tres |
 | `FACTOR_REPOSICION` | silencio mayor a esto × su intervalo típico = atrasado | 1,5 |
 | `BRECHA_RATIO` | compra menos de esta fracción de lo que le dedican sus pares | 0,5 |
+
+### Cómo se estima el valor
+
+Los tres tipos se miden igual: **USD esperados en los próximos `HORIZONTE_DIAS`**, que es
+`MT_USD_SI_COMPRA × MT_PROB`.
+
+| Perilla | Qué hace | Default |
+|---|---|---|
+| `HORIZONTE_DIAS` | el plazo de la estimación y la unidad común de los tres tipos | 90 |
+| `PESO_PRIOR_PARES` | cuánta evidencia de los pares se le presta al que tiene poca propia. Con 1 compra manda el segmento; con 20, manda él. 0 = no prestar | 3,0 |
+| `USAR_PROBABILIDAD` | multiplicar por la probabilidad de recompra (reposición) o de adopción medida por el backtest (cruzada) | True |
+| `MIN_CASOS_RECUPERACION` | casos para creerle a la curva de recuperación de un ítem; con menos se usa la del panel | 30 |
+| `ORDENAR_POR` | `esperado` (rinde por visita) o `bruto` (tamaño de la oportunidad, para campañas de recuperación) | esperado |
+| `PISO_PROB` | piso de la probabilidad; con 0,05 lo muy atrasado no vale cero | 0,0 |
+| `VIDA_MEDIA_AFINIDAD_DIAS` | pesar la afinidad por recencia: lo de hace N días pesa la mitad. 0 = todo igual | 0 |
+
+### Evidencia exigida y topes del potencial
+
+| Perilla | Qué hace | Default |
+|---|---|---|
+| `MIN_COMPRAS_REPOSICION` | días de compra propios del par. Con 1 no hay ritmo propio, pero el segmento lo presta; 3 es lo conservador | 2 |
+| `MAX_CV_INTERVALO` | desvío sobre promedio de los intervalos. Filtra al que compra salteado. `None` = no filtrar | 1,0 |
+| `MIN_DIAS_COMPRA_ENTIDAD` | días de compra de la entidad para recomendarle algo | 3 |
+| `TOPE_POTENCIAL_POR_HISTORICO` | veces el propio ritmo de compra del ítem. `0` = sin tope | 1,5 |
+| `TOPE_POTENCIAL_RELATIVO` | veces su compra total en el mismo lapso. `0` = sin tope | 1,0 |
+
+La evidencia queda en la tabla: `MT_DIAS_COMPRA_ITEM` (cuántas veces lo compró), `MT_INTERVALO_TIPICO`
+(su propio ritmo, vacío si no tiene), `MT_INTERVALO_ESPERADO` (el estimado, mezclando con los pares),
+`MT_COMPRAS_ESPERADAS`, `MT_PROB`, `MT_USD_SI_COMPRA` y `MT_DIAS_COMPRA_ENTIDAD`.
+
+Sale **una fila por cliente e ítem**: si un ítem califica como reposición y como brecha, queda el tipo
+que mejor lo explica.
 
 Variables de entorno: `RC_FECHA_EJECUCION`, `RC_SELECCION`, `RC_DRY_RUN`.
 Para calibrar: `RC_NIVELES` y `RC_REJILLA` (JSON) en `calibrar_recomendaciones.ipynb`.

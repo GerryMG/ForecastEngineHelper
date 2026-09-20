@@ -87,7 +87,8 @@ class RecConfig:
     etiquetas_tamano: Sequence[str] = ("CHICO", "MEDIANO", "GRANDE", "TOP")
 
     # -- ventanas ----------------------------------------------------------- #
-    dias_afinidad: int = 365           #: ventana que arma la matriz de compras
+    #: ventana que arma la matriz de compras. 0 = TODA la historia que traiga la fuente.
+    dias_afinidad: int = 365
     dias_backtest: int = 90            #: tramo final reservado para medir aciertos
 
     # -- recortes ----------------------------------------------------------- #
@@ -113,10 +114,50 @@ class RecConfig:
     # -- tipos de recomendación --------------------------------------------- #
     incluir_tipos: Sequence[str] = TIPOS
     factor_reposicion: float = 1.5     #: silencio > factor x intervalo típico del par
-    min_compras_reposicion: int = 2    #: días de compra mínimos para hablar de intervalo
+    #: días de compra que necesita un par para hablar de "su ritmo". Con 2 compras hay un
+    #: solo hueco y el ritmo es una casualidad, no un ritmo: el mínimo razonable es 3.
+    min_compras_reposicion: int = 3
+    #: qué tan irregular puede ser: desvío / promedio de los intervalos. None = no filtrar.
+    #: Un cliente que compró en enero, en marzo y en diciembre no está "atrasado".
+    max_cv_intervalo: Optional[float] = 1.0
     brecha_ratio: float = 0.5          #: compra menos de esta fracción de lo que compran sus pares
+
+    # -- topes del USD potencial --------------------------------------------- #
     escalar_potencial: bool = True     #: ajusta el USD potencial por tamaño de la entidad
     tope_escala: float = 3.0           #: tope de ese ajuste
+    #: horizonte de la estimación: "USD esperados en los próximos N días". Es la unidad
+    #: común de los tres tipos, para que el ranking compare lo mismo.
+    horizonte_dias: int = 90
+    #: cuánta evidencia de los pares se le presta al cliente que tiene poca propia.
+    #: k = 3 significa "sus datos valen tanto como los pares cuando tiene 3 intervalos".
+    #: 0 = no prestar nada (sólo su historia).
+    peso_prior_pares: float = 3.0
+    #: multiplicar el valor por la probabilidad de que la compra ocurra:
+    #: recompra (reposición, por la distribución de intervalos del segmento) y
+    #: adopción (cruzada, por la tasa que midió el backtest en ese segmento).
+    usar_probabilidad: bool = True
+    #: vida media para pesar la afinidad por recencia: lo de hace `n` días pesa la mitad.
+    #: 0 = todo pesa igual. Sirve cuando el mix de compra cambia con el tiempo.
+    vida_media_afinidad_dias: int = 0
+    #: casos mínimos para creerle a la curva de recuperación de un ítem; con menos, se usa
+    #: la del panel entero.
+    min_casos_recuperacion: int = 30
+    #: por qué se ordena. "esperado" = USD por probabilidad (asigna bien el esfuerzo del
+    #: vendedor); "bruto" = el tamaño de la oportunidad sin descontar la probabilidad
+    #: (deja arriba a los clientes muy atrasados, que son campañas de recuperación).
+    ordenar_por: str = "esperado"
+    #: piso de la probabilidad. Con 0, un ítem que nadie recupera nunca vale 0 y cae al
+    #: fondo; con 0,05 se le deja una chance mínima y sigue compitiendo.
+    piso_prob: float = 0.0
+    #: la reposición no puede valer más que esta fracción de lo que la entidad compró de
+    #: ESE ítem en la ventana. 0 = sin tope.
+    tope_potencial_por_historico: float = 1.0
+    #: ninguna recomendación puede valer más que esta fracción de la compra total de la
+    #: entidad en la ventana. 0 = sin tope.
+    tope_potencial_relativo: float = 1.0
+    #: días de compra mínimos de la ENTIDAD para recomendarle algo. Con una o dos compras
+    #: en el año no hay con qué sostener una recomendación.
+    min_dias_compra_entidad: int = 3
 
     filas_bloque: int = 2048           #: entidades por bloque (memoria acotada)
     decimales: int = 4
@@ -172,6 +213,8 @@ class RecConfig:
             raise ValueError("hace falta al menos un algoritmo")
         if self.seleccion not in ("backtest", "rrf", "ponderado") and self.seleccion not in self.algoritmos:
             raise ValueError("seleccion debe ser backtest, rrf, ponderado o el nombre de un algoritmo activo")
+        if self.ordenar_por not in ("esperado", "bruto"):
+            raise ValueError("ordenar_por debe ser esperado o bruto")
         if self.metrica_seleccion not in ("precision", "usd", "recall"):
             raise ValueError("metrica_seleccion debe ser precision, usd o recall")
         malos = [t for t in self.incluir_tipos if t not in TIPOS]
@@ -254,6 +297,53 @@ class Matriz:
         self.P = csr(tab["primero"].to_numpy(float))        # primer día (época)
         self.venta_entidad = np.asarray(self.V.sum(1)).ravel()
         self.items_entidad = np.asarray(self.R.sum(1)).ravel()
+        self.dias_entidad = np.zeros(n_ent)      # días de compra de la entidad, lo llena Panel
+        self.huecos: Tuple[np.ndarray, np.ndarray, np.ndarray] = ()   # los llena Panel
+        self.censuras: Tuple[np.ndarray, np.ndarray, np.ndarray] = ()
+
+    #: razones silencio/intervalo en las que se mide la curva
+    REJILLA_ATRASO = (1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 13.0)
+
+    def curva_recuperacion(self, horizonte: float, min_casos: int = 30
+                           ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """P(vuelve a comprar el ítem dentro del horizonte | lleva X veces su intervalo sin comprar).
+
+        Se estima con la historia y nada más: para cada nivel de atraso se cuenta cuántos
+        casos llegaron a ese atraso (huecos observados más silencios todavía abiertos) y
+        cuántos de esos volvieron a comprar dentro del horizonte. No supone ninguna
+        distribución.
+
+        Devuelve (rejilla de atrasos, curva por ítem, curva global).
+        """
+        clave = (round(float(horizonte), 3), int(min_casos))
+        if getattr(self, "_curva_cache", (None,))[0] == clave:
+            return self._curva_cache[1]
+        if not hasattr(self, "huecos"):
+            vacio = np.full((self.n_item, len(self.REJILLA_ATRASO)), np.nan)
+            return np.array(self.REJILLA_ATRASO), vacio, np.full(len(self.REJILLA_ATRASO), np.nan)
+        it_h, gap, iv_h = self.huecos
+        it_c, sil, iv_c = self.censuras
+        rejilla = np.array(self.REJILLA_ATRASO, dtype=float)
+        por_item = np.full((self.n_item, len(rejilla)), np.nan)
+        global_ = np.full(len(rejilla), np.nan)
+        for k, a in enumerate(rejilla):
+            umbral_h = a * iv_h
+            umbral_c = a * iv_c
+            en_riesgo_h = gap >= umbral_h
+            # un silencio abierto sólo cuenta como "no volvió" si ya observamos el horizonte
+            # completo después de haberse atrasado; si no, todavía no sabemos y se excluye
+            en_riesgo_c = sil >= umbral_c + horizonte
+            volvio = en_riesgo_h & (gap <= umbral_h + horizonte)
+            riesgo_item = (np.bincount(it_h[en_riesgo_h], minlength=self.n_item)
+                           + np.bincount(it_c[en_riesgo_c], minlength=self.n_item)).astype(float)
+            volvio_item = np.bincount(it_h[volvio], minlength=self.n_item).astype(float)
+            suficiente = riesgo_item >= min_casos
+            por_item[suficiente, k] = volvio_item[suficiente] / riesgo_item[suficiente]
+            riesgo_total = float(en_riesgo_h.sum() + en_riesgo_c.sum())
+            if riesgo_total >= min_casos:
+                global_[k] = float(volvio.sum()) / riesgo_total
+        self._curva_cache = (clave, (rejilla, por_item, global_))
+        return self._curva_cache[1]
 
     def __repr__(self) -> str:
         densidad = self.R.nnz / max(self.n_ent * self.n_item, 1)
@@ -283,10 +373,38 @@ class Panel:
         tab = por_dia.groupby(["e", "i"], sort=False, as_index=False).agg(
             usd=("v", "sum"), margen=("g", "sum"), dias=("d", "size"),
             primero=("d", "min"), ultimo=("d", "max"))
+
+        # ritmo real de cada par: promedio y desvío de los huecos entre compras. Con esto se
+        # distingue "compra cada 20 días" de "compró dos veces y justo pasaron 20 días".
+        por_dia = por_dia.sort_values(["e", "i", "d"])
+        por_dia["hueco"] = por_dia.groupby(["e", "i"], sort=False)["d"].diff()
+        huecos = por_dia.groupby(["e", "i"], sort=False, as_index=False)["hueco"].agg(
+            intervalo_medio="mean", intervalo_desvio="std", n_intervalos="count")
+        tab = tab.merge(huecos, on=["e", "i"], how="left")
+
+        # cada hueco observado es un caso de "se atrasó y volvió"; cada silencio final que
+        # sigue abierto es un caso de "se atrasó y todavía no volvió". Con los dos se estima
+        # después, sin suponer nada, cuánta gente vuelve.
+        con_hueco = por_dia[por_dia["hueco"].notna()][["e", "i", "hueco"]]
+        con_hueco = con_hueco.merge(tab[["e", "i", "intervalo_medio"]], on=["e", "i"], how="left")
+        censura = tab[["i", "ultimo", "intervalo_medio"]].copy()
+        censura["silencio"] = float(hasta) - censura["ultimo"]
+
         if self.cfg.excluir_netos_no_positivos:
             # comprado y devuelto entero no es una compra
             tab = tab[tab["usd"] > 0].reset_index(drop=True)
-        return Matriz(self.n_ent, self.n_item, tab)
+        m = Matriz(self.n_ent, self.n_item, tab)
+        dias_ent = por_dia.drop_duplicates(["e", "d"]).groupby("e").size()
+        m.dias_entidad = dias_ent.reindex(range(self.n_ent), fill_value=0).to_numpy(float)
+        ok_h = con_hueco["intervalo_medio"].notna().to_numpy()
+        m.huecos = (con_hueco["i"].to_numpy(np.int32)[ok_h],
+                    con_hueco["hueco"].to_numpy(np.float32)[ok_h],
+                    con_hueco["intervalo_medio"].to_numpy(np.float32)[ok_h])
+        ok_c = censura["intervalo_medio"].notna().to_numpy()
+        m.censuras = (censura["i"].to_numpy(np.int32)[ok_c],
+                      censura["silencio"].to_numpy(np.float32)[ok_c],
+                      censura["intervalo_medio"].to_numpy(np.float32)[ok_c])
+        return m
 
     def pares(self, desde: int, hasta: int) -> sp.csr_matrix:
         """Pares entidad-ítem con compra en la ventana, como matriz binaria."""
@@ -295,7 +413,7 @@ class Panel:
                              shape=(self.n_ent, self.n_item))
 
 
-    def canastas(self, desde: int, hasta: int) -> Tuple[sp.csr_matrix, np.ndarray]:
+    def canastas(self, desde: int, hasta: int) -> Tuple[sp.csr_matrix, np.ndarray, np.ndarray]:
         """Matriz canasta x ítem y a qué entidad pertenece cada canasta.
 
         La canasta es el documento si la fuente lo trae; si no, el día: para un cliente
@@ -315,7 +433,9 @@ class Panel:
         B.data[:] = 1.0
         entidad_canasta = np.zeros(n, dtype=np.int64)
         entidad_canasta[fila] = ent
-        return B, entidad_canasta
+        dia_canasta = np.zeros(n, dtype=np.int64)
+        dia_canasta[fila] = self.dia[m]
+        return B, entidad_canasta, dia_canasta
 
 
 def preparar(df: pd.DataFrame, cfg: RecConfig, fechas: Fechas) -> Panel:
@@ -433,7 +553,8 @@ class Bloque:
     """Un segmento ya recortado: matrices, soporte, penetración y candidatos."""
 
     def __init__(self, cfg: RecConfig, matriz: Matriz, filas: np.ndarray, etiqueta: str, nivel: str,
-                 canastas: Optional[Tuple[sp.csr_matrix, np.ndarray]] = None):
+                 canastas: Optional[Tuple[sp.csr_matrix, np.ndarray, np.ndarray]] = None,
+                 d_ayer: Optional[int] = None):
         self.cfg, self.etiqueta, self.nivel, self.filas = cfg, etiqueta, nivel, filas
         self.R = matriz.R[filas]
         self.V = matriz.V[filas]
@@ -443,19 +564,37 @@ class Bloque:
         self.P = matriz.P[filas]
         self.n = len(filas)
         self.n_item = matriz.n_item
+        self._pares: Optional[pd.DataFrame] = None            # caché de los pares del bloque
+        self.dias_ventana = float(cfg.dias_afinidad or 365)   # el motor la ajusta a la real
+        self.p_adopcion = 1.0                                 # el backtest la ajusta
 
         # matriz con la que se mide la afinidad: canastas (lo que se compra junto) o
         # el repertorio de cada entidad (todo lo que compra en la ventana)
+        vida = float(cfg.vida_media_afinidad_dias or 0)
+
+        def peso(dias_del_dato: np.ndarray) -> np.ndarray:
+            """Lo viejo pesa menos: a `vida` días de antigüedad, la mitad."""
+            if not vida or d_ayer is None:
+                return np.ones(len(dias_del_dato))
+            edad = np.maximum(float(d_ayer) - np.asarray(dias_del_dato, float), 0.0)
+            return np.power(0.5, edad / vida)
+
         self.A = (self.R > 0).astype(float)
         self.n_afinidad = self.n
         if canastas is not None:
-            B, entidad_canasta = canastas
+            B, entidad_canasta, dia_canasta = canastas
             pertenece = np.zeros(matriz.n_ent, dtype=bool)
             pertenece[filas] = True
             sel = np.flatnonzero(pertenece[entidad_canasta])
             if len(sel):
                 self.A = B[sel]
                 self.n_afinidad = len(sel)
+                if vida:
+                    self.A = (sp.diags(peso(dia_canasta[sel])) @ self.A).tocsr()
+        elif vida:
+            ultimo = self.U.tocoo()
+            self.A = sp.csr_matrix((peso(ultimo.data), (ultimo.row, ultimo.col)),
+                                   shape=self.R.shape)
 
         self.soporte = np.asarray((self.R > 0).sum(0)).ravel().astype(float)
         self.penetracion = self.soporte / max(self.n, 1)
@@ -467,7 +606,33 @@ class Bloque:
         self.usd_medio_comprador = np.where(self.soporte > 0, usd_item / seguro, 0.0)
         self.margen_pct_item = np.where(usd_item > 0, margen_item / np.where(usd_item > 0, usd_item, 1.0), 0.0)
 
+        # ritmo y ticket del ítem EN ESTE SEGMENTO: es la evidencia que se le presta a
+        # quien tiene poca historia propia
+        self.iv_item = np.full(self.n_item, np.nan)
+        self.cv_item = np.full(self.n_item, np.nan)
+        self.ticket_item = np.zeros(self.n_item)
+        pares = matriz.tab
+        propios = np.isin(pares["e"].to_numpy(np.int64), filas)
+        if propios.any():
+            sub = pares.loc[propios]
+            i_sub = sub["i"].to_numpy(np.int64)
+            dias_sub = sub["dias"].to_numpy(float)
+            usd_sub = sub["usd"].to_numpy(float)
+            total_dias = np.bincount(i_sub, weights=dias_sub, minlength=self.n_item)
+            total_usd = np.bincount(i_sub, weights=usd_sub, minlength=self.n_item)
+            self.ticket_item = np.where(total_dias > 0, total_usd / np.maximum(total_dias, 1.0), 0.0)
+            iv = pd.to_numeric(sub["intervalo_medio"], errors="coerce").to_numpy(float)
+            de = pd.to_numeric(sub["intervalo_desvio"], errors="coerce").to_numpy(float)
+            con_ritmo = np.isfinite(iv) & (iv > 0)
+            if con_ritmo.any():
+                tabla = pd.DataFrame({"i": i_sub[con_ritmo], "iv": iv[con_ritmo],
+                                      "cv": np.where(iv[con_ritmo] > 0, de[con_ritmo] / iv[con_ritmo], np.nan)})
+                agr = tabla.groupby("i").agg(iv=("iv", "median"), cv=("cv", "median"))
+                self.iv_item[agr.index.to_numpy()] = agr["iv"].to_numpy()
+                self.cv_item[agr.index.to_numpy()] = agr["cv"].to_numpy()
+
         self.venta_entidad = np.asarray(self.V.sum(1)).ravel()
+        self.dias_entidad = matriz.dias_entidad[filas]
         positivas = self.venta_entidad[self.venta_entidad > 0]
         self.venta_media = float(positivas.mean()) if len(positivas) else 0.0
         escala = sp.diags(1.0 / np.where(self.venta_entidad > 0, self.venta_entidad, 1.0))
@@ -803,13 +968,16 @@ class Fusion(Algoritmo):
 
 
 def _pares_bloque(b: Bloque, matriz: Matriz) -> pd.DataFrame:
-    """Los pares entidad-ítem del bloque, con la fila local."""
+    """Los pares entidad-ítem del bloque, con la fila local. Se calcula una sola vez."""
+    if getattr(b, "_pares", None) is not None:
+        return b._pares
     mapa = np.full(matriz.n_ent, -1, dtype=np.int64)
     mapa[b.filas] = np.arange(b.n)
     f = mapa[matriz.tab["e"].to_numpy(np.int64)]
     sel = f >= 0
     out = matriz.tab.loc[sel].copy()
     out["f"] = f[sel]
+    b._pares = out
     return out
 
 
@@ -820,6 +988,56 @@ def _escala_tamano(b: Bloque, filas: np.ndarray, cfg: RecConfig) -> np.ndarray:
     razon = b.venta_entidad[filas] / b.venta_media
     razon = np.where(razon > 0, razon, 1.0)
     return np.clip(razon, 1.0 / cfg.tope_escala, cfg.tope_escala)
+
+
+def _mezclar(propio: np.ndarray, n_propio: np.ndarray, pares: np.ndarray, k: float) -> np.ndarray:
+    """Estimación encogida hacia los pares: (n*propio + k*pares) / (n + k).
+
+    Con una sola compra, `n` es chico y manda la evidencia del segmento. Con veinte,
+    manda la del cliente. Es lo que evita inventar un ritmo con un solo intervalo y, al
+    mismo tiempo, no desperdiciar la historia de quien sí la tiene.
+    """
+    propio = np.asarray(propio, float)
+    pares = np.asarray(pares, float)
+    n = np.maximum(np.asarray(n_propio, float), 0.0)
+    hay_propio = np.isfinite(propio) & (propio > 0)
+    hay_pares = np.isfinite(pares) & (pares > 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mezcla = (np.where(hay_propio, propio, 0.0) * n + np.where(hay_pares, pares, 0.0) * k) / np.maximum(
+            np.where(hay_propio, n, 0.0) + np.where(hay_pares, k, 0.0), 1e-12)
+    mezcla = np.where(hay_propio | hay_pares, mezcla, np.nan)
+    return np.where(hay_propio & ~hay_pares, propio, np.where(hay_pares & ~hay_propio, pares, mezcla))
+
+
+def _prob_recompra(silencio: np.ndarray, intervalo: np.ndarray, item: np.ndarray,
+                   matriz: Matriz, cfg: RecConfig) -> np.ndarray:
+    """P(vuelve a comprar el ítem dentro del horizonte), leída de la curva de recuperación.
+
+    No es "¿este silencio es normal?" —eso ya lo dice el puntaje— sino "de los que
+    llegaron a este nivel de atraso, ¿cuántos volvieron?". Sale de la historia: primero la
+    curva del ítem, y si el ítem no tiene casos suficientes, la del panel.
+    """
+    horizonte = float(cfg.horizonte_dias) if cfg.horizonte_dias else 90.0
+    rejilla, por_item, global_ = matriz.curva_recuperacion(horizonte, cfg.min_casos_recuperacion)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        atraso = np.where(intervalo > 0, silencio / intervalo, np.nan)
+    atraso = np.clip(np.nan_to_num(atraso, nan=rejilla[0]), rejilla[0], rejilla[-1])
+    # curva por ítem, rellenando con la del panel donde el ítem no tiene casos suficientes
+    curva = np.where(np.isfinite(por_item), por_item, global_[None, :]) if len(por_item) else None
+    if curva is None:
+        valida = np.isfinite(global_)
+        p = (np.interp(atraso, rejilla[valida], global_[valida]) if valida.any()
+             else np.zeros(len(atraso)))
+        return np.clip(p, 0.0, 1.0)
+    # interpolación lineal vectorizada entre los dos puntos de rejilla que rodean al atraso
+    k = np.clip(np.searchsorted(rejilla, atraso, side="left"), 1, len(rejilla) - 1)
+    x0, x1 = rejilla[k - 1], rejilla[k]
+    y0, y1 = curva[item, k - 1], curva[item, k]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        w = np.where(x1 > x0, (atraso - x0) / (x1 - x0), 0.0)
+        p = y0 + w * (y1 - y0)
+    p = np.where(np.isfinite(p), p, np.where(np.isfinite(y0), y0, np.where(np.isfinite(y1), y1, 0.0)))
+    return np.clip(np.where(np.isfinite(p), p, 0.0), 0.0, 1.0)
 
 
 def recomendar_cruzadas(b: Bloque, alg: Algoritmo, cfg: RecConfig, top: Optional[int] = None) -> pd.DataFrame:
@@ -853,36 +1071,90 @@ def recomendar_cruzadas(b: Bloque, alg: Algoritmo, cfg: RecConfig, top: Optional
 
 
 def recomendar_reposicion(b: Bloque, matriz: Matriz, cfg: RecConfig, d_ayer: int) -> pd.DataFrame:
-    """Lo que compraba con cierto ritmo y hace rato no compra."""
+    """Lo que compraba con cierto ritmo y hace rato no compra.
+
+    El ritmo y el ticket se estiman mezclando la evidencia del cliente con la del ítem en
+    su segmento (`peso_prior_pares`): con una compra manda el segmento, con veinte manda
+    él. El valor es lo que se espera en los próximos `horizonte_dias`, multiplicado por la
+    probabilidad de que la compra ocurra.
+    """
+    columnas = ["f", "i", "puntaje", "usd_potencial", "usd_si_compra", "prob", "dias_sin_comprar",
+                "dias_compra_item", "intervalo_tipico", "intervalo_esperado", "compras_esperadas",
+                "motivo"]
     p = _pares_bloque(b, matriz)
     if p.empty:
-        return pd.DataFrame(columns=["f", "i", "puntaje", "usd_potencial", "dias_sin_comprar", "motivo"])
+        return pd.DataFrame(columns=columnas)
+    fila = p["f"].to_numpy(np.int64)
+    item = p["i"].to_numpy(np.int64)
     dias = p["dias"].to_numpy(float)
-    primero = p["primero"].to_numpy(float)
-    ultimo = p["ultimo"].to_numpy(float)
     usd = p["usd"].to_numpy(float)
-    silencio = d_ayer - ultimo
-    intervalo = np.where(dias >= 2, (ultimo - primero) / np.maximum(dias - 1, 1), np.inf)
-    ok = ((dias >= cfg.min_compras_reposicion) & np.isfinite(intervalo) & (intervalo > 0)
-          & (silencio > cfg.factor_reposicion * intervalo))
+    silencio = d_ayer - p["ultimo"].to_numpy(float)
+    iv_propio = pd.to_numeric(p["intervalo_medio"], errors="coerce").to_numpy(float)
+    de_propio = pd.to_numeric(p["intervalo_desvio"], errors="coerce").to_numpy(float)
+    n_int = pd.to_numeric(p["n_intervalos"], errors="coerce").fillna(0).to_numpy(float)
+
+    # ritmo y ticket: lo propio mezclado con lo del ítem en el segmento
+    escala = _escala_tamano(b, fila, cfg)
+    iv_est = _mezclar(iv_propio, n_int, b.iv_item[item], cfg.peso_prior_pares)
+    ticket_propio = np.where(dias > 0, usd / np.maximum(dias, 1.0), np.nan)
+    ticket_est = _mezclar(ticket_propio, dias, b.ticket_item[item] * escala, cfg.peso_prior_pares)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cv_propio = np.where(iv_propio > 0, de_propio / iv_propio, np.nan)
+    cv_est = _mezclar(cv_propio, np.maximum(n_int - 1, 0), b.cv_item[item], cfg.peso_prior_pares)
+
+    ok = ((dias >= cfg.min_compras_reposicion) & np.isfinite(iv_est) & (iv_est > 0)
+          & np.isfinite(ticket_est) & (ticket_est > 0)
+          & (silencio > cfg.factor_reposicion * iv_est))
+    if cfg.max_cv_intervalo is not None:      # la regularidad sólo se le exige a quien tiene ritmo propio
+        medible = n_int >= 2
+        ok &= ~medible | ~np.isfinite(cv_propio) | (cv_propio <= float(cfg.max_cv_intervalo))
     if not ok.any():
-        return pd.DataFrame(columns=["f", "i", "puntaje", "usd_potencial", "dias_sin_comprar", "motivo"])
-    ritmo = usd[ok] / np.maximum(ultimo[ok] - primero[ok] + 1.0, 1.0)
-    iv, sil = intervalo[ok], silencio[ok]
+        return pd.DataFrame(columns=columnas)
+
+    iv, sil, compras = iv_est[ok], silencio[ok], dias[ok]
+    ticket, comprado = ticket_est[ok], usd[ok]
+    horizonte = float(cfg.horizonte_dias) if cfg.horizonte_dias else float(np.max(sil))
+    esperadas = np.minimum(horizonte / iv, horizonte)          # a lo sumo una compra por día
+    si_compra = ticket * esperadas
+    if cfg.tope_potencial_por_historico:                       # no más de N veces su propio ritmo
+        propio_en_horizonte = comprado / max(b.dias_ventana, 1.0) * horizonte
+        techo = propio_en_horizonte * float(cfg.tope_potencial_por_historico)
+        si_compra = np.minimum(si_compra, np.where(techo > 0, techo, np.inf))
+    prob = (_prob_recompra(sil, iv, item[ok], matriz, cfg) if cfg.usar_probabilidad
+            else np.ones(len(iv)))
     return pd.DataFrame({
-        "f": p["f"].to_numpy()[ok],
-        "i": p["i"].to_numpy()[ok],
+        "f": fila[ok], "i": item[ok],
         "puntaje": sil / iv,
-        "usd_potencial": ritmo * sil,
+        "usd_potencial": si_compra * prob,
+        "usd_si_compra": si_compra,
+        "prob": prob,
         "dias_sin_comprar": sil,
-        "motivo": [f"compraba cada {v:.0f} días y lleva {s:.0f} sin comprar" for v, s in zip(iv, sil)]})
+        "dias_compra_item": compras,
+        "intervalo_tipico": np.where(np.isfinite(iv_propio[ok]), iv_propio[ok], np.nan),
+        "intervalo_esperado": iv,
+        "compras_esperadas": esperadas,
+        "motivo": [_motivo_reposicion(c, ip, iv_, s, pr)
+                   for c, ip, iv_, s, pr in zip(compras, iv_propio[ok], iv, sil, prob)]})
+
+
+def _motivo_reposicion(compras, iv_propio, iv_est, silencio, prob) -> str:
+    """El texto dice con qué evidencia se armó: la propia, la de los pares, o las dos."""
+    if np.isfinite(iv_propio) and compras >= 3:
+        base = f"compró {compras:.0f} veces, cada {iv_propio:.0f} días en promedio"
+    elif np.isfinite(iv_propio):
+        base = (f"compró {compras:.0f} veces (cada {iv_propio:.0f} días); sus pares lo compran "
+                f"cada {iv_est:.0f}")
+    else:
+        base = f"compró {compras:.0f} vez; sus pares lo compran cada {iv_est:.0f} días"
+    return f"{base}, lleva {silencio:.0f} sin comprar (probabilidad de recompra {prob:.0%})"
 
 
 def recomendar_brecha(b: Bloque, matriz: Matriz, cfg: RecConfig) -> pd.DataFrame:
     """Lo que compra, pero mucho menos de lo que le dedican sus pares."""
+    columnas = ["f", "i", "puntaje", "usd_potencial", "usd_si_compra", "prob", "motivo"]
     p = _pares_bloque(b, matriz)
     if p.empty:
-        return pd.DataFrame(columns=["f", "i", "puntaje", "usd_potencial", "motivo"])
+        return pd.DataFrame(columns=columnas)
     f = p["f"].to_numpy(np.int64)
     i = p["i"].to_numpy(np.int64)
     venta_ent = b.venta_entidad[f]
@@ -890,27 +1162,51 @@ def recomendar_brecha(b: Bloque, matriz: Matriz, cfg: RecConfig) -> pd.DataFrame
     medio = b.share_medio_comprador[i]
     ok = b.candidato[i] & (venta_ent > 0) & (medio > 0) & (share < cfg.brecha_ratio * medio)
     if not ok.any():
-        return pd.DataFrame(columns=["f", "i", "puntaje", "usd_potencial", "motivo"])
+        return pd.DataFrame(columns=columnas)
     sh, me, ve = share[ok], medio[ok], venta_ent[ok]
+    horizonte = float(cfg.horizonte_dias) if cfg.horizonte_dias else b.dias_ventana
+    falta = (me - sh) * ve * horizonte / max(b.dias_ventana, 1.0)
     return pd.DataFrame({
         "f": f[ok], "i": i[ok],
         "puntaje": 1.0 - sh / me,
-        "usd_potencial": (me - sh) * ve,
+        "usd_potencial": falta,
+        "usd_si_compra": falta,
+        "prob": np.ones(len(falta)),
         "motivo": [f"sus pares le dedican {m:.1%} de su compra y esta entidad {s:.1%}"
                    for m, s in zip(me, sh)]})
 
 
 def armar_recomendaciones(b: Bloque, matriz: Matriz, alg: Algoritmo, cfg: RecConfig,
                           d_ayer: int) -> pd.DataFrame:
-    """Los tres tipos juntos, ordenados por USD en juego y recortados a max_items_reco."""
+    """Los tres tipos juntos, todos medidos en USD esperados en el mismo horizonte."""
+    horizonte = float(cfg.horizonte_dias) if cfg.horizonte_dias else b.dias_ventana
     partes = []
     if "CRUZADA" in cfg.incluir_tipos:
         cru = recomendar_cruzadas(b, alg, cfg)
         if len(cru):
-            escala = _escala_tamano(b, cru["f"].to_numpy(), cfg)
-            cru["usd_potencial"] = b.usd_medio_comprador[cru["i"].to_numpy()] * escala
+            f = cru["f"].to_numpy(np.int64)
+            i = cru["i"].to_numpy(np.int64)
+            escala = _escala_tamano(b, f, cfg)
+            # lo que gastaría en el horizonte si lo adoptara: el ticket del ítem en el
+            # segmento por las compras que hace un par en ese lapso
+            iv_pares = b.iv_item[i]
+            con_ritmo = np.isfinite(iv_pares) & (iv_pares > 0)
+            esperadas = np.where(con_ritmo,
+                                 np.minimum(horizonte / np.where(con_ritmo, iv_pares, 1.0), horizonte),
+                                 1.0)
+            si_compra = np.where(con_ritmo,
+                                 b.ticket_item[i] * escala * esperadas,
+                                 b.usd_medio_comprador[i] * escala * horizonte / max(b.dias_ventana, 1.0))
+            prob = np.full(len(f), float(b.p_adopcion) if cfg.usar_probabilidad else 1.0)
+            cru["usd_si_compra"] = si_compra
+            cru["prob"] = prob
+            cru["usd_potencial"] = si_compra * prob
             cru["dias_sin_comprar"] = np.nan
-            cru["motivo"] = alg.explicar(cru["f"].to_numpy(), cru["i"].to_numpy())
+            cru["dias_compra_item"] = 0.0
+            cru["intervalo_tipico"] = np.nan
+            cru["intervalo_esperado"] = iv_pares
+            cru["compras_esperadas"] = esperadas
+            cru["motivo"] = alg.explicar(f, i)
             cru["tipo"] = "CRUZADA"
             cru["algoritmo"] = alg.nombre
             partes.append(cru)
@@ -923,15 +1219,47 @@ def armar_recomendaciones(b: Bloque, matriz: Matriz, alg: Algoritmo, cfg: RecCon
     if "BRECHA" in cfg.incluir_tipos:
         bre = recomendar_brecha(b, matriz, cfg)
         if len(bre):
+            evidencia = _pares_bloque(b, matriz)[["f", "i", "dias", "intervalo_medio"]]
+            bre = bre.merge(evidencia, on=["f", "i"], how="left")
             bre["tipo"] = "BRECHA"
             bre["algoritmo"] = "regla_brecha"
             bre["dias_sin_comprar"] = np.nan
+            bre["dias_compra_item"] = bre.pop("dias").fillna(0).astype(float)
+            bre["intervalo_tipico"] = pd.to_numeric(bre.pop("intervalo_medio"), errors="coerce")
+            bre["intervalo_esperado"] = b.iv_item[bre["i"].to_numpy(np.int64)]
+            bre["compras_esperadas"] = np.nan
             partes.append(bre)
     if not partes:
         return pd.DataFrame()
     out = pd.concat(partes, ignore_index=True)
+    filas_local = out["f"].to_numpy(np.int64)
+
+    # ninguna recomendación puede valer más que lo que la entidad compra en ese lapso
+    if cfg.tope_potencial_relativo:
+        techo = (b.venta_entidad[filas_local] * float(cfg.tope_potencial_relativo)
+                 * horizonte / max(b.dias_ventana, 1.0))
+        techo = np.where(techo > 0, techo, np.inf)
+        out["usd_si_compra"] = np.minimum(out["usd_si_compra"].to_numpy(float), techo)
+        out["usd_potencial"] = np.minimum(out["usd_potencial"].to_numpy(float), techo)
+
+    # y a una entidad con una o dos compras en el año no se le recomienda nada
+    out["dias_compra_entidad"] = b.dias_entidad[filas_local]
+    if cfg.min_dias_compra_entidad:
+        out = out[out["dias_compra_entidad"] >= float(cfg.min_dias_compra_entidad)]
+        if out.empty:
+            return pd.DataFrame()
+    if cfg.piso_prob:
+        piso = float(cfg.piso_prob)
+        subio = out["prob"].to_numpy(float) < piso
+        if subio.any():
+            out.loc[subio, "prob"] = piso
+            out.loc[subio, "usd_potencial"] = out.loc[subio, "usd_si_compra"] * piso
     out["margen_potencial"] = out["usd_potencial"] * b.margen_pct_item[out["i"].to_numpy()]
-    out = out.sort_values(["f", "usd_potencial", "puntaje"], ascending=[True, False, False])
+    orden = "usd_potencial" if cfg.ordenar_por == "esperado" else "usd_si_compra"
+    out = out.sort_values(["f", orden, "puntaje"], ascending=[True, False, False])
+    # un mismo cliente-ítem puede caer en dos tipos (dejó de comprarlo Y compra menos que
+    # sus pares): queda una sola fila, la del tipo que mejor lo explica
+    out = out.drop_duplicates(["f", "i"], keep="first")
     out["ranking"] = out.groupby("f").cumcount() + 1
     out = out[out["ranking"] <= cfg.max_items_reco].reset_index(drop=True)
     i = out["i"].to_numpy(np.int64)
@@ -956,7 +1284,8 @@ def backtest(panel: Panel, cfg: RecConfig) -> pd.DataFrame:
     """
     f = panel.f
     corte = f.d_ayer - cfg.dias_backtest
-    entrena = panel.matriz(corte - cfg.dias_afinidad + 1, corte)
+    inicio = corte - cfg.dias_afinidad + 1 if cfg.dias_afinidad else int(panel.dia.min())
+    entrena = panel.matriz(inicio, corte)
     evalua = panel.matriz(corte + 1, f.d_ayer)
     verdad = (evalua.R > 0)
     nuevos = verdad.astype(int) - (entrena.R > 0).astype(int)
@@ -966,15 +1295,15 @@ def backtest(panel: Panel, cfg: RecConfig) -> pd.DataFrame:
     panel.cfg = replace(cfg, segmentos=agregar_tamano(panel, entrena))
     seg = asignar_segmentos(panel, entrena)
     nombres = etiquetas_item(panel)
-    canastas = (panel.canastas(corte - cfg.dias_afinidad + 1, corte)
-                if cfg.afinidad == "canasta" else None)
+    canastas = panel.canastas(inicio, corte) if cfg.afinidad == "canasta" else None
 
     filas = []
     codigos, etiquetas = pd.factorize(seg["segmento"])
     for k, etiqueta in enumerate(etiquetas):
         idx = np.flatnonzero(codigos == k)
         b = Bloque(cfg, entrena, idx, str(etiqueta), str(seg["nivel_segmento"].iloc[idx[0]]),
-                   canastas=canastas)
+                   canastas=canastas, d_ayer=corte)
+        b.dias_ventana = float(corte - inicio + 1)
         b.nombres_item = nombres
         adopciones = int(nuevos[idx].sum())
         entidades_adoptan = int((np.asarray(nuevos[idx].sum(1)).ravel() > 0).sum())
@@ -1048,9 +1377,18 @@ def catalogo(cfg: RecConfig) -> List[Tuple[str, str, str]]:
         ("MT_RANKING", "NUMBER", "Orden de la recomendación dentro de la entidad: 1 es la de mayor USD en juego."),
         ("BD_TIPO", "VARCHAR2(20)", "CRUZADA (no lo compra y sus pares sí), REPOSICION (lo compraba y se atrasó) "
                                     "o BRECHA (lo compra mucho menos que sus pares)."),
-        ("MT_USD_POTENCIAL", "NUMBER", "USD anuales estimados en juego. CRUZADA: lo que gasta un par medio, "
-                                       "ajustado por tamaño. REPOSICION: lo que dejó de comprar desde que se atrasó. "
-                                       "BRECHA: lo que le faltaría para igualar a sus pares."),
+        ("MT_USD_POTENCIAL", "NUMBER", "USD esperados en el horizonte configurado (por defecto 90 días). "
+                                       "Es MT_USD_SI_COMPRA por MT_PROB, y es la columna por la que se ordena: "
+                                       "los tres tipos quedan en la misma unidad y se pueden comparar."),
+        ("MT_USD_SI_COMPRA", "NUMBER", "USD del horizonte si la compra efectivamente ocurre, sin multiplicar por "
+                                       "la probabilidad. Sirve para ver el tamaño de la oportunidad."),
+        ("MT_PROB", "NUMBER", "Probabilidad de que ocurra. REPOSICION: que vuelva a comprar el ítem, según la "
+                              "distribución de intervalos del segmento. CRUZADA: tasa de adopción que midió el "
+                              "backtest en ese segmento. BRECHA: 1, porque ya lo compra."),
+        ("MT_INTERVALO_ESPERADO", "NUMBER", "Días entre compras estimados para este cliente y este ítem, mezclando "
+                                            "su propia historia con la de sus pares del segmento: con una compra "
+                                            "manda el segmento, con veinte manda él."),
+        ("MT_COMPRAS_ESPERADAS", "NUMBER", "Compras esperadas en el horizonte, según ese intervalo."),
         ("MT_MARGEN_POTENCIAL", "NUMBER", "MT_USD_POTENCIAL por el margen porcentual del ítem en el segmento. USD."),
         ("MT_PUNTAJE", "NUMBER", "Puntaje del algoritmo o de la regla. Comparable dentro del mismo tipo y segmento."),
         ("MT_PENETRACION_SEGMENTO", "NUMBER", "Fracción de las entidades del segmento que compran el ítem."),
@@ -1058,6 +1396,12 @@ def catalogo(cfg: RecConfig) -> List[Tuple[str, str, str]]:
         ("MT_USD_MEDIO_PAR", "NUMBER", "USD que gasta en el ítem una entidad del segmento que sí lo compra. USD."),
         ("MT_USD_ENTIDAD", "NUMBER", "Compra total de la entidad en la ventana de afinidad. USD."),
         ("MT_DIAS_SIN_COMPRAR", "NUMBER", "Sólo REPOSICION: días desde la última compra del ítem."),
+        ("MT_DIAS_COMPRA_ITEM", "NUMBER", "Días en que la entidad compró este ítem en la ventana. Es la "
+                                          "evidencia detrás de REPOSICION y BRECHA: con 2 compras el ritmo "
+                                          "es una casualidad, no un ritmo."),
+        ("MT_INTERVALO_TIPICO", "NUMBER", "Días promedio entre compras del ítem por parte de la entidad."),
+        ("MT_DIAS_COMPRA_ENTIDAD", "NUMBER", "Días en que la entidad compró algo en la ventana. Mide cuánta "
+                                             "historia sostiene la recomendación."),
         ("BD_SEGMENTO", "VARCHAR2(400)", "Segmento contra el que se comparó a la entidad."),
         ("BD_NIVEL_SEGMENTO", "VARCHAR2(100)", "Nivel de segmentación usado, o GLOBAL si ninguno tenía suficientes entidades."),
         ("BD_ALGORITMO", "VARCHAR2(40)", "Algoritmo que produjo la recomendación, o la regla (regla_reposicion / regla_brecha)."),
@@ -1080,7 +1424,9 @@ class RecEngine:
         cfg, f = self.cfg, self.fechas
         t_inicio = time.time()
         panel = preparar(df, cfg, f)
-        desde = f.d_ayer - cfg.dias_afinidad + 1
+        desde = (f.d_ayer - cfg.dias_afinidad + 1 if cfg.dias_afinidad
+                 else int(panel.dia.min()))
+        dias_ventana = float(f.d_ayer - desde + 1)
         t0 = time.time()
         matriz = panel.matriz(desde, f.d_ayer)
         self.tiempos_["matriz"] = time.time() - t0
@@ -1092,6 +1438,12 @@ class RecEngine:
         seg = asignar_segmentos(panel, matriz)
         nombres = etiquetas_item(panel)
         canastas = panel.canastas(desde, f.d_ayer) if cfg.afinidad == "canasta" else None
+        p_adopcion = {}
+        if len(self.diagnostico):
+            base = float(cfg.dias_backtest or 90)
+            for _, g in self.diagnostico[self.diagnostico["elegido"]].iterrows():
+                tasa = float(g["precision"]) * (float(cfg.horizonte_dias or base) / base)
+                p_adopcion[str(g["segmento"])] = float(min(max(tasa, 0.0), 1.0))
         if canastas is not None:
             LOGGER.info("afinidad por canasta: %s canastas (%.1f ítems por canasta)",
                         f"{canastas[0].shape[0]:,}", canastas[0].nnz / max(canastas[0].shape[0], 1))
@@ -1119,7 +1471,9 @@ class RecEngine:
         for k, etiqueta in enumerate(etiquetas):
             idx = np.flatnonzero(codigos == k)
             nivel = str(seg["nivel_segmento"].iloc[idx[0]])
-            b = Bloque(cfg, matriz, idx, str(etiqueta), nivel, canastas=canastas)
+            b = Bloque(cfg, matriz, idx, str(etiqueta), nivel, canastas=canastas, d_ayer=f.d_ayer)
+            b.dias_ventana = dias_ventana
+            b.p_adopcion = p_adopcion.get(str(etiqueta), 1.0)
             b.nombres_item = nombres
             nombre_alg = elegido_por_segmento.get(str(etiqueta), mejor_global)
             alg = construir_algoritmo(nombre_alg, cfg)
@@ -1156,6 +1510,10 @@ class RecEngine:
             "MT_RANKING": rec["ranking"].to_numpy(int),
             "BD_TIPO": rec["tipo"].to_numpy(dtype=object),
             "MT_USD_POTENCIAL": np.round(rec["usd_potencial"].to_numpy(float), 2),
+            "MT_USD_SI_COMPRA": np.round(rec["usd_si_compra"].to_numpy(float), 2),
+            "MT_PROB": np.round(rec["prob"].to_numpy(float), 4),
+            "MT_INTERVALO_ESPERADO": np.round(rec["intervalo_esperado"].to_numpy(float), 1),
+            "MT_COMPRAS_ESPERADAS": np.round(rec["compras_esperadas"].to_numpy(float), 2),
             "MT_MARGEN_POTENCIAL": np.round(rec["margen_potencial"].to_numpy(float), 2),
             "MT_PUNTAJE": np.round(rec["puntaje"].to_numpy(float), dec),
             "MT_PENETRACION_SEGMENTO": np.round(rec["penetracion"].to_numpy(float), dec),
@@ -1163,6 +1521,9 @@ class RecEngine:
             "MT_USD_MEDIO_PAR": np.round(rec["usd_medio_par"].to_numpy(float), 2),
             "MT_USD_ENTIDAD": np.round(rec["usd_entidad"].to_numpy(float), 2),
             "MT_DIAS_SIN_COMPRAR": rec["dias_sin_comprar"].to_numpy(float),
+            "MT_DIAS_COMPRA_ITEM": rec["dias_compra_item"].to_numpy(float),
+            "MT_INTERVALO_TIPICO": np.round(rec["intervalo_tipico"].to_numpy(float), 1),
+            "MT_DIAS_COMPRA_ENTIDAD": rec["dias_compra_entidad"].to_numpy(float),
             "BD_SEGMENTO": rec["segmento"].to_numpy(dtype=object),
             "BD_NIVEL_SEGMENTO": rec["nivel_segmento"].to_numpy(dtype=object),
             "BD_ALGORITMO": rec["algoritmo"].to_numpy(dtype=object),
