@@ -39,6 +39,32 @@ def _dia(ts) -> int:
     return int((pd.Timestamp(ts).normalize() - _EPOCA).days)
 
 
+def sin_residuo(suma, suma_abs, tol: float, piso: float = 0.0):
+    """Anula la suma cuando no se distingue del residuo de cancelación de float64.
+
+    Sumar una venta y su devolución no da cero exacto: queda un residuo del orden de
+    1e-16 veces lo que pasó por la suma. Como número no molesta; como denominador de
+    un porcentaje (el margen del ítem, la participación de la entidad) explota. Por eso
+    el cero se prueba contra la escala real, que es la suma de los valores absolutos.
+
+    `piso` es una escala mínima de referencia (la del panel típico): sirve para el
+    residuo que ya llega cancelado desde la fuente, donde no hay nada con qué
+    compararlo dentro de la propia suma.
+    """
+    if not tol:
+        return suma
+    suma = np.asarray(suma, dtype=float)
+    escala = np.maximum(np.asarray(suma_abs, dtype=float), float(piso or 0.0))
+    return np.where(np.abs(suma) <= tol * escala, 0.0, suma)
+
+
+def escala_tipica(suma_abs) -> float:
+    """Escala de referencia del panel: la mediana de lo que movió cada grupo."""
+    a = np.asarray(suma_abs, dtype=float)
+    a = a[np.isfinite(a) & (a > 0)]
+    return float(np.median(a)) if a.size else 0.0
+
+
 # =========================================================================== #
 # 1. Configuración
 # =========================================================================== #
@@ -159,6 +185,11 @@ class RecConfig:
     #: en el año no hay con qué sostener una recomendación.
     min_dias_compra_entidad: int = 3
 
+    #: Cuándo una suma de dinero es cero. Una venta y su devolución no se anulan exacto
+    #: en punto flotante: queda un residuo de 1e-10 que, como denominador, explota. Una
+    #: suma cuenta como cero cuando no llega a esta fracción de lo que pasó por ella.
+    tolerancia_cero: float = 1e-9
+
     filas_bloque: int = 2048           #: entidades por bloque (memoria acotada)
     decimales: int = 4
     verbose: int = 1
@@ -215,6 +246,8 @@ class RecConfig:
             raise ValueError("seleccion debe ser backtest, rrf, ponderado o el nombre de un algoritmo activo")
         if self.ordenar_por not in ("esperado", "bruto"):
             raise ValueError("ordenar_por debe ser esperado o bruto")
+        if not 0 <= self.tolerancia_cero < 1:
+            raise ValueError("tolerancia_cero debe estar entre 0 y 1 (0 = sin limpieza)")
         if self.metrica_seleccion not in ("precision", "usd", "recall"):
             raise ValueError("metrica_seleccion debe ser precision, usd o recall")
         malos = [t for t in self.incluir_tipos if t not in TIPOS]
@@ -280,8 +313,9 @@ def _ultimo_valor(df: pd.DataFrame, codigos: np.ndarray, n: int,
 class Matriz:
     """Entidades x ítems dentro de una ventana, ya agregadas."""
 
-    def __init__(self, n_ent: int, n_item: int, tab: pd.DataFrame):
+    def __init__(self, n_ent: int, n_item: int, tab: pd.DataFrame, tolerancia_cero: float = 0.0):
         self.n_ent, self.n_item, self.tab = n_ent, n_item, tab
+        self.tol = float(tolerancia_cero)
         e = tab["e"].to_numpy(np.int64)
         i = tab["i"].to_numpy(np.int64)
         forma = (n_ent, n_item)
@@ -295,7 +329,9 @@ class Matriz:
         self.D = csr(tab["dias"].to_numpy(float))           # días de compra
         self.U = csr(tab["ultimo"].to_numpy(float))         # último día (época)
         self.P = csr(tab["primero"].to_numpy(float))        # primer día (época)
-        self.venta_entidad = np.asarray(self.V.sum(1)).ravel()
+        bruto_ent = np.asarray(abs(self.V).sum(1)).ravel()
+        self.venta_entidad = sin_residuo(np.asarray(self.V.sum(1)).ravel(), bruto_ent,
+                                         self.tol, escala_tipica(bruto_ent))
         self.items_entidad = np.asarray(self.R.sum(1)).ravel()
         self.dias_entidad = np.zeros(n_ent)      # días de compra de la entidad, lo llena Panel
         self.huecos: Tuple[np.ndarray, np.ndarray, np.ndarray] = ()   # los llena Panel
@@ -367,12 +403,19 @@ class Panel:
         """Agrega los eventos de [desde, hasta] a una fila por entidad-ítem."""
         m = (self.dia >= desde) & (self.dia <= hasta)
         base = pd.DataFrame({"e": self.ent[m], "i": self.item[m], "d": self.dia[m],
-                             "v": self.usd[m], "g": self.margen[m]})
+                             "v": self.usd[m], "g": self.margen[m],
+                             "va": np.abs(self.usd[m]), "ga": np.abs(self.margen[m])})
         por_dia = base.groupby(["e", "i", "d"], sort=False, as_index=False).agg(
-            v=("v", "sum"), g=("g", "sum"))
+            v=("v", "sum"), g=("g", "sum"), va=("va", "sum"), ga=("ga", "sum"))
         tab = por_dia.groupby(["e", "i"], sort=False, as_index=False).agg(
             usd=("v", "sum"), margen=("g", "sum"), dias=("d", "size"),
-            primero=("d", "min"), ultimo=("d", "max"))
+            primero=("d", "min"), ultimo=("d", "max"),
+            usd_bruto=("va", "sum"), margen_bruto=("ga", "sum"))
+        # el par que se compró y se devolvió entero vale 0, no 1e-10 (ver `sin_residuo`)
+        tol = self.cfg.tolerancia_cero
+        bu, bm = tab.pop("usd_bruto").to_numpy(float), tab.pop("margen_bruto").to_numpy(float)
+        tab["usd"] = sin_residuo(tab["usd"].to_numpy(float), bu, tol, escala_tipica(bu))
+        tab["margen"] = sin_residuo(tab["margen"].to_numpy(float), bm, tol, escala_tipica(bm))
 
         # ritmo real de cada par: promedio y desvío de los huecos entre compras. Con esto se
         # distingue "compra cada 20 días" de "compró dos veces y justo pasaron 20 días".
@@ -392,8 +435,8 @@ class Panel:
 
         if self.cfg.excluir_netos_no_positivos:
             # comprado y devuelto entero no es una compra
-            tab = tab[tab["usd"] > 0].reset_index(drop=True)
-        m = Matriz(self.n_ent, self.n_item, tab)
+            tab = tab[tab["usd"] > 0].reset_index(drop=True)   # 1e-10 ya es 0, no pasa
+        m = Matriz(self.n_ent, self.n_item, tab, self.cfg.tolerancia_cero)
         dias_ent = por_dia.drop_duplicates(["e", "d"]).groupby("e").size()
         m.dias_entidad = dias_ent.reindex(range(self.n_ent), fill_value=0).to_numpy(float)
         ok_h = con_hueco["intervalo_medio"].notna().to_numpy()
@@ -600,10 +643,14 @@ class Bloque:
         self.penetracion = self.soporte / max(self.n, 1)
         self.candidato = (self.soporte >= cfg.min_soporte) & (self.penetracion >= cfg.min_penetracion)
 
-        usd_item = np.asarray(self.V.sum(0)).ravel()
-        margen_item = np.asarray(self.M.sum(0)).ravel()
+        tol = cfg.tolerancia_cero
+        bruto_v = np.asarray(abs(self.V).sum(0)).ravel()
+        bruto_m = np.asarray(abs(self.M).sum(0)).ravel()
+        usd_item = sin_residuo(np.asarray(self.V.sum(0)).ravel(), bruto_v, tol, escala_tipica(bruto_v))
+        margen_item = sin_residuo(np.asarray(self.M.sum(0)).ravel(), bruto_m, tol, escala_tipica(bruto_m))
         seguro = np.maximum(self.soporte, 1.0)
         self.usd_medio_comprador = np.where(self.soporte > 0, usd_item / seguro, 0.0)
+        # el ítem cuya venta se anula con sus devoluciones no tiene margen %, no uno gigante
         self.margen_pct_item = np.where(usd_item > 0, margen_item / np.where(usd_item > 0, usd_item, 1.0), 0.0)
 
         # ritmo y ticket del ítem EN ESTE SEGMENTO: es la evidencia que se le presta a
@@ -631,14 +678,23 @@ class Bloque:
                 self.iv_item[agr.index.to_numpy()] = agr["iv"].to_numpy()
                 self.cv_item[agr.index.to_numpy()] = agr["cv"].to_numpy()
 
-        self.venta_entidad = np.asarray(self.V.sum(1)).ravel()
+        bruto_ent = np.asarray(abs(self.V).sum(1)).ravel()
+        self.venta_entidad = sin_residuo(np.asarray(self.V.sum(1)).ravel(), bruto_ent,
+                                         tol, escala_tipica(bruto_ent))
         self.dias_entidad = matriz.dias_entidad[filas]
-        positivas = self.venta_entidad[self.venta_entidad > 0]
+        valido = self.venta_entidad > 0
+        positivas = self.venta_entidad[valido]
         self.venta_media = float(positivas.mean()) if len(positivas) else 0.0
-        escala = sp.diags(1.0 / np.where(self.venta_entidad > 0, self.venta_entidad, 1.0))
+        # participación de cada ítem en la compra de la entidad. La entidad cuya compra neta
+        # es cero (compró y devolvió todo) no tiene participaciones: su fila queda en cero y
+        # tampoco cuenta en el promedio del ítem, para no ensuciar la brecha de los demás.
+        escala = sp.diags(np.where(valido, 1.0 / np.where(valido, self.venta_entidad, 1.0), 0.0))
         self.share = (escala @ self.V).tocsr()
-        self.share_medio_comprador = np.where(self.soporte > 0,
-                                              np.asarray(self.share.sum(0)).ravel() / seguro, 0.0)
+        soporte_share = (np.asarray((self.R[valido] > 0).sum(0)).ravel().astype(float)
+                         if valido.any() else np.zeros(self.n_item))
+        self.share_medio_comprador = np.where(
+            soporte_share > 0,
+            np.asarray(self.share.sum(0)).ravel() / np.maximum(soporte_share, 1.0), 0.0)
 
     def __repr__(self) -> str:
         return (f"Bloque({self.etiqueta!r} nivel={self.nivel} {self.n:,} entidades, "

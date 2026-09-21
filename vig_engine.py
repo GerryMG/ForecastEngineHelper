@@ -39,6 +39,33 @@ def _dia(ts) -> int:
     return int((pd.Timestamp(ts).normalize() - _EPOCA).days)
 
 
+def sin_residuo(suma, suma_abs, tol: float, piso: float = 0.0):
+    """Anula la suma cuando no se distingue del residuo de cancelación de float64.
+
+    Sumar un importe y su reverso no da cero exacto: queda un residuo del orden de
+    1e-16 veces lo que pasó por la suma. En una serie eso convierte un período de
+    valor cero en uno de 1e-10, y si además es el denominador de un ratio, el punto
+    se dispara a millones y la vigilancia grita por nada. El cero se prueba contra la
+    escala real del período: la suma de los valores absolutos.
+
+    `piso` es una escala mínima de referencia (la del panel típico): sirve para el
+    residuo que ya llega cancelado desde la fuente, donde no hay nada con qué
+    compararlo dentro de la propia suma.
+    """
+    if not tol:
+        return suma
+    suma = np.asarray(suma, dtype=float)
+    escala = np.maximum(np.asarray(suma_abs, dtype=float), float(piso or 0.0))
+    return np.where(np.abs(suma) <= tol * escala, 0.0, suma)
+
+
+def escala_tipica(suma_abs) -> float:
+    """Escala de referencia del panel: la mediana de lo que movió cada grupo."""
+    a = np.asarray(suma_abs, dtype=float)
+    a = a[np.isfinite(a) & (a > 0)]
+    return float(np.median(a)) if a.size else 0.0
+
+
 # =========================================================================== #
 # 1. Configuración
 # =========================================================================== #
@@ -130,6 +157,11 @@ class VigConfig:
     nivel_minimo_evento: str = "ATENCION"
     #: cuántos causantes se guardan al explicar un evento
     top_atribucion: int = 5
+    #: Cuándo una suma de un período es cero. Un importe y su reverso no se anulan exacto
+    #: en punto flotante: queda un residuo de 1e-10 que, como denominador de un ratio,
+    #: dispara una alerta falsa. Una suma cuenta como cero cuando no llega a esta fracción
+    #: de lo que pasó por ella. 0 desactiva la limpieza.
+    tolerancia_cero: float = 1e-9
     decimales: int = 4
     verbose: int = 1
 
@@ -155,6 +187,8 @@ class VigConfig:
             desconocidos = [d for d in (v.detectores or self.detectores) if d not in DETECTORES]
             if desconocidos:
                 raise ValueError(f"{v.nombre}: detectores desconocidos {desconocidos}; hay {list(DETECTORES)}")
+        if not 0 <= self.tolerancia_cero < 1:
+            raise ValueError("tolerancia_cero debe estar entre 0 y 1 (0 = sin limpieza)")
         if self.nivel_notificacion not in NIVELES:
             raise ValueError(f"nivel_notificacion debe ser uno de {NIVELES}")
 
@@ -239,21 +273,33 @@ def armar_series(df: pd.DataFrame, v: Vigilancia, cfg: VigConfig, grano: str) ->
                          for c in claves})
     base["periodo"] = indice_periodo(df[cfg.col_fecha], grano)
     base["valor"] = pd.to_numeric(df[v.metrica], errors="coerce").fillna(0.0)
+    base["bruto"] = base["valor"].abs()
     if v.agregacion == "ratio":
         base["denominador"] = pd.to_numeric(df[v.denominador], errors="coerce").fillna(0.0)
+        base["denominador_bruto"] = base["denominador"].abs()
 
+    tol = cfg.tolerancia_cero
     g = base.groupby(claves + ["periodo"], sort=False)
     if v.agregacion == "conteo":
         out = g.size().reset_index(name="valor")
     elif v.agregacion == "promedio":
         out = g["valor"].mean().reset_index()
     elif v.agregacion == "ratio":
-        out = g.agg(numerador=("valor", "sum"), denominador=("denominador", "sum")).reset_index()
+        out = g.agg(numerador=("valor", "sum"), denominador=("denominador", "sum"),
+                    num_bruto=("bruto", "sum"),
+                    den_bruto=("denominador_bruto", "sum")).reset_index()
+        # el denominador que se anula con sus reversos vale 0, no 1e-10: el ratio queda
+        # nulo (un hueco de la serie) en vez de dispararse a millones
+        bd, bn = out.pop("den_bruto").to_numpy(float), out.pop("num_bruto").to_numpy(float)
+        den = sin_residuo(out["denominador"].to_numpy(float), bd, tol, escala_tipica(bd))
+        num = sin_residuo(out["numerador"].to_numpy(float), bn, tol, escala_tipica(bn))
+        out["denominador"], out["numerador"] = den, num
         with np.errstate(invalid="ignore", divide="ignore"):
-            den = out["denominador"].to_numpy(float)
-            out["valor"] = np.where(den != 0, out["numerador"].to_numpy(float) / den, np.nan)
+            out["valor"] = np.where(den != 0, num / den, np.nan)
     else:
-        out = g["valor"].sum().reset_index()
+        out = g.agg(valor=("valor", "sum"), bruto=("bruto", "sum")).reset_index()
+        bruto = out.pop("bruto").to_numpy(float)
+        out["valor"] = sin_residuo(out["valor"].to_numpy(float), bruto, tol, escala_tipica(bruto))
     out["clave"] = _clave_texto(out, claves)
     return out
 
@@ -806,7 +852,8 @@ def atribuir(crudo: pd.DataFrame, eventos: pd.DataFrame, v: Vigilancia, cfg: Vig
         aportan = aportan[aportan > 0].head(cfg.top_atribucion)
         if aportan.empty:
             continue
-        total = float(abs(delta.sum()))
+        # si el cambio neto se anula, el reparto no significa nada (sería 4.000.000 %)
+        total = float(sin_residuo(abs(delta.sum()), delta.abs().sum(), cfg.tolerancia_cero))
         parte = float(aportan.sum()) / total if total else 0.0
         detalle = ", ".join(f"{k} ({delta[k]:+,.0f} {v.unidad})" for k in aportan.index)
         salida[e["id_evento"]] = (f"{len(aportan)} de {len(delta)} explican el {parte:.0%} del cambio: "

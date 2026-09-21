@@ -29,6 +29,7 @@ Variables de entorno comunes: `ORA_USER`, `ORA_PASSWORD`, `ORA_DSN` para el orig
 | `MODO_CORRIDA`, `RELEER_MESES` | incremental o completa, y cuánto se relee | si corregís datos viejos seguido |
 | `MAX_DIAS_SIN_DATOS` | atraso tolerado de la fuente antes de cortar | si tu ETL carga con más atraso |
 | `FECHA_INICIO_FUENTE` | desde dónde lee la corrida completa | rara vez |
+| `TOLERANCIA_CERO` | cuándo una suma de dinero cuenta como cero (ver abajo) | casi nunca |
 
 Variables de entorno: `ST_MODO`, `ST_RELEER_MESES`, `ST_RELEER_DESDE`, `ST_FECHA_EJECUCION`, `ST_DRY_RUN`.
 
@@ -107,6 +108,7 @@ Los tres tipos se miden igual: **USD esperados en los próximos `HORIZONTE_DIAS`
 | `MIN_DIAS_COMPRA_ENTIDAD` | días de compra de la entidad para recomendarle algo | 3 |
 | `TOPE_POTENCIAL_POR_HISTORICO` | veces el propio ritmo de compra del ítem. `0` = sin tope | 1,5 |
 | `TOPE_POTENCIAL_RELATIVO` | veces su compra total en el mismo lapso. `0` = sin tope | 1,0 |
+| `TOLERANCIA_CERO` | cuándo una suma de dinero cuenta como cero (ver abajo) | 1e-9 |
 
 La evidencia queda en la tabla: `MT_DIAS_COMPRA_ITEM` (cuántas veces lo compró), `MT_INTERVALO_TIPICO`
 (su propio ritmo, vacío si no tiene), `MT_INTERVALO_ESPERADO` (el estimado, mezclando con los pares),
@@ -162,12 +164,55 @@ Una entrada por métrica en `VIGILANCIAS`, con estos campos:
 | `NIVEL_MINIMO_EVENTO` | desde qué nivel se guarda un evento (`INFO` = todo) | ATENCION |
 | `NIVEL_NOTIFICACION` | desde qué nivel se notifica | ALERTA |
 | `CANALES_NOTIFICACION` | `tabla` siempre; sumá `webhook`, `correo`, `teams` | `("tabla",)` |
+| `TOLERANCIA_CERO` | cuándo la suma de un período cuenta como cero (ver abajo) | 1e-9 |
 
 En el motor hay además `detectores_excluidos` (por defecto, `estacional` no corre en grano día),
 `desestacionalizar_dia`, `duracion_minima` por detector, `prioridad_detectores` y `unificar_eventos`.
 
 Variables de entorno: `VG_FECHA_EJECUCION`, `VG_MODO`, `VG_DRY_RUN`, `VG_WEBHOOK_URL`.
 Para calibrar: `VG_OBJETIVO`, `VG_REJILLA`, `VG_N_FALLAS` en `calibrar_vigilancia.ipynb`.
+
+---
+
+## `TOLERANCIA_CERO` — por qué una venta de cero no da cero
+
+Los tres motores la tienen, con el mismo valor por defecto (`1e-9`) y el mismo significado.
+
+Sumar en punto flotante una venta y su devolución **no da cero exacto**. Cada importe decimal se
+guarda redondeado en binario, y al ir acumulando queda un residuo del orden de 1e-16 veces lo más
+grande que pasó por la suma. Con 300.000 USD de venta y 300.000 de devolución, el neto puede quedar
+en `-4,7e-10` en lugar de `0`. Como número no molesta. Como **denominador de un porcentaje**, explota:
+
+```
+margen bruto = -0,01 / -4,7e-10 = 2.100.000.000 %
+```
+
+Por eso el cero no se prueba contra `0` exacto, sino contra la escala real de lo que se sumó: la
+suma de los valores absolutos, y como piso la escala típica del panel (la mediana de los grupos con
+movimiento, para el residuo que ya llega cancelado desde la fuente).
+
+| Suma | Lo que pasó por ella | Razón | Veredicto |
+|---|---|---|---|
+| -4,7e-10 | 600.000 | 7,8e-17 | es cero |
+| -0,01 | 600.000 | 1,7e-8 | es un neto real, se respeta |
+
+Qué protege en cada motor:
+
+- **Estadísticas**: `MT_MARGENBRUTO` y `MT_MARGENBRUTO_R12` quedan **nulos** en lugar de dar millones;
+  `MT_VOLUMENCOMPRA` y las ventas por ventana salen en `0,00` y no en `-1,8e-11`; los meses que se
+  anulan no entran en `MT_IDDPORCENTUALMARGEN`. La corrida informa cuántas sumas quedaron en cero.
+- **Recomendación**: el ítem que se vende y se devuelve entero no tiene margen % gigante, y la
+  entidad cuya compra neta es cero no participa del promedio de participaciones de sus pares.
+- **Vigilancia**: un ratio cuyo denominador se anula da **nulo** (un hueco de la serie) en lugar de
+  un pico de 1e11 que llega al webhook como una alerta crítica.
+
+`1e-9` equivale a un centavo en diez millones: nada real cae ahí. Poner `0` la desactiva por completo
+y devuelve el comportamiento anterior.
+
+El piso del panel es una heurística, no una demostración: si tus importes viven en una moneda donde
+un grupo **real** puede valer una milmillonésima del grupo típico, bajá `TOLERANCIA_CERO` a `1e-12`.
+La parte que sí es exacta —la comparación contra lo que pasó por la propia suma— sigue funcionando
+igual con cualquier valor.
 
 ---
 

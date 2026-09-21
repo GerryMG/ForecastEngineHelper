@@ -142,6 +142,13 @@ NIVEL_MINIMO_EVENTO = "ATENCION"    # desde qué nivel se guarda un evento ("INF
 CANALES_NOTIFICACION = ("tabla",)   # "tabla", "webhook", y los que agregues abajo
 
 
+# Cuándo una suma de un período es cero. Un importe y su reverso no se anulan exacto en
+# punto flotante: queda un residuo de 1e-10 que, como denominador de un ratio, dispara una
+# alerta falsa. Una suma cuenta como cero cuando no llega a esta fracción de lo que pasó
+# por ella. 0 la apaga.
+TOLERANCIA_CERO = 1e-9
+
+
 def build_config(fecha_ejecucion: str | None = None) -> VigConfig:
     return VigConfig(
         vigilancias=VIGILANCIAS,
@@ -159,6 +166,7 @@ def build_config(fecha_ejecucion: str | None = None) -> VigConfig:
         piso_sigma_relativo=PISO_SIGMA_RELATIVO,
         nivel_notificacion=NIVEL_NOTIFICACION,
         nivel_minimo_evento=NIVEL_MINIMO_EVENTO,
+        tolerancia_cero=TOLERANCIA_CERO,
     )
 
 

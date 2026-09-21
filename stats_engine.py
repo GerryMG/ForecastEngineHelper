@@ -64,6 +64,42 @@ MESES_ES = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO", "AGO
 _EPOCA = pd.Timestamp("1970-01-01")
 
 
+def sin_residuo(suma, suma_abs, tol: float, piso: float = 0.0):
+    """Anula la suma cuando no se distingue del residuo de cancelación.
+
+    Sumar en float64 una venta y su devolución no da cero exacto: cada número
+    decimal se guarda redondeado, y al ir acumulando queda un residuo del orden
+    de 1e-16 veces lo más grande que pasó por la suma. Con 300.000 USD de venta
+    y 300.000 de devolución el neto puede quedar en -4.7e-11 en vez de 0. Como
+    número no molesta; como denominador de un porcentaje, explota: un margen de
+    -0,01 dividido por -4.7e-11 da 21 millones por ciento.
+
+    Por eso el cero no se prueba contra 0 exacto sino contra la escala real del
+    grupo, que es la suma de los valores absolutos: lo que pasó por la suma.
+
+        suma = -4.7e-11, suma_abs = 600.000  ->  razón 7.8e-17  ->  es cero
+        suma = -0,01,    suma_abs = 600.000  ->  razón 1.7e-8   ->  es un neto real
+
+    tol = 0 devuelve la suma tal cual.
+
+    `piso` es una escala mínima de referencia (la del panel típico): sirve para el
+    residuo que ya llega cancelado desde la fuente, donde no hay nada con qué
+    compararlo dentro de la propia suma.
+    """
+    if not tol:
+        return suma
+    suma = np.asarray(suma, dtype=float)
+    escala = np.maximum(np.asarray(suma_abs, dtype=float), float(piso or 0.0))
+    return np.where(np.abs(suma) <= tol * escala, 0.0, suma)
+
+
+def escala_tipica(suma_abs) -> float:
+    """Escala de referencia del panel: la mediana de lo que movió cada grupo."""
+    a = np.asarray(suma_abs, dtype=float)
+    a = a[np.isfinite(a) & (a > 0)]
+    return float(np.median(a)) if a.size else 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Configuración
 # --------------------------------------------------------------------------- #
@@ -92,6 +128,11 @@ class StatsConfig:
     idd_unidad: str = "gon"            #: gon (0..100) | grados | radianes
     idd_normalizar: bool = False       #: True = pendiente relativa al promedio antes del ángulo
     margen_escala: float = 100.0       #: márgenes en % (100) o fracción (1)
+    #: Un denominador se toma como cero cuando |suma| <= tolerancia_cero * suma de los
+    #: valores absolutos. Una venta y su devolución no se anulan exacto en punto flotante:
+    #: dejan un residuo minúsculo, y si ese residuo cae en el denominador de un porcentaje
+    #: el resultado explota. 1e-9 = un centavo en diez millones. 0 desactiva la limpieza.
+    tolerancia_cero: float = 1e-9
     modelo_actividad: str = "pareto"   #: pareto | mbgnbd | bgnbd
     #: el modelo se ajusta sobre una muestra estable de hasta N grupos (None = todos).
     #: Sus 4 parámetros describen a la población: la probabilidad se calcula para todos.
@@ -119,6 +160,8 @@ class StatsConfig:
             raise ValueError("Hace falta al menos una categoría clave (SK_* o BK_*)")
         if self.idd_unidad not in ("gon", "grados", "radianes"):
             raise ValueError("idd_unidad debe ser gon, grados o radianes")
+        if not 0 <= self.tolerancia_cero < 1:
+            raise ValueError("tolerancia_cero debe estar entre 0 y 1 (0 = sin limpieza)")
         if self.modelo_actividad not in MODELOS_ACTIVIDAD:
             raise ValueError(f"modelo_actividad debe ser uno de {list(MODELOS_ACTIVIDAD)}")
         fuera = [c for c in self.segmentos_actividad if c not in self.categorias]
@@ -184,11 +227,21 @@ class Contexto:
         self.G = n_grupos
         self.hash_grupo: Optional[np.ndarray] = None    # identifica al grupo entre corridas
         self.segmento: Optional[np.ndarray] = None      # segmento de actividad de cada grupo
+        self.residuos = 0        # sumas de dinero que quedaron en cero por cancelación
 
     # -- helpers vectorizados ------------------------------------------------ #
-    def suma(self, grupos: np.ndarray, valores: np.ndarray, mascara=None) -> np.ndarray:
+    def suma(self, grupos: np.ndarray, valores: np.ndarray, mascara=None,
+             neta: bool = False) -> np.ndarray:
+        """Suma por grupo. neta=True limpia el residuo de cancelación (ver `sin_residuo`):
+        se usa en todo lo que sea dinero, porque puede sumar cero de verdad."""
         w = valores if mascara is None else np.where(mascara, valores, 0.0)
-        return np.bincount(grupos, weights=w, minlength=self.G).astype(float)
+        s = np.bincount(grupos, weights=w, minlength=self.G).astype(float)
+        if not neta or not self.cfg.tolerancia_cero:
+            return s
+        escala = np.bincount(grupos, weights=np.abs(w), minlength=self.G).astype(float)
+        limpia = sin_residuo(s, escala, self.cfg.tolerancia_cero, escala_tipica(escala))
+        self.residuos += int(np.count_nonzero((s != 0) & (limpia == 0)))
+        return limpia
 
     def conteo(self, grupos: np.ndarray, mascara=None) -> np.ndarray:
         w = None if mascara is None else mascara.astype(float)
@@ -261,12 +314,15 @@ class Contexto:
     def mensual(self) -> Dict[str, np.ndarray]:
         m = self.mes_fila
         idx = np.flatnonzero(np.r_[True, (self.gid[1:] != self.gid[:-1]) | (m[1:] != m[:-1])])
-        return {
-            "gid": self.gid[idx],
-            "mes": m[idx],
-            "venta": np.add.reduceat(self.venta, idx),
-            "margen": np.add.reduceat(self.margen, idx),
-        }
+        tol = self.cfg.tolerancia_cero
+        venta = np.add.reduceat(self.venta, idx)
+        margen = np.add.reduceat(self.margen, idx)
+        if tol:                      # el mes que se anula con sus devoluciones vale 0, no 1e-11
+            bv = np.add.reduceat(np.abs(self.venta), idx)
+            bm = np.add.reduceat(np.abs(self.margen), idx)
+            venta = sin_residuo(venta, bv, tol, escala_tipica(bv))
+            margen = sin_residuo(margen, bm, tol, escala_tipica(bm))
+        return {"gid": self.gid[idx], "mes": m[idx], "venta": venta, "margen": margen}
 
     # -- estacionalidad (G x 12), compartida por varias columnas ------------- #
     @cached_property
@@ -433,7 +489,7 @@ def rango_ventana(f: Fechas, cfg: StatsConfig, ventana: str, ap: bool = False) -
 # ── A. Venta por ventana ────────────────────────────────────────────────────
 def venta_ventana(ctx: Contexto, ventana: str, ap: bool = False) -> np.ndarray:
     ini, fin = rango_ventana(ctx.f, ctx.cfg, ventana, ap)
-    return ctx.suma(ctx.gid, ctx.venta, (ctx.dia >= ini) & (ctx.dia <= fin))
+    return ctx.suma(ctx.gid, ctx.venta, (ctx.dia >= ini) & (ctx.dia <= fin), neta=True)
 
 
 # ── B. Comportamiento por día de compra ─────────────────────────────────────
@@ -470,7 +526,7 @@ def dias_comprados(ctx: Contexto) -> np.ndarray:
 
 
 def volumen_compra(ctx: Contexto) -> np.ndarray:
-    return ctx.suma(ctx.gid, ctx.venta)
+    return ctx.suma(ctx.gid, ctx.venta, neta=True)
 
 
 def _intervalos_en_ventana(ctx: Contexto, ventana: Optional[str]):
@@ -508,7 +564,8 @@ def _dias_en_ventana(ctx: Contexto, ventana: Optional[str]):
 def ticket_promedio(ctx: Contexto, ventana: Optional[str] = None) -> np.ndarray:
     """Venta por día de compra."""
     m = _dias_en_ventana(ctx, ventana)
-    return ctx.media_std(ctx.conteo(ctx.gid, m), ctx.suma(ctx.gid, ctx.venta, m), ctx.dias_compra)[0]
+    return ctx.media_std(ctx.conteo(ctx.gid, m), ctx.suma(ctx.gid, ctx.venta, m, neta=True),
+                         ctx.dias_compra)[0]
 
 
 def ticket_promedio_std(ctx: Contexto, ventana: Optional[str] = None) -> np.ndarray:
@@ -537,14 +594,14 @@ def _pendiente_venta(ctx: Contexto, meses: Optional[int], normalizar: bool) -> n
     lo_fila = lo[mm["gid"]]
     ok = (mm["mes"] >= lo_fila) & (mm["mes"] <= hi)
     x = (mm["mes"] - lo_fila).astype(float)
-    sy = ctx.suma(mm["gid"], mm["venta"], ok)
+    sy = ctx.suma(mm["gid"], mm["venta"], ok, neta=True)
     sxy = ctx.suma(mm["gid"], x * mm["venta"], ok)
     sx = n * (n - 1) / 2
     sxx = (n - 1) * n * (2 * n - 1) / 6
     with np.errstate(divide="ignore", invalid="ignore"):
         den = n * sxx - sx * sx
         p = np.where((n >= 2) & (den > 0), (n * sxy - sx * sy) / den, np.nan)
-        if normalizar:
+        if normalizar:      # sy neta: el grupo que vende y devuelve todo no tiene promedio
             media = sy / np.where(n > 0, n, 1)
             p = np.where(media > 0, p / media, np.nan)
     return p
@@ -568,7 +625,7 @@ def idd_porcentual_margen(ctx: Contexto, ventana: Optional[str] = None) -> np.nd
     meses = None if ventana is None else ctx.cfg.meses_ventana[ventana]
     lo = ctx.primer_mes if meses is None else np.maximum(ctx.primer_mes, hi - meses + 1)
     lo_fila = lo[mm["gid"]]
-    ok = (mm["mes"] >= lo_fila) & (mm["mes"] <= hi) & (mm["venta"] > 0)
+    ok = (mm["mes"] >= lo_fila) & (mm["mes"] <= hi) & (mm["venta"] > 0)   # venta ya limpia
     with np.errstate(divide="ignore", invalid="ignore"):
         y = np.where(ok, ctx.cfg.margen_escala * mm["margen"] / mm["venta"], 0.0)
     x = (mm["mes"] - lo_fila).astype(float)
@@ -584,9 +641,14 @@ def idd_porcentual_margen(ctx: Contexto, ventana: Optional[str] = None) -> np.nd
 
 # ── D. Margen ───────────────────────────────────────────────────────────────
 def margen_bruto(ctx: Contexto, ventana: Optional[str] = None) -> np.ndarray:
-    """Margen ponderado: suma de margen / suma de venta, en %."""
+    """Margen ponderado: suma de margen / suma de venta, en %.
+
+    La venta va neta (`sin_residuo`): el grupo que vendió y devolvió lo mismo tiene
+    venta cero, no un residuo de 1e-11, y su margen % queda nulo en vez de explotar.
+    """
     m = _dias_en_ventana(ctx, ventana)
-    v, mg = ctx.suma(ctx.gid, ctx.venta, m), ctx.suma(ctx.gid, ctx.margen, m)
+    v = ctx.suma(ctx.gid, ctx.venta, m, neta=True)
+    mg = ctx.suma(ctx.gid, ctx.margen, m, neta=True)
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.where(v != 0, ctx.cfg.margen_escala * mg / v, np.nan)
 
@@ -597,7 +659,8 @@ def anio_inicial(ctx: Contexto) -> np.ndarray:
 
 
 def venta_anio_inicial(ctx: Contexto) -> np.ndarray:
-    return ctx.suma(ctx.gid, ctx.venta, ctx.anio_fila == ctx.anio_fila[ctx.inicios][ctx.gid])
+    return ctx.suma(ctx.gid, ctx.venta, ctx.anio_fila == ctx.anio_fila[ctx.inicios][ctx.gid],
+                    neta=True)
 
 
 def anio_final_cerrado(ctx: Contexto) -> np.ndarray:
@@ -608,7 +671,7 @@ def anio_final_cerrado(ctx: Contexto) -> np.ndarray:
 def venta_anio_final_cerrado(ctx: Contexto) -> np.ndarray:
     fin = anio_final_cerrado(ctx)
     return np.where(np.isnan(fin), np.nan,
-                    ctx.suma(ctx.gid, ctx.venta, ctx.anio_fila == fin[ctx.gid]))
+                    ctx.suma(ctx.gid, ctx.venta, ctx.anio_fila == fin[ctx.gid], neta=True))
 
 
 # ── F. Estacionalidad ───────────────────────────────────────────────────────
@@ -657,7 +720,7 @@ def venta_siguiente_mes_esperada(ctx: Contexto) -> np.ndarray:
 
 def venta_cumplida_actual(ctx: Contexto) -> np.ndarray:
     ini = _dia(_inicio_mes(ctx.f.m_actual))
-    return ctx.suma(ctx.gid, ctx.venta, (ctx.dia >= ini) & (ctx.dia <= ctx.f.d_ayer))
+    return ctx.suma(ctx.gid, ctx.venta, (ctx.dia >= ini) & (ctx.dia <= ctx.f.d_ayer), neta=True)
 
 
 # ── G. Actividad ────────────────────────────────────────────────────────────
@@ -1085,10 +1148,13 @@ class StatsEngine:
 
         # un registro por grupo-día
         nuevo = np.flatnonzero(cambio_grupo | np.r_[True, d[1:] != d[:-1]])
-        ctx = Contexto(cfg, self.fechas, g[nuevo], d[nuevo],
-                       np.add.reduceat(venta[orden], nuevo),
-                       np.add.reduceat(margen[orden], nuevo),
-                       int(g.max()) + 1)
+        v_dia, mg_dia = np.add.reduceat(venta[orden], nuevo), np.add.reduceat(margen[orden], nuevo)
+        if cfg.tolerancia_cero:      # el día que se anula con su devolución vale 0, no 1e-12
+            bv = np.add.reduceat(np.abs(venta[orden]), nuevo)
+            bm = np.add.reduceat(np.abs(margen[orden]), nuevo)
+            v_dia = sin_residuo(v_dia, bv, cfg.tolerancia_cero, escala_tipica(bv))
+            mg_dia = sin_residuo(mg_dia, bm, cfg.tolerancia_cero, escala_tipica(bm))
+        ctx = Contexto(cfg, self.fechas, g[nuevo], d[nuevo], v_dia, mg_dia, int(g.max()) + 1)
         ctx.hash_grupo = pd.util.hash_pandas_object(cats[claves], index=False).to_numpy(np.uint64)
         if cfg.segmentos_actividad:
             etiqueta = None
@@ -1119,6 +1185,11 @@ class StatsEngine:
         salida["FECHA_CORTE"] = np.full(ctx.G, f.ayer)
 
         out = pd.DataFrame(salida)
+        if ctx.residuos:
+            LOGGER.info("%s sumas de dinero quedaron en cero (contando todas las columnas): "
+                        "venta y devolución se anulan y lo que sobraba era residuo de punto "
+                        "flotante. Sus porcentajes salen nulos (tolerancia_cero=%g)",
+                        f"{ctx.residuos:,}", self.cfg.tolerancia_cero)
         LOGGER.info("estadísticas: %s filas x %d columnas en %.1fs", f"{len(out):,}",
                     out.shape[1], time.time() - t_inicio)
         return out

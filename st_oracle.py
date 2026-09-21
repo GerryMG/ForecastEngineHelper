@@ -99,6 +99,13 @@ COL_FECHA = "FECHA"
 COL_VENTA = "MT_VENTA"
 COL_MARGEN = "MT_MARGEN"          # margen bruto en USD (venta - costo)
 
+# Cuándo una suma de dinero es cero. Sumar en punto flotante una venta y su devolución no
+# da cero exacto: queda un residuo de 1e-10, y si cae en el denominador de un porcentaje
+# (el margen bruto) el resultado explota. Una suma cuenta como cero cuando su valor
+# absoluto no llega a esta fracción de lo que pasó por la suma (la suma de los valores
+# absolutos). 1e-9 = un centavo en diez millones. 0 desactiva la limpieza.
+TOLERANCIA_CERO = 1e-9
+
 TABLA_DESTINO = "EST_CLIENTE"     # podés calificarla: "ESQUEMA.EST_CLIENTE"
 
 # "delete"   : DELETE + INSERT en una transacción. Si algo falla, la tabla queda como estaba.
@@ -145,6 +152,7 @@ def build_config(fecha_ejecucion: str | None = None) -> StatsConfig:
         idd_unidad="gon",         # 0 plano, 100 creciente, -100 decreciente
         idd_normalizar=False,     # pendiente cruda, como se acordó
         margen_escala=100.0,      # márgenes en %
+        tolerancia_cero=TOLERANCIA_CERO,
 
         modelo_actividad="pareto",     # el mejor en las pruebas; alternativas: mbgnbd, bgnbd
         max_clientes_ajuste=20_000,    # los 4 parámetros se estiman sobre esta muestra estable (por segmento)

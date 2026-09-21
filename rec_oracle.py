@@ -138,6 +138,12 @@ MIN_SOPORTE = 5                # entidades del segmento que tienen que comprar e
 MIN_PENETRACION = 0.02         # y la fracción mínima del segmento
 MAX_ITEMS_RECO = 10            # recomendaciones por entidad
 
+# Cuándo una suma de dinero es cero. Una venta y su devolución no se anulan exacto en
+# punto flotante: queda un residuo de 1e-10 que, si cae en un denominador (el margen %,
+# la participación de la entidad), explota. Una suma cuenta como cero cuando no llega a
+# esta fracción de lo que pasó por ella. 1e-9 = un centavo en diez millones. 0 la apaga.
+TOLERANCIA_CERO = 1e-9
+
 # La batería. Se miden todas con backtest y gana la mejor en cada segmento.
 ALGORITMOS = ("popularidad", "coseno_item", "coseno_entidad", "svd", "kmeans_valor", "reglas")
 SELECCION = "backtest"         # backtest | rrf | ponderado | el nombre de un algoritmo
@@ -205,6 +211,7 @@ def build_config(fecha_ejecucion: str | None = None, seleccion: str | None = Non
         dias_backtest=DIAS_BACKTEST,
         min_entidades_segmento=MIN_ENTIDADES_SEGMENTO,
         min_soporte=MIN_SOPORTE,
+        tolerancia_cero=TOLERANCIA_CERO,
         min_penetracion=MIN_PENETRACION,
         max_items_reco=MAX_ITEMS_RECO,
 
