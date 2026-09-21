@@ -59,6 +59,31 @@ def sin_residuo(suma, suma_abs, tol: float, piso: float = 0.0):
     return np.where(np.abs(suma) <= tol * escala, 0.0, suma)
 
 
+def escala_decimal(arrays, max_decimales: int = 6) -> float:
+    """Potencia de 10 que vuelve enteros a todos los importes, o 0 si no la hay.
+
+    El dinero es decimal: 1.234,56 son 123.456 centavos. Los enteros se suman SIN
+    ERROR en float64 mientras no pasen de 2^53, así que sumar en esa escala hace que
+    un importe y su reverso den cero exacto, sin tolerancias ni umbrales. Es lo mismo
+    que hace Oracle con NUMBER, y cuesta lo mismo que sumar en float.
+
+    Se elige la escala más chica que sirva y que no desborde 2^53 con el bruto. Si los
+    valores traen más decimales de los buscados, se usa el máximo y el resto se
+    redondea. Devuelve 0 cuando no hay escala usable: ahí entra `sin_residuo`.
+    """
+    finitos = [np.asarray(a, dtype=float)[np.isfinite(np.asarray(a, dtype=float))]
+               for a in arrays]
+    bruto = sum(float(np.abs(a).sum()) for a in finitos) or 1.0
+    for d in range(int(max_decimales) + 1):
+        e = 10.0 ** d
+        if bruto * e >= 2.0 ** 53:      # ya no entra, y con más decimales entra menos
+            return 0.0
+        if all(np.array_equal(np.round(a, d), a) for a in finitos):
+            return e
+    e = 10.0 ** int(max_decimales)
+    return e if bruto * e < 2.0 ** 53 else 0.0
+
+
 def escala_tipica(suma_abs) -> float:
     """Escala de referencia del panel: la mediana de lo que movió cada grupo."""
     a = np.asarray(suma_abs, dtype=float)
@@ -157,10 +182,13 @@ class VigConfig:
     nivel_minimo_evento: str = "ATENCION"
     #: cuántos causantes se guardan al explicar un evento
     top_atribucion: int = 5
-    #: Cuándo una suma de un período es cero. Un importe y su reverso no se anulan exacto
-    #: en punto flotante: queda un residuo de 1e-10 que, como denominador de un ratio,
-    #: dispara una alerta falsa. Una suma cuenta como cero cuando no llega a esta fracción
-    #: de lo que pasó por ella. 0 desactiva la limpieza.
+    #: Suma los valores de cada período en su escala decimal (centavos): un importe y
+    #: su reverso dan cero EXACTO, sin tolerancias. Es lo que hace Oracle con NUMBER.
+    suma_exacta: bool = True
+    #: hasta cuántos decimales busca esa escala. Más allá, redondea.
+    max_decimales: int = 6
+    #: Plan B para cuando no hay escala decimal usable: una suma cuenta como cero
+    #: cuando no llega a esta fracción de lo que pasó por ella. 0 lo desactiva.
     tolerancia_cero: float = 1e-9
     decimales: int = 4
     verbose: int = 1
@@ -187,6 +215,8 @@ class VigConfig:
             desconocidos = [d for d in (v.detectores or self.detectores) if d not in DETECTORES]
             if desconocidos:
                 raise ValueError(f"{v.nombre}: detectores desconocidos {desconocidos}; hay {list(DETECTORES)}")
+        if not 0 <= self.max_decimales <= 15:
+            raise ValueError("max_decimales debe estar entre 0 y 15")
         if not 0 <= self.tolerancia_cero < 1:
             raise ValueError("tolerancia_cero debe estar entre 0 y 1 (0 = sin limpieza)")
         if self.nivel_notificacion not in NIVELES:
@@ -279,11 +309,25 @@ def armar_series(df: pd.DataFrame, v: Vigilancia, cfg: VigConfig, grano: str) ->
         base["denominador_bruto"] = base["denominador"].abs()
 
     tol = cfg.tolerancia_cero
+    # escala decimal de la métrica: en centavos los enteros se suman sin error y el
+    # período que se anula con sus reversos da cero exacto
+    columnas_dinero = [base["valor"].to_numpy(float)]
+    if v.agregacion == "ratio":
+        columnas_dinero.append(base["denominador"].to_numpy(float))
+    e = escala_decimal(columnas_dinero, cfg.max_decimales) if cfg.suma_exacta else 0.0
+    if e:
+        base["valor"] = np.round(base["valor"].to_numpy(float) * e)
+        base["bruto"] = base["valor"].abs()
+        if v.agregacion == "ratio":
+            base["denominador"] = np.round(base["denominador"].to_numpy(float) * e)
+            base["denominador_bruto"] = base["denominador"].abs()
     g = base.groupby(claves + ["periodo"], sort=False)
     if v.agregacion == "conteo":
         out = g.size().reset_index(name="valor")
     elif v.agregacion == "promedio":
         out = g["valor"].mean().reset_index()
+        if e:
+            out["valor"] = out["valor"].to_numpy(float) / e
     elif v.agregacion == "ratio":
         out = g.agg(numerador=("valor", "sum"), denominador=("denominador", "sum"),
                     num_bruto=("bruto", "sum"),
@@ -291,15 +335,20 @@ def armar_series(df: pd.DataFrame, v: Vigilancia, cfg: VigConfig, grano: str) ->
         # el denominador que se anula con sus reversos vale 0, no 1e-10: el ratio queda
         # nulo (un hueco de la serie) en vez de dispararse a millones
         bd, bn = out.pop("den_bruto").to_numpy(float), out.pop("num_bruto").to_numpy(float)
-        den = sin_residuo(out["denominador"].to_numpy(float), bd, tol, escala_tipica(bd))
-        num = sin_residuo(out["numerador"].to_numpy(float), bn, tol, escala_tipica(bn))
+        den, num = out["denominador"].to_numpy(float), out["numerador"].to_numpy(float)
+        if e:                              # enteros: el que se anula ya vale 0
+            den, num = den / e, num / e
+        else:
+            den = sin_residuo(den, bd, tol, escala_tipica(bd))
+            num = sin_residuo(num, bn, tol, escala_tipica(bn))
         out["denominador"], out["numerador"] = den, num
         with np.errstate(invalid="ignore", divide="ignore"):
             out["valor"] = np.where(den != 0, num / den, np.nan)
     else:
         out = g.agg(valor=("valor", "sum"), bruto=("bruto", "sum")).reset_index()
         bruto = out.pop("bruto").to_numpy(float)
-        out["valor"] = sin_residuo(out["valor"].to_numpy(float), bruto, tol, escala_tipica(bruto))
+        out["valor"] = (out["valor"].to_numpy(float) / e if e else
+                        sin_residuo(out["valor"].to_numpy(float), bruto, tol, escala_tipica(bruto)))
     out["clave"] = _clave_texto(out, claves)
     return out
 

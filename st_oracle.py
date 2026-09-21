@@ -99,11 +99,16 @@ COL_FECHA = "FECHA"
 COL_VENTA = "MT_VENTA"
 COL_MARGEN = "MT_MARGEN"          # margen bruto en USD (venta - costo)
 
-# Cuándo una suma de dinero es cero. Sumar en punto flotante una venta y su devolución no
-# da cero exacto: queda un residuo de 1e-10, y si cae en el denominador de un porcentaje
-# (el margen bruto) el resultado explota. Una suma cuenta como cero cuando su valor
-# absoluto no llega a esta fracción de lo que pasó por la suma (la suma de los valores
-# absolutos). 1e-9 = un centavo en diez millones. 0 desactiva la limpieza.
+# El dinero se suma en su escala decimal (centavos), igual que hace Oracle con NUMBER:
+# los enteros se suman sin error, así que la venta que se anula con su devolución da cero
+# EXACTO y su margen bruto sale nulo en vez de dar millones por ciento.
+# Es lo que resuelve el problema; no cuesta nada y no hay umbrales de por medio.
+SUMA_EXACTA = True
+MAX_DECIMALES = 6       # hasta cuántos decimales busca esa escala; más allá, redondea
+
+# Plan B, sólo si no hay escala decimal usable (importes con muchísimos decimales, o un
+# bruto que desborda 2^53 ≈ 90 billones en centavos). Una suma cuenta como cero cuando no
+# llega a esta fracción de lo que pasó por ella. 0 lo apaga.
 TOLERANCIA_CERO = 1e-9
 
 TABLA_DESTINO = "EST_CLIENTE"     # podés calificarla: "ESQUEMA.EST_CLIENTE"
@@ -152,6 +157,8 @@ def build_config(fecha_ejecucion: str | None = None) -> StatsConfig:
         idd_unidad="gon",         # 0 plano, 100 creciente, -100 decreciente
         idd_normalizar=False,     # pendiente cruda, como se acordó
         margen_escala=100.0,      # márgenes en %
+        suma_exacta=SUMA_EXACTA,
+        max_decimales=MAX_DECIMALES,
         tolerancia_cero=TOLERANCIA_CERO,
 
         modelo_actividad="pareto",     # el mejor en las pruebas; alternativas: mbgnbd, bgnbd

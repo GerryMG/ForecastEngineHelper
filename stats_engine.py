@@ -93,6 +93,32 @@ def sin_residuo(suma, suma_abs, tol: float, piso: float = 0.0):
     return np.where(np.abs(suma) <= tol * escala, 0.0, suma)
 
 
+def escala_decimal(arrays, max_decimales: int = 6) -> float:
+    """Potencia de 10 que vuelve enteros a todos los importes, o 0 si no la hay.
+
+    El dinero es decimal: 1.234,56 son 123.456 centavos. Los enteros se suman SIN
+    ERROR en float64 mientras no pasen de 2^53, así que sumar en esa escala hace que
+    una venta y su devolución den cero exacto, sin tolerancias ni umbrales. Es lo
+    mismo que hace Oracle con NUMBER, y cuesta lo mismo que sumar en float.
+
+    Se elige la escala más chica que sirva y que no desborde 2^53 con el bruto del
+    panel. Si los importes traen más decimales de los buscados, se usa el máximo y
+    el resto se redondea (medio millonésimo de dólar, si max_decimales=6). Devuelve
+    0 cuando no hay escala usable: ahí entra `sin_residuo` como plan B.
+    """
+    finitos = [np.asarray(a, dtype=float)[np.isfinite(np.asarray(a, dtype=float))]
+               for a in arrays]
+    bruto = sum(float(np.abs(a).sum()) for a in finitos) or 1.0
+    for d in range(int(max_decimales) + 1):
+        e = 10.0 ** d
+        if bruto * e >= 2.0 ** 53:      # ya no entra, y con más decimales entra menos
+            return 0.0
+        if all(np.array_equal(np.round(a, d), a) for a in finitos):
+            return e
+    e = 10.0 ** int(max_decimales)
+    return e if bruto * e < 2.0 ** 53 else 0.0
+
+
 def escala_tipica(suma_abs) -> float:
     """Escala de referencia del panel: la mediana de lo que movió cada grupo."""
     a = np.asarray(suma_abs, dtype=float)
@@ -128,7 +154,14 @@ class StatsConfig:
     idd_unidad: str = "gon"            #: gon (0..100) | grados | radianes
     idd_normalizar: bool = False       #: True = pendiente relativa al promedio antes del ángulo
     margen_escala: float = 100.0       #: márgenes en % (100) o fracción (1)
-    #: Un denominador se toma como cero cuando |suma| <= tolerancia_cero * suma de los
+    #: Suma el dinero en su escala decimal (centavos): la venta que se anula con su
+    #: devolución da cero EXACTO, sin tolerancias. Es lo que hace Oracle con NUMBER.
+    suma_exacta: bool = True
+    #: hasta cuántos decimales busca esa escala. Más allá, redondea.
+    max_decimales: int = 6
+    #: Plan B para cuando no hay escala decimal usable (importes con muchísimos
+    #: decimales o un bruto que desborda 2^53). Un denominador se toma como cero
+    #: cuando |suma| <= tolerancia_cero * suma de los
     #: valores absolutos. Una venta y su devolución no se anulan exacto en punto flotante:
     #: dejan un residuo minúsculo, y si ese residuo cae en el denominador de un porcentaje
     #: el resultado explota. 1e-9 = un centavo en diez millones. 0 desactiva la limpieza.
@@ -160,6 +193,8 @@ class StatsConfig:
             raise ValueError("Hace falta al menos una categoría clave (SK_* o BK_*)")
         if self.idd_unidad not in ("gon", "grados", "radianes"):
             raise ValueError("idd_unidad debe ser gon, grados o radianes")
+        if not 0 <= self.max_decimales <= 15:
+            raise ValueError("max_decimales debe estar entre 0 y 15")
         if not 0 <= self.tolerancia_cero < 1:
             raise ValueError("tolerancia_cero debe estar entre 0 y 1 (0 = sin limpieza)")
         if self.modelo_actividad not in MODELOS_ACTIVIDAD:
@@ -227,14 +262,18 @@ class Contexto:
         self.G = n_grupos
         self.hash_grupo: Optional[np.ndarray] = None    # identifica al grupo entre corridas
         self.segmento: Optional[np.ndarray] = None      # segmento de actividad de cada grupo
+        self.escala = 0.0        # escala decimal del dinero (100 = centavos); 0 = sin escala
         self.residuos = 0        # sumas de dinero que quedaron en cero por cancelación
 
     # -- helpers vectorizados ------------------------------------------------ #
     def suma(self, grupos: np.ndarray, valores: np.ndarray, mascara=None,
              neta: bool = False) -> np.ndarray:
-        """Suma por grupo. neta=True limpia el residuo de cancelación (ver `sin_residuo`):
-        se usa en todo lo que sea dinero, porque puede sumar cero de verdad."""
+        """Suma por grupo. neta=True es para el dinero, que puede sumar cero de verdad:
+        se suma en la escala decimal (exacto) o, si no hay, se limpia el residuo."""
         w = valores if mascara is None else np.where(mascara, valores, 0.0)
+        if neta and self.escala:          # centavos: enteros, sin error posible
+            return np.bincount(grupos, weights=np.round(w * self.escala),
+                               minlength=self.G) / self.escala
         s = np.bincount(grupos, weights=w, minlength=self.G).astype(float)
         if not neta or not self.cfg.tolerancia_cero:
             return s
@@ -314,14 +353,19 @@ class Contexto:
     def mensual(self) -> Dict[str, np.ndarray]:
         m = self.mes_fila
         idx = np.flatnonzero(np.r_[True, (self.gid[1:] != self.gid[:-1]) | (m[1:] != m[:-1])])
-        tol = self.cfg.tolerancia_cero
-        venta = np.add.reduceat(self.venta, idx)
-        margen = np.add.reduceat(self.margen, idx)
-        if tol:                      # el mes que se anula con sus devoluciones vale 0, no 1e-11
-            bv = np.add.reduceat(np.abs(self.venta), idx)
-            bm = np.add.reduceat(np.abs(self.margen), idx)
-            venta = sin_residuo(venta, bv, tol, escala_tipica(bv))
-            margen = sin_residuo(margen, bm, tol, escala_tipica(bm))
+        # el mes que se anula con sus devoluciones tiene que valer 0, no 1e-11
+        if self.escala:
+            venta = np.add.reduceat(np.round(self.venta * self.escala), idx) / self.escala
+            margen = np.add.reduceat(np.round(self.margen * self.escala), idx) / self.escala
+        else:
+            tol = self.cfg.tolerancia_cero
+            venta = np.add.reduceat(self.venta, idx)
+            margen = np.add.reduceat(self.margen, idx)
+            if tol:
+                bv = np.add.reduceat(np.abs(self.venta), idx)
+                bm = np.add.reduceat(np.abs(self.margen), idx)
+                venta = sin_residuo(venta, bv, tol, escala_tipica(bv))
+                margen = sin_residuo(margen, bm, tol, escala_tipica(bm))
         return {"gid": self.gid[idx], "mes": m[idx], "venta": venta, "margen": margen}
 
     # -- estacionalidad (G x 12), compartida por varias columnas ------------- #
@@ -1148,13 +1192,24 @@ class StatsEngine:
 
         # un registro por grupo-día
         nuevo = np.flatnonzero(cambio_grupo | np.r_[True, d[1:] != d[:-1]])
-        v_dia, mg_dia = np.add.reduceat(venta[orden], nuevo), np.add.reduceat(margen[orden], nuevo)
-        if cfg.tolerancia_cero:      # el día que se anula con su devolución vale 0, no 1e-12
-            bv = np.add.reduceat(np.abs(venta[orden]), nuevo)
-            bm = np.add.reduceat(np.abs(margen[orden]), nuevo)
-            v_dia = sin_residuo(v_dia, bv, cfg.tolerancia_cero, escala_tipica(bv))
-            mg_dia = sin_residuo(mg_dia, bm, cfg.tolerancia_cero, escala_tipica(bm))
+        vo, mo = venta[orden], margen[orden]
+        # el día que se anula con su devolución tiene que valer 0, no 1e-12
+        escala = escala_decimal((vo, mo), cfg.max_decimales) if cfg.suma_exacta else 0.0
+        if escala:
+            v_dia = np.add.reduceat(np.round(vo * escala), nuevo) / escala
+            mg_dia = np.add.reduceat(np.round(mo * escala), nuevo) / escala
+            LOGGER.info("dinero en escala de %d decimales: las sumas son exactas",
+                        int(round(np.log10(escala))))
+        else:
+            v_dia, mg_dia = np.add.reduceat(vo, nuevo), np.add.reduceat(mo, nuevo)
+            if cfg.tolerancia_cero:
+                bv, bm = np.add.reduceat(np.abs(vo), nuevo), np.add.reduceat(np.abs(mo), nuevo)
+                v_dia = sin_residuo(v_dia, bv, cfg.tolerancia_cero, escala_tipica(bv))
+                mg_dia = sin_residuo(mg_dia, bm, cfg.tolerancia_cero, escala_tipica(bm))
+                LOGGER.info("sin escala decimal usable: los ceros se deciden con "
+                            "tolerancia_cero=%g", cfg.tolerancia_cero)
         ctx = Contexto(cfg, self.fechas, g[nuevo], d[nuevo], v_dia, mg_dia, int(g.max()) + 1)
+        ctx.escala = escala
         ctx.hash_grupo = pd.util.hash_pandas_object(cats[claves], index=False).to_numpy(np.uint64)
         if cfg.segmentos_actividad:
             etiqueta = None
@@ -1185,7 +1240,7 @@ class StatsEngine:
         salida["FECHA_CORTE"] = np.full(ctx.G, f.ayer)
 
         out = pd.DataFrame(salida)
-        if ctx.residuos:
+        if ctx.residuos:      # sólo cuando no hubo escala decimal
             LOGGER.info("%s sumas de dinero quedaron en cero (contando todas las columnas): "
                         "venta y devolución se anulan y lo que sobraba era residuo de punto "
                         "flotante. Sus porcentajes salen nulos (tolerancia_cero=%g)",

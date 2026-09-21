@@ -142,10 +142,16 @@ NIVEL_MINIMO_EVENTO = "ATENCION"    # desde qué nivel se guarda un evento ("INF
 CANALES_NOTIFICACION = ("tabla",)   # "tabla", "webhook", y los que agregues abajo
 
 
-# Cuándo una suma de un período es cero. Un importe y su reverso no se anulan exacto en
-# punto flotante: queda un residuo de 1e-10 que, como denominador de un ratio, dispara una
-# alerta falsa. Una suma cuenta como cero cuando no llega a esta fracción de lo que pasó
-# por ella. 0 la apaga.
+# El dinero se suma en su escala decimal (centavos), igual que hace Oracle con NUMBER:
+# los enteros se suman sin error, así que un importe y su reverso dan cero EXACTO y un
+# ratio con denominador anulado queda nulo en vez de dispararse a 1e11.
+# Es lo que resuelve el problema; no cuesta nada y no hay umbrales de por medio.
+SUMA_EXACTA = True
+MAX_DECIMALES = 6       # hasta cuántos decimales busca esa escala; más allá, redondea
+
+# Plan B, sólo si no hay escala decimal usable (importes con muchísimos decimales, o un
+# bruto que desborda 2^53 ≈ 90 billones en centavos). Una suma cuenta como cero cuando no
+# llega a esta fracción de lo que pasó por ella. 0 lo apaga.
 TOLERANCIA_CERO = 1e-9
 
 
@@ -166,6 +172,8 @@ def build_config(fecha_ejecucion: str | None = None) -> VigConfig:
         piso_sigma_relativo=PISO_SIGMA_RELATIVO,
         nivel_notificacion=NIVEL_NOTIFICACION,
         nivel_minimo_evento=NIVEL_MINIMO_EVENTO,
+        suma_exacta=SUMA_EXACTA,
+        max_decimales=MAX_DECIMALES,
         tolerancia_cero=TOLERANCIA_CERO,
     )
 
