@@ -142,6 +142,11 @@ NIVEL_MINIMO_EVENTO = "ATENCION"    # desde qué nivel se guarda un evento ("INF
 CANALES_NOTIFICACION = ("tabla",)   # "tabla", "webhook", y los que agregues abajo
 
 
+# En las vigilancias con agregacion="ratio", `min_denominador` corta el período cuyo
+# denominador es real pero despreciable: 25 sobre 0,0000064 da 390.000.000 y dispara una
+# alerta crítica que no significa nada. Va en cada Vigilancia, porque cada métrica tiene su
+# propia unidad. Por defecto 0 = sin mínimo.
+
 # El dinero se suma en su escala decimal (centavos), igual que hace Oracle con NUMBER:
 # los enteros se suman sin error, así que un importe y su reverso dan cero EXACTO y un
 # ratio con denominador anulado queda nulo en vez de dispararse a 1e11.

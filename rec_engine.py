@@ -210,6 +210,10 @@ class RecConfig:
     #: en el año no hay con qué sostener una recomendación.
     min_dias_compra_entidad: int = 3
 
+    #: Base mínima, en la moneda de col_valor, para que un porcentaje tenga sentido.
+    #: Un ítem con 0,0000064 de venta y -25,04 de margen daría -388.304.245 %: el número
+    #: es correcto y no significa nada. Por debajo, el porcentaje vale 0. 0 lo desactiva.
+    min_base_porcentaje: float = 1.0
     #: Suma el dinero en su escala decimal (centavos): lo que se compra y se devuelve
     #: entero da cero EXACTO, sin tolerancias. Es lo que hace Oracle con NUMBER.
     suma_exacta: bool = True
@@ -275,6 +279,8 @@ class RecConfig:
             raise ValueError("seleccion debe ser backtest, rrf, ponderado o el nombre de un algoritmo activo")
         if self.ordenar_por not in ("esperado", "bruto"):
             raise ValueError("ordenar_por debe ser esperado o bruto")
+        if self.min_base_porcentaje < 0:
+            raise ValueError("min_base_porcentaje no puede ser negativo (0 = sin mínimo)")
         if not 0 <= self.max_decimales <= 15:
             raise ValueError("max_decimales debe estar entre 0 y 15")
         if not 0 <= self.tolerancia_cero < 1:
@@ -711,8 +717,13 @@ class Bloque:
         margen_item = _sumar(self.M, 0, esc, tol)
         seguro = np.maximum(self.soporte, 1.0)
         self.usd_medio_comprador = np.where(self.soporte > 0, usd_item / seguro, 0.0)
-        # el ítem cuya venta se anula con sus devoluciones no tiene margen %, no uno gigante
-        self.margen_pct_item = np.where(usd_item > 0, margen_item / np.where(usd_item > 0, usd_item, 1.0), 0.0)
+        # el ítem sin venta suficiente no tiene margen %: una base de 0,0000064 daría
+        # un porcentaje de cientos de millones, correcto y sin ningún sentido
+        base = max(cfg.min_base_porcentaje, 0.0)
+        con_base = usd_item > 0
+        if base:
+            con_base &= usd_item >= base
+        self.margen_pct_item = np.where(con_base, margen_item / np.where(con_base, usd_item, 1.0), 0.0)
 
         # ritmo y ticket del ítem EN ESTE SEGMENTO: es la evidencia que se le presta a
         # quien tiene poca historia propia
@@ -741,7 +752,10 @@ class Bloque:
 
         self.venta_entidad = _sumar(self.V, 1, esc, tol)
         self.dias_entidad = matriz.dias_entidad[filas]
+        # la entidad sin compra suficiente tampoco reparte participaciones
         valido = self.venta_entidad > 0
+        if cfg.min_base_porcentaje > 0:
+            valido &= self.venta_entidad >= cfg.min_base_porcentaje
         positivas = self.venta_entidad[valido]
         self.venta_media = float(positivas.mean()) if len(positivas) else 0.0
         # participación de cada ítem en la compra de la entidad. La entidad cuya compra neta

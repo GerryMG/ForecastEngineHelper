@@ -154,6 +154,11 @@ class StatsConfig:
     idd_unidad: str = "gon"            #: gon (0..100) | grados | radianes
     idd_normalizar: bool = False       #: True = pendiente relativa al promedio antes del ángulo
     margen_escala: float = 100.0       #: márgenes en % (100) o fracción (1)
+    #: Venta mínima para que un porcentaje tenga sentido, en la moneda de col_venta.
+    #: Un cliente con 0,0000064 USD de venta y -25,04 de margen da -388.304.245 %: el
+    #: número es correcto y no significa nada. Por debajo de esta base, el porcentaje
+    #: sale nulo. Es un criterio de materialidad, no de precisión. 0 lo desactiva.
+    min_base_porcentaje: float = 1.0
     #: Suma el dinero en su escala decimal (centavos): la venta que se anula con su
     #: devolución da cero EXACTO, sin tolerancias. Es lo que hace Oracle con NUMBER.
     suma_exacta: bool = True
@@ -193,6 +198,8 @@ class StatsConfig:
             raise ValueError("Hace falta al menos una categoría clave (SK_* o BK_*)")
         if self.idd_unidad not in ("gon", "grados", "radianes"):
             raise ValueError("idd_unidad debe ser gon, grados o radianes")
+        if self.min_base_porcentaje < 0:
+            raise ValueError("min_base_porcentaje no puede ser negativo (0 = sin mínimo)")
         if not 0 <= self.max_decimales <= 15:
             raise ValueError("max_decimales debe estar entre 0 y 15")
         if not 0 <= self.tolerancia_cero < 1:
@@ -263,6 +270,7 @@ class Contexto:
         self.hash_grupo: Optional[np.ndarray] = None    # identifica al grupo entre corridas
         self.segmento: Optional[np.ndarray] = None      # segmento de actividad de cada grupo
         self.escala = 0.0        # escala decimal del dinero (100 = centavos); 0 = sin escala
+        self.bases_chicas = 0    # porcentajes que salieron nulos por base despreciable
         self.residuos = 0        # sumas de dinero que quedaron en cero por cancelación
 
     # -- helpers vectorizados ------------------------------------------------ #
@@ -647,7 +655,8 @@ def _pendiente_venta(ctx: Contexto, meses: Optional[int], normalizar: bool) -> n
         p = np.where((n >= 2) & (den > 0), (n * sxy - sx * sy) / den, np.nan)
         if normalizar:      # sy neta: el grupo que vende y devuelve todo no tiene promedio
             media = sy / np.where(n > 0, n, 1)
-            p = np.where(media > 0, p / media, np.nan)
+            base = np.maximum(ctx.cfg.min_base_porcentaje, 0.0)
+            p = np.where((media > 0) & (media >= base), p / np.where(media > 0, media, 1.0), np.nan)
     return p
 
 
@@ -669,7 +678,9 @@ def idd_porcentual_margen(ctx: Contexto, ventana: Optional[str] = None) -> np.nd
     meses = None if ventana is None else ctx.cfg.meses_ventana[ventana]
     lo = ctx.primer_mes if meses is None else np.maximum(ctx.primer_mes, hi - meses + 1)
     lo_fila = lo[mm["gid"]]
-    ok = (mm["mes"] >= lo_fila) & (mm["mes"] <= hi) & (mm["venta"] > 0)   # venta ya limpia
+    # el mes sin venta suficiente no sostiene un margen %: no entra en la recta
+    ok = ((mm["mes"] >= lo_fila) & (mm["mes"] <= hi)
+          & (mm["venta"] >= max(ctx.cfg.min_base_porcentaje, 0.0)) & (mm["venta"] > 0))
     with np.errstate(divide="ignore", invalid="ignore"):
         y = np.where(ok, ctx.cfg.margen_escala * mm["margen"] / mm["venta"], 0.0)
     x = (mm["mes"] - lo_fila).astype(float)
@@ -687,14 +698,20 @@ def idd_porcentual_margen(ctx: Contexto, ventana: Optional[str] = None) -> np.nd
 def margen_bruto(ctx: Contexto, ventana: Optional[str] = None) -> np.ndarray:
     """Margen ponderado: suma de margen / suma de venta, en %.
 
-    La venta va neta (`sin_residuo`): el grupo que vendió y devolvió lo mismo tiene
-    venta cero, no un residuo de 1e-11, y su margen % queda nulo en vez de explotar.
+    Dos cuidados con el denominador, por motivos distintos:
+      - la venta va neta, así que el grupo que vendió y devolvió lo mismo da cero
+        exacto y no un residuo de 1e-11 (ver `sin_residuo` y `escala_decimal`);
+      - y aunque sea exacta, una venta de 0,0000064 no sostiene un porcentaje: con
+        -25,04 de margen daría -388.304.245 %. Por debajo de `min_base_porcentaje`
+        el margen sale nulo.
     """
     m = _dias_en_ventana(ctx, ventana)
     v = ctx.suma(ctx.gid, ctx.venta, m, neta=True)
     mg = ctx.suma(ctx.gid, ctx.margen, m, neta=True)
+    sirve = np.abs(v) >= ctx.cfg.min_base_porcentaje
+    ctx.bases_chicas += int(np.count_nonzero((v != 0) & ~sirve))
     with np.errstate(divide="ignore", invalid="ignore"):
-        return np.where(v != 0, ctx.cfg.margen_escala * mg / v, np.nan)
+        return np.where(sirve, ctx.cfg.margen_escala * mg / np.where(sirve, v, 1.0), np.nan)
 
 
 # ── E. Años ─────────────────────────────────────────────────────────────────
@@ -1061,8 +1078,12 @@ def catalogo(cfg: Optional[StatsConfig] = None) -> List[Metrica]:
     add("MT_IDDPENDIENTE", "Pendiente de la recta de venta mensual en USD por mes, toda la historia (meses cerrados, sin compra = 0).", idd_pendiente)
 
     # D. Margen
-    add("MT_MARGENBRUTO", "Margen bruto histórico en %: suma del margen / suma de la venta.", margen_bruto)
-    add("MT_MARGENBRUTO_R12", f"Margen bruto en % de los últimos {d['R12']} días: suma del margen / suma de la venta.",
+    base = (f" Nulo si la venta no llega a {cfg.min_base_porcentaje:g}: un porcentaje sobre una "
+            f"base así no significa nada." if cfg.min_base_porcentaje else "")
+    add("MT_MARGENBRUTO", "Margen bruto histórico en %: suma del margen / suma de la venta." + base,
+        margen_bruto)
+    add("MT_MARGENBRUTO_R12",
+        f"Margen bruto en % de los últimos {d['R12']} días: suma del margen / suma de la venta." + base,
         margen_bruto, ventana="R12")
 
     # B (cont.)
@@ -1111,8 +1132,10 @@ def catalogo(cfg: Optional[StatsConfig] = None) -> List[Metrica]:
     add("MT_MINMENSUAL", "Venta mensual promedio del peor mes calendario. USD.", min_mensual)
 
     # C. Tendencia de margen
+    meses_ok = (f"sólo meses con venta de al menos {cfg.min_base_porcentaje:g}"
+                if cfg.min_base_porcentaje else "sólo meses con venta positiva")
     variantes("MT_IDDPORCENTUALMARGEN",
-              f"Pendiente de la recta del margen % mensual (sólo meses con venta positiva), expresada en {u}. Positivo = más rentable. Histórico.",
+              f"Pendiente de la recta del margen % mensual ({meses_ok}), expresada en {u}. Positivo = más rentable. Histórico.",
               lambda v: f"Pendiente de la recta del margen % mensual de los últimos {cfg.meses_ventana[v]} meses cerrados, expresada en {u}.",
               idd_porcentual_margen)
 
@@ -1240,6 +1263,10 @@ class StatsEngine:
         salida["FECHA_CORTE"] = np.full(ctx.G, f.ayer)
 
         out = pd.DataFrame(salida)
+        if ctx.bases_chicas:
+            LOGGER.info("%s márgenes salieron nulos porque la venta del grupo no llega a "
+                        "min_base_porcentaje=%g: un porcentaje sobre una base así no "
+                        "significa nada", f"{ctx.bases_chicas:,}", self.cfg.min_base_porcentaje)
         if ctx.residuos:      # sólo cuando no hubo escala decimal
             LOGGER.info("%s sumas de dinero quedaron en cero (contando todas las columnas): "
                         "venta y devolución se anulan y lo que sobraba era residuo de punto "

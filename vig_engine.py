@@ -106,6 +106,10 @@ class Vigilancia:
     unidad: str = "USD"                          #: USD, unidades, galones, %, lo que sea
     agregacion: str = "suma"                     #: suma | promedio | conteo | ratio
     denominador: Optional[str] = None            #: sólo para agregacion="ratio"
+    #: denominador mínimo para que el ratio tenga sentido, en la unidad del denominador.
+    #: Un período con 0,0000064 de base y 25 arriba da 390.000.000: correcto y sin
+    #: sentido, y dispara una alerta crítica. Por debajo, el período queda nulo (hueco).
+    min_denominador: float = 0.0
     granos: Sequence[str] = ("dia", "mes")       #: en qué granos se vigila
     detectores: Optional[Sequence[str]] = None   #: None = todos los del config
     #: columna con la que se explica una anomalía (quién la causó). Tiene que venir en el SQL.
@@ -207,6 +211,8 @@ class VigConfig:
                 raise ValueError(f"{v.nombre}: agregacion debe ser suma, promedio, conteo o ratio")
             if v.agregacion == "ratio" and not v.denominador:
                 raise ValueError(f"{v.nombre}: agregacion='ratio' necesita denominador")
+            if v.min_denominador < 0:
+                raise ValueError(f"{v.nombre}: min_denominador no puede ser negativo")
             if v.direccion not in ("ambas", "baja", "sube"):
                 raise ValueError(f"{v.nombre}: direccion debe ser ambas, baja o sube")
             malos = [g for g in v.granos if g not in GRANOS]
@@ -342,8 +348,11 @@ def armar_series(df: pd.DataFrame, v: Vigilancia, cfg: VigConfig, grano: str) ->
             den = sin_residuo(den, bd, tol, escala_tipica(bd))
             num = sin_residuo(num, bn, tol, escala_tipica(bn))
         out["denominador"], out["numerador"] = den, num
+        sirve = den != 0
+        if v.min_denominador > 0:      # base despreciable: el ratio no significa nada
+            sirve &= np.abs(den) >= v.min_denominador
         with np.errstate(invalid="ignore", divide="ignore"):
-            out["valor"] = np.where(den != 0, num / den, np.nan)
+            out["valor"] = np.where(sirve, num / np.where(sirve, den, 1.0), np.nan)
     else:
         out = g.agg(valor=("valor", "sum"), bruto=("bruto", "sum")).reset_index()
         bruto = out.pop("bruto").to_numpy(float)

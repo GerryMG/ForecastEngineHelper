@@ -99,6 +99,12 @@ COL_FECHA = "FECHA"
 COL_VENTA = "MT_VENTA"
 COL_MARGEN = "MT_MARGEN"          # margen bruto en USD (venta - costo)
 
+# Venta mínima para que un margen porcentual tenga sentido, en la moneda de COL_VENTA.
+# Esto NO es precisión: es materialidad. Un cliente con 0,0000064 USD de venta y -25,04 de
+# margen da -388.304.245 %, un número correcto que no significa nada. Por debajo de esta
+# base el porcentaje sale NULO (la venta y el margen se informan igual). 0 lo desactiva.
+MIN_BASE_PORCENTAJE = 1.0
+
 # El dinero se suma en su escala decimal (centavos), igual que hace Oracle con NUMBER:
 # los enteros se suman sin error, así que la venta que se anula con su devolución da cero
 # EXACTO y su margen bruto sale nulo en vez de dar millones por ciento.
@@ -157,6 +163,7 @@ def build_config(fecha_ejecucion: str | None = None) -> StatsConfig:
         idd_unidad="gon",         # 0 plano, 100 creciente, -100 decreciente
         idd_normalizar=False,     # pendiente cruda, como se acordó
         margen_escala=100.0,      # márgenes en %
+        min_base_porcentaje=MIN_BASE_PORCENTAJE,
         suma_exacta=SUMA_EXACTA,
         max_decimales=MAX_DECIMALES,
         tolerancia_cero=TOLERANCIA_CERO,

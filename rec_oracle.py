@@ -138,6 +138,12 @@ MIN_SOPORTE = 5                # entidades del segmento que tienen que comprar e
 MIN_PENETRACION = 0.02         # y la fracción mínima del segmento
 MAX_ITEMS_RECO = 10            # recomendaciones por entidad
 
+# Base mínima para que un porcentaje tenga sentido, en la moneda de COL_VALOR.
+# Esto NO es precisión: es materialidad. Un ítem con 0,0000064 de venta y -25,04 de margen
+# daría -388.304.245 %, correcto y sin ningún sentido. Por debajo de esta base el margen %
+# del ítem vale 0 y la entidad no reparte participaciones. 0 lo desactiva.
+MIN_BASE_PORCENTAJE = 1.0
+
 # El dinero se suma en su escala decimal (centavos), igual que hace Oracle con NUMBER:
 # los enteros se suman sin error, así que lo que se compra y se devuelve entero da cero
 # EXACTO y no deja residuos en los márgenes ni en las participaciones.
@@ -217,6 +223,7 @@ def build_config(fecha_ejecucion: str | None = None, seleccion: str | None = Non
         dias_backtest=DIAS_BACKTEST,
         min_entidades_segmento=MIN_ENTIDADES_SEGMENTO,
         min_soporte=MIN_SOPORTE,
+        min_base_porcentaje=MIN_BASE_PORCENTAJE,
         suma_exacta=SUMA_EXACTA,
         max_decimales=MAX_DECIMALES,
         tolerancia_cero=TOLERANCIA_CERO,

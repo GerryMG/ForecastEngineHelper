@@ -29,6 +29,7 @@ Variables de entorno comunes: `ORA_USER`, `ORA_PASSWORD`, `ORA_DSN` para el orig
 | `MODO_CORRIDA`, `RELEER_MESES` | incremental o completa, y cuánto se relee | si corregís datos viejos seguido |
 | `MAX_DIAS_SIN_DATOS` | atraso tolerado de la fuente antes de cortar | si tu ETL carga con más atraso |
 | `FECHA_INICIO_FUENTE` | desde dónde lee la corrida completa | rara vez |
+| `MIN_BASE_PORCENTAJE` | venta mínima para calcular un margen % (ver abajo) | si tenés ventas microscópicas |
 | `SUMA_EXACTA`, `MAX_DECIMALES`, `TOLERANCIA_CERO` | cómo se suma el dinero (ver abajo) | casi nunca |
 
 Variables de entorno: `ST_MODO`, `ST_RELEER_MESES`, `ST_RELEER_DESDE`, `ST_FECHA_EJECUCION`, `ST_DRY_RUN`.
@@ -108,6 +109,7 @@ Los tres tipos se miden igual: **USD esperados en los próximos `HORIZONTE_DIAS`
 | `MIN_DIAS_COMPRA_ENTIDAD` | días de compra de la entidad para recomendarle algo | 3 |
 | `TOPE_POTENCIAL_POR_HISTORICO` | veces el propio ritmo de compra del ítem. `0` = sin tope | 1,5 |
 | `TOPE_POTENCIAL_RELATIVO` | veces su compra total en el mismo lapso. `0` = sin tope | 1,0 |
+| `MIN_BASE_PORCENTAJE` | base mínima para calcular un porcentaje (ver abajo) | 1,0 |
 | `SUMA_EXACTA`, `MAX_DECIMALES`, `TOLERANCIA_CERO` | cómo se suma el dinero (ver abajo) | True / 6 / 1e-9 |
 
 La evidencia queda en la tabla: `MT_DIAS_COMPRA_ITEM` (cuántas veces lo compró), `MT_INTERVALO_TIPICO`
@@ -171,6 +173,37 @@ En el motor hay además `detectores_excluidos` (por defecto, `estacional` no cor
 
 Variables de entorno: `VG_FECHA_EJECUCION`, `VG_MODO`, `VG_DRY_RUN`, `VG_WEBHOOK_URL`.
 Para calibrar: `VG_OBJETIVO`, `VG_REJILLA`, `VG_N_FALLAS` en `calibrar_vigilancia.ipynb`.
+
+---
+
+## `MIN_BASE_PORCENTAJE` — un porcentaje necesita una base
+
+**Esto no es precisión, es materialidad, y son dos problemas distintos.** Un cliente con tres
+registros —0, 0 y 0,0000064— tiene una venta de `6,449116e-06` y un margen de `-25,04`. Los dos
+números son **reales y correctos**. El porcentaje que sale de ahí, no:
+
+```
+-25,04219120618 / 0,000006449116 = -388.304.245 %
+```
+
+No hay nada que arreglar en la suma: el problema es que un porcentaje sobre una base de seis
+millonésimos no significa nada. Por eso hay un mínimo explícito, en la misma moneda que la venta:
+
+| Perilla | Qué hace | Default |
+|---|---|---|
+| `MIN_BASE_PORCENTAJE` | venta mínima para que se calcule un porcentaje | 1,0 |
+
+Por debajo de esa base:
+
+- **Estadísticas**: `MT_MARGENBRUTO` y `MT_MARGENBRUTO_R12` salen **nulos**, y el mes no entra en
+  la recta de `MT_IDDPORCENTUALMARGEN`. La venta y el margen se siguen informando tal cual: lo
+  único que se suprime es el porcentaje. La corrida dice cuántos fueron.
+- **Recomendación**: el ítem no tiene margen % y la entidad no reparte participaciones.
+- **Vigilancia**: el mínimo va en cada `Vigilancia` (`min_denominador`), porque cada métrica tiene
+  su propia unidad, y por defecto es 0. El período por debajo queda nulo, como un hueco de la serie.
+
+`0` lo desactiva. Subilo si querés ser más estricto: con `MIN_BASE_PORCENTAJE = 100`, un cliente con
+4 USD de venta tampoco reporta margen %.
 
 ---
 
@@ -242,6 +275,13 @@ sumó —la suma de los valores absolutos, con la escala típica del panel como 
 
 `1e-9` equivale a un centavo en diez millones. `0` lo desactiva. Es una heurística, no una
 demostración, y por eso es el plan B y no el principal.
+
+### Lo que NO resuelve
+
+La suma exacta arregla el **cero que no daba cero**. No arregla una base que es chica **de verdad**:
+`6,449116e-06` redondeado a 6 decimales sigue sin ser cero, y su porcentaje sigue siendo de cientos
+de millones. Para eso está `MIN_BASE_PORCENTAJE`, más arriba. Son dos reglas distintas porque son
+dos problemas distintos.
 
 ### Qué protege, en cada motor
 
