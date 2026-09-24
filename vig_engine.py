@@ -22,7 +22,8 @@ import hashlib
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+import warnings
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -84,6 +85,15 @@ def escala_decimal(arrays, max_decimales: int = 6) -> float:
     return e if bruto * e < 2.0 ** 53 else 0.0
 
 
+def _mediana(A: np.ndarray, axis: int = 1) -> np.ndarray:
+    """Mediana ignorando nulos. Una franja toda nula da nulo y no avisa por consola: en
+    una serie con huecos eso es lo normal, no un problema."""
+    A = np.asarray(A, dtype=float)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return np.nanmedian(A, axis=axis)
+
+
 def escala_tipica(suma_abs) -> float:
     """Escala de referencia del panel: la mediana de lo que movió cada grupo."""
     a = np.asarray(suma_abs, dtype=float)
@@ -122,6 +132,15 @@ class Vigilancia:
     #: multiplicativo (±20%), no de tantos USD: medirlo en línea recta infla las colas y
     #: llena de falsas alarmas. "lineal" para métricas que pueden ser negativas.
     escala: str = "auto"
+    #: Perillas de VigConfig que esta vigilancia pisa, por nombre. Sirve para lo que no
+    #: puede ser igual para todos: qué tan estable es la métrica. Un stock casi no se
+    #: mueve y un 5% ya es raro; las devoluciones diarias por canal se mueven 40% solas.
+    #:     ajustes={"desvio_relativo_minimo": 0.25, "piso_sigma_relativo": 0.10,
+    #:              "umbral_z": {"ATENCION": 4, "ALERTA": 6, "CRITICO": 10},
+    #:              "nivel_notificacion": "CRITICO"}
+    #: Acepta cualquier campo de VigConfig menos `vigilancias`. Lo que no nombres, se
+    #: hereda del config global.
+    ajustes: Dict[str, Any] = field(default_factory=dict)
     activa: bool = True
 
     def claves(self) -> List[str]:
@@ -196,6 +215,8 @@ class VigConfig:
     tolerancia_cero: float = 1e-9
     decimales: int = 4
     verbose: int = 1
+    #: caché de los configs efectivos por vigilancia (lo llena `para`)
+    _cache_ajustes: Dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def validate(self) -> None:
         if not self.vigilancias:
@@ -213,6 +234,12 @@ class VigConfig:
                 raise ValueError(f"{v.nombre}: agregacion='ratio' necesita denominador")
             if v.min_denominador < 0:
                 raise ValueError(f"{v.nombre}: min_denominador no puede ser negativo")
+            propios = {f.name for f in fields(self)} - {"vigilancias", "_cache_ajustes"}
+            fuera = [k for k in v.ajustes if k not in propios]
+            if fuera:
+                raise ValueError(f"{v.nombre}: ajustes desconocidos {fuera}. "
+                                 f"Tienen que ser campos de VigConfig: {sorted(propios)}")
+            self.para(v).validate_propio(v.nombre)
             if v.direccion not in ("ambas", "baja", "sube"):
                 raise ValueError(f"{v.nombre}: direccion debe ser ambas, baja o sube")
             malos = [g for g in v.granos if g not in GRANOS]
@@ -227,6 +254,30 @@ class VigConfig:
             raise ValueError("tolerancia_cero debe estar entre 0 y 1 (0 = sin limpieza)")
         if self.nivel_notificacion not in NIVELES:
             raise ValueError(f"nivel_notificacion debe ser uno de {NIVELES}")
+
+    def para(self, v: Vigilancia) -> "VigConfig":
+        """El config efectivo de una vigilancia: el global con sus `ajustes` encima."""
+        if not v.ajustes:
+            return self
+        clave = v.nombre
+        if clave not in self._cache_ajustes:
+            self._cache_ajustes[clave] = replace(self, **dict(v.ajustes))
+        return self._cache_ajustes[clave]
+
+    def validate_propio(self, quien: str = "") -> None:
+        """Valida sólo lo que no depende de las vigilancias (para los configs con ajustes)."""
+        donde = f"{quien}: " if quien else ""
+        if self.nivel_notificacion not in NIVELES:
+            raise ValueError(f"{donde}nivel_notificacion debe ser uno de {NIVELES}")
+        if self.nivel_minimo_evento not in NIVELES:
+            raise ValueError(f"{donde}nivel_minimo_evento debe ser uno de {NIVELES}")
+        faltan = [n for n in ("ATENCION", "ALERTA", "CRITICO") if n not in self.umbral_z]
+        if faltan:
+            raise ValueError(f"{donde}umbral_z le falta {faltan}")
+        if not (self.umbral_z["ATENCION"] <= self.umbral_z["ALERTA"] <= self.umbral_z["CRITICO"]):
+            raise ValueError(f"{donde}umbral_z tiene que ir de menor a mayor: {self.umbral_z}")
+        if self.min_periodos < 2:
+            raise ValueError(f"{donde}min_periodos tiene que ser al menos 2")
 
     def umbral_de(self, detector: str) -> float:
         return self.umbral_z.get(self.umbral_marca.get(detector, "ATENCION"), 3.0)
@@ -426,14 +477,14 @@ def desestacionalizar_semanal(M: np.ndarray, periodos: np.ndarray,
     """
     dow = np.asarray(periodos, dtype=np.int64) % 7
     with np.errstate(invalid="ignore"):
-        base = np.nanmedian(M, axis=1)
+        base = _mediana(M)
     ajuste = np.zeros_like(M) if aditivo else np.ones_like(M)
     for d in range(7):
         col = dow == d
         if not col.any():
             continue
         with np.errstate(invalid="ignore"):
-            med = np.nanmedian(M[:, col], axis=1)
+            med = _mediana(M[:, col])
         if aditivo:
             a = np.where(np.isfinite(med) & np.isfinite(base), med - base, 0.0)
         else:
@@ -490,9 +541,9 @@ def _base_movil(M: np.ndarray, idx: np.ndarray, w: int) -> Tuple[np.ndarray, np.
         if tramo.shape[1] == 0:
             continue
         with np.errstate(invalid="ignore"):
-            med = np.nanmedian(tramo, axis=1)
+            med = _mediana(tramo)
             mediana[:, k] = med
-            mad[:, k] = np.nanmedian(np.abs(tramo - med[:, None]), axis=1)
+            mad[:, k] = _mediana(np.abs(tramo - med[:, None]))
         cuenta[:, k] = np.isfinite(tramo).sum(axis=1)
     return mediana, mad, cuenta
 
@@ -553,7 +604,7 @@ def det_escalon(M, idx, cfg: VigConfig, v: "Vigilancia", grano: str, log: bool =
     for j, t in enumerate(idx):
         tramo = M[:, max(0, t - k + 1):t + 1]
         with np.errstate(invalid="ignore"):
-            reciente[:, j] = np.nanmedian(np.where(np.isfinite(tramo), tramo, 0.0), axis=1)
+            reciente[:, j] = _mediana(np.where(np.isfinite(tramo), tramo, 0.0))
     # error estándar de una mediana de k valores: 1.2533 * sigma / sqrt(k)
     z = _z(reciente, mediana, mad, cuenta, cfg.min_periodos, cfg.piso_sigma_relativo, log) * (np.sqrt(k) / 1.2533)
     return Deteccion(marca=np.abs(z) >= cfg.umbral_de("escalon"), z=z, esperado=mediana)
@@ -590,25 +641,32 @@ def det_tendencia(M, idx, cfg: VigConfig, v: "Vigilancia", grano: str, log: bool
     mediana, mad, cuenta = _base_movil(M, idx, base)
     n, E = M.shape[0], len(idx)
     z = np.zeros((n, E))
-    esperado = np.zeros((n, E))
+    esperado = np.full((n, E), np.nan)
     for j, t in enumerate(idx):
         tramo = M[:, max(0, t - base):t + 1]
         y = np.where(np.isfinite(tramo), tramo, np.nan)
         with np.errstate(invalid="ignore"):
             dif = np.abs(np.diff(y, axis=1))
-            mad_dif = np.nanmedian(dif, axis=1)
+            mad_dif = _mediana(dif)
         sigma = 1.4826 * mad_dif / np.sqrt(2.0)
         piso = (np.log1p(cfg.piso_sigma_relativo) if log
                 else np.abs(np.nan_to_num(mediana[:, j])) * cfg.piso_sigma_relativo)
         sigma = np.maximum(np.nan_to_num(sigma), piso)
         sigma = np.where(sigma > 0, sigma, np.nan)
         actual = _pendiente(M, max(0, t - w + 1), t + 1)
-        previa = _pendiente(M, max(0, t - 2 * w + 1), max(0, t - w + 1))
+        ini_previa, fin_previa = max(0, t - 2 * w + 1), max(0, t - w + 1)
+        previa = _pendiente(M, ini_previa, fin_previa)
         se = _error_pendiente(sigma, w)
         with np.errstate(invalid="ignore", divide="ignore"):
             zz = (actual - previa) / (se * np.sqrt(2.0))
         z[:, j] = np.where(np.isfinite(zz), zz, 0.0)
-        esperado[:, j] = previa * w
+        # el esperado que se REPORTA es un nivel, no una pendiente: se ancla en el centro
+        # de la ventana anterior y se estira su propia recta hasta este período. Así
+        # "observado 28.021 contra 29.960 esperados" se puede leer; una pendiente, no.
+        anterior = M[:, ini_previa:fin_previa]
+        ancla = _mediana(np.where(np.isfinite(anterior), anterior, np.nan))
+        centro = (ini_previa + max(fin_previa - 1, ini_previa)) / 2.0
+        esperado[:, j] = ancla + previa * (t - centro)
     z = np.where(cuenta >= max(cfg.min_periodos, w), z, 0.0)
     return Deteccion(marca=np.abs(z) >= cfg.umbral_de("tendencia"), z=z, esperado=esperado)
 
@@ -626,9 +684,9 @@ def det_estacional(M, idx, cfg: VigConfig, v: "Vigilancia", grano: str, log: boo
             continue
         tramo = M[:, pares]
         with np.errstate(invalid="ignore"):
-            med = np.nanmedian(tramo, axis=1)
+            med = _mediana(tramo)
             esperado[:, j] = med
-            mad[:, j] = np.nanmedian(np.abs(tramo - med[:, None]), axis=1)
+            mad[:, j] = _mediana(np.abs(tramo - med[:, None]))
         cuenta[:, j] = np.isfinite(tramo).sum(axis=1)
     obs = np.where(np.isfinite(M[:, idx]), M[:, idx], 0.0)
     minimo = max(3, cfg.min_periodos // 2)
@@ -666,7 +724,8 @@ def det_nueva(M, idx, cfg: VigConfig, v: "Vigilancia", grano: str, log: bool = F
     for j, t in enumerate(idx):
         antes = np.isfinite(M[:, :t]).any(axis=1)
         marca[:, j] = (~antes) & np.isfinite(obs[:, j])
-    return Deteccion(marca=marca, z=np.zeros((n, E)), esperado=np.zeros((n, E)))
+    # sin historia no hay nada que esperar: nulo, no cero
+    return Deteccion(marca=marca, z=np.zeros((n, E)), esperado=np.full((n, E), np.nan))
 
 
 DETECTORES: Dict[str, Detector] = {d.nombre: d for d in [
@@ -778,7 +837,7 @@ def agrupar_eventos(marca: np.ndarray, z: np.ndarray, esperado: np.ndarray, obs:
             eventos.append({
                 "clave": str(claves[i]), "detector": detector, "periodo_inicio": int(periodos[ini]),
                 "periodo_fin": int(periodos[fin]), "periodos": n_periodos, "z": round(peor, 4),
-                "observado": float(np.nan_to_num(obs[i, fin])), "esperado": float(np.nan_to_num(esperado[i, fin])),
+                "observado": float(np.nan_to_num(obs[i, fin])), "esperado": float(esperado[i, fin]),
                 "materialidad": round(materialidad, 2), "participacion": round(float(participacion[i]), 6),
                 "peso_relativo": round(float(peso[i]), 4),
                 "nivel": nivel, "motivo_nivel": motivo, "fila": i})
@@ -974,7 +1033,7 @@ class VigEngine:
     # -- una vigilancia, un grano ------------------------------------------- #
     def _procesar(self, v: Vigilancia, grano: str, crudo: pd.DataFrame,
                   estado: Optional[pd.DataFrame], desde_relectura: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        cfg, f = self.cfg, self.fechas
+        cfg, f = self.cfg.para(v), self.fechas      # con los `ajustes` de esta vigilancia
         series = armar_series(crudo, v, cfg, grano)
         series = combinar_historia(estado, series, v, cfg, grano, desde_relectura)
         if series.empty:
@@ -1101,7 +1160,7 @@ class VigEngine:
                           & (eventos["estado"] != "CERRADO") & eventos["principal"].fillna(True)]
             if not len(sel):
                 continue
-            textos = atribuir(crudo, sel, v, cfg, grano)
+            textos = atribuir(crudo, sel, v, cfg.para(v), grano)
             if textos:
                 eventos["atribucion"] = np.where(eventos["id_evento"].isin(textos),
                                                  eventos["id_evento"].map(textos).fillna(""),
@@ -1120,8 +1179,10 @@ class VigEngine:
         cfg = self.cfg
         if eventos.empty:
             return pd.DataFrame()
-        piso = NIVELES.index(cfg.nivel_notificacion)
-        grave = eventos["nivel"].map(lambda n: NIVELES.index(n) >= piso)
+        # el piso puede ser propio de cada vigilancia (una métrica ruidosa avisa sólo lo grave)
+        piso_de = {v.nombre: NIVELES.index(cfg.para(v).nivel_notificacion) for v in cfg.vigilancias}
+        piso_fila = eventos["vigilancia"].map(piso_de).fillna(NIVELES.index(cfg.nivel_notificacion))
+        grave = eventos["nivel"].map(NIVELES.index) >= piso_fila
         anterior = eventos["nivel_anterior"].map(lambda n: NIVELES.index(n) if n in NIVELES else -1)
         actual = eventos["nivel"].map(lambda n: NIVELES.index(n))
         nuevo = eventos["estado"] == "NUEVO"

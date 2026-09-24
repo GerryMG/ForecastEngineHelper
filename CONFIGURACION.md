@@ -171,6 +171,62 @@ Una entrada por métrica en `VIGILANCIAS`, con estos campos:
 En el motor hay además `detectores_excluidos` (por defecto, `estacional` no corre en grano día),
 `desestacionalizar_dia`, `duracion_minima` por detector, `prioridad_detectores` y `unificar_eventos`.
 
+### `ajustes`: los umbrales no pueden ser los mismos para todas las métricas
+
+La mediana y el desvío se calculan **por serie**, así que el "ruido normal" sale de sus propios
+datos. Los **umbrales**, en cambio, venían del config global — y ningún par de números sirve para
+dos métricas de estabilidad distinta. Medido con un stock que se mueve 0,9% por día y devoluciones
+que se mueven 39%, las dos con una caída real del 6%:
+
+| configuración | stock | devoluciones |
+|---|---|---|
+| global sensible (`DESVIO_RELATIVO_MINIMO = 0,05`) | 1 evento, **0 avisos** | 1 evento, 0 avisos |
+| global tolerante (0,30) | **0 eventos** | 1 evento, 0 avisos |
+| cada una con su perfil | **8 eventos, 4 avisos** | 0 eventos, 0 avisos |
+
+Cada `Vigilancia` puede pisar cualquier campo de `VigConfig` con `ajustes`:
+
+```python
+Vigilancia(nombre="STOCK", sql=SQL_STOCK, categorias=["BD_PLANTA"],
+           metrica="MT_STOCK", unidad="unidades", granos=("dia",),
+           ajustes={"desvio_relativo_minimo": 0.03, "piso_sigma_relativo": 0.005})
+
+Vigilancia(nombre="DEVOLUCIONES", sql=SQL_DEV, categorias=["BD_CANAL"],
+           metrica="MT_DEVOLUCION", unidad="USD", granos=("dia", "semana"),
+           ajustes={"desvio_relativo_minimo": 0.35, "piso_sigma_relativo": 0.25,
+                    "umbral_z": {"ATENCION": 4.0, "ALERTA": 6.0, "CRITICO": 10.0},
+                    "nivel_notificacion": "CRITICO"})
+```
+
+Lo que no nombres se hereda del global. Un campo inexistente o umbrales desordenados se rechazan al
+validar, antes de correr.
+
+### Perfiles por tipo de dato
+
+| tipo de dato | ejemplo | `escala` | `desvio_relativo_minimo` | `piso_sigma_relativo` | detectores | grano |
+|---|---|---|---|---|---|---|
+| contador estable | stock, nómina | auto | 0,02–0,03 | 0,005 | escalon, hueco, tendencia | día |
+| dinero diario ruidoso | venta por canal | auto | 0,25–0,40 | 0,15–0,25 | salto, escalon, racha | día + semana |
+| ratio / porcentaje | tasa de devolución | lineal | 0,10–0,20 | 0,05 | escalon, salto | día + mes |
+| puede ser negativa | margen, resultado | **lineal** | 0,10 | 0,05 | escalon, tendencia | mes |
+| eventos raros | reclamos | auto | 0,30 | 0,20 | escalon, racha (**sin hueco**) | semana + mes |
+| salud del ETL | filas cargadas | auto | 0,05 | 0,02 | **hueco** + escalon | día |
+
+### Las fechas de un evento
+
+Un evento es un **rango**, no un punto: `FECHA_INICIO`, `FECHA_FIN` y `MT_PERIODOS`. `MT_OBSERVADO`
+y `MT_ESPERADO` son del **último período**, o sea de `FECHA_FIN`. `BD_MENSAJE` lo dice completo:
+
+```
+[CRITICO] STOCK / PLANTA_A (dia) 4 período(s), del 2026-09-19 al 2026-09-22:
+cayó contra lo esperado. En 2026-09-22: 46,925.62 unidades contra 49,927.77
+esperados, desvío 7.1. En juego: 188,849 unidades.
+```
+
+`MT_ESPERADO` es siempre un **nivel** comparable con `MT_OBSERVADO`, en cualquier detector. En
+`tendencia` es el nivel que daría la recta de la ventana anterior proyectada hasta ese período; en
+`nueva` es **nulo**, porque una serie que aparece por primera vez no tiene referencia.
+
 Variables de entorno: `VG_FECHA_EJECUCION`, `VG_MODO`, `VG_DRY_RUN`, `VG_WEBHOOK_URL`.
 Para calibrar: `VG_OBJETIVO`, `VG_REJILLA`, `VG_N_FALLAS` en `calibrar_vigilancia.ipynb`.
 

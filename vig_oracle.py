@@ -692,13 +692,25 @@ def preparar_tablas(res: Resultado, cfg: VigConfig) -> Dict[str, pd.DataFrame]:
 
 
 def mensaje(evento) -> str:
-    """El texto que se manda: qué pasó, cuánto pesa, quién lo causó y si ya sabemos por qué."""
+    """El texto que se manda: cuándo, qué pasó, cuánto pesa, quién y si ya sabemos por qué.
+
+    El "cuándo" va completo: el rango del evento y, aparte, la fecha del período del que
+    sale el valor observado (que es siempre el último del evento). Sin la fecha del final,
+    un "esperado 1.200, observado 0" no dice si el cero fue ayer o hace tres semanas.
+    """
     signo = "cayó" if float(evento["z"]) < 0 else "subió"
-    partes = [f"[{evento['nivel']}] {evento['vigilancia']} / {evento['clave']} ({evento['grano']}): "
-              f"{signo} contra lo esperado ({evento['observado']:,.2f} vs {evento['esperado']:,.2f} "
-              f"{evento.get('unidad', '')}), desvío {abs(float(evento['z'])):.1f}, "
-              f"{int(evento['periodos'])} período(s) desde el {str(evento['fecha_inicio'])[:10]}.",
-              f"En juego: {float(evento['materialidad']):,.0f} {evento.get('unidad', '')}."]
+    ini, fin = str(evento["fecha_inicio"])[:10], str(evento["fecha_fin"])[:10]
+    n = int(evento["periodos"])
+    cuando = (f"el {fin}" if n <= 1 or ini == fin
+              else f"{n} período(s), del {ini} al {fin}")
+    unidad = evento.get("unidad", "")
+    esperado = float(evento["esperado"]) if pd.notna(evento["esperado"]) else None
+    contra = (f"contra {esperado:,.2f} esperados, desvío {abs(float(evento['z'])):.1f}"
+              if esperado is not None else "sin referencia previa (serie nueva)")
+    partes = [f"[{evento['nivel']}] {evento['vigilancia']} / {evento['clave']} ({evento['grano']}) "
+              f"{cuando}: {signo} contra lo esperado. En {fin}: {evento['observado']:,.2f} "
+              f"{unidad} {contra}.",
+              f"En juego: {float(evento['materialidad']):,.0f} {unidad}."]
     if str(evento.get("atribucion", "")):
         partes.append(f"Quién: {evento['atribucion']}")
     if str(evento.get("causa", "")):
