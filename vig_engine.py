@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import time
+import unicodedata
 import warnings
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -132,6 +133,19 @@ class Vigilancia:
     #: multiplicativo (±20%), no de tantos USD: medirlo en línea recta infla las colas y
     #: llena de falsas alarmas. "lineal" para métricas que pueden ser negativas.
     escala: str = "auto"
+    #: Columnas que unen esta vigilancia con el calendario de asuetos, por ejemplo
+    #: ["BD_PAIS"]: cada serie usa los asuetos de SU país, así un asueto de Guatemala no
+    #: apaga a El Salvador. Tienen que venir en el SQL (como categoría o como columna
+    #: extra). None = no usa el calendario. [] = todo el calendario vale para todas.
+    calendario_por: Optional[Sequence[str]] = None
+    #: Días de la semana en que NO se opera, para todas las series: ("domingo",) o (6,).
+    #: No se evalúan: un cero ahí es lo normal. Complementa lo que el motor ya aprende
+    #: solo de la historia (un día que casi siempre es cero), para las series que abren
+    #: ese día de vez en cuando y por eso no parecen cerradas.
+    dias_sin_operacion: Sequence[Any] = ()
+    #: Lo mismo, distinto por valor de `calendario_por`: {"GT": ["domingo"],
+    #: "SV": ["sabado", "domingo"]}. Con varias columnas, la clave es "valor1 | valor2".
+    dias_sin_operacion_por: Dict[str, Sequence[Any]] = field(default_factory=dict)
     #: Perillas de VigConfig que esta vigilancia pisa, por nombre. Sirve para lo que no
     #: puede ser igual para todos: qué tan estable es la métrica. Un stock casi no se
     #: mueve y un 5% ya es raro; las devoluciones diarias por canal se mueven 40% solas.
@@ -219,6 +233,12 @@ class VigConfig:
     #: mediana de la serie es un día CERRADO (el domingo de un B2B): sus valores no se
     #: evalúan, porque un cero ahí es lo normal y no un apagón.
     dia_cerrado_relativo: float = 0.05
+    #: En semana y mes, una suma (venta, litros) depende de cuántos días se operó: una
+    #: semana con asueto vende menos sin que nada ande mal, y febrero tiene tres días
+    #: menos que marzo. Con esto lo esperado se ajusta a los días operados de cada
+    #: período. Sólo para agregacion "suma" y "conteo": un promedio o un ratio no
+    #: dependen de cuántos días tuvo el período.
+    ajustar_dias_operados: bool = True
     #: desde qué nivel se notifica
     nivel_notificacion: str = "ALERTA"
     #: desde qué nivel se guarda un evento. Lo que queda abajo no se pierde: la serie y su
@@ -255,6 +275,14 @@ class VigConfig:
                 raise ValueError(f"{v.nombre}: agregacion='ratio' necesita denominador")
             if v.min_denominador < 0:
                 raise ValueError(f"{v.nombre}: min_denominador no puede ser negativo")
+            dias_semana(v.dias_sin_operacion)                 # valida los nombres
+            for alcance, dias in dict(v.dias_sin_operacion_por).items():
+                dias_semana(dias)
+            if v.dias_sin_operacion_por and v.calendario_por is None:
+                raise ValueError(f"{v.nombre}: dias_sin_operacion_por necesita calendario_por "
+                                 f"(la columna cuyo valor es la clave, por ejemplo ['BD_PAIS'])")
+            if v.calendario_por is not None and isinstance(v.calendario_por, str):
+                raise ValueError(f"{v.nombre}: calendario_por es una lista: ['{v.calendario_por}']")
             propios = {f.name for f in fields(self)} - {"vigilancias", "_cache_ajustes"}
             fuera = [k for k in v.ajustes if k not in propios]
             if fuera:
@@ -358,8 +386,69 @@ def inicio_periodo(idx: np.ndarray, grano: str) -> pd.DatetimeIndex:
     if grano == "dia":
         return pd.DatetimeIndex(_EPOCA + pd.to_timedelta(idx, unit="D"))
     if grano == "semana":
-        return pd.DatetimeIndex(_EPOCA + pd.to_timedelta(idx * 7, unit="D"))
+        # el período k es la semana cuyo lunes es el día 4 + 7k (el 1-1-1970 fue jueves)
+        return pd.DatetimeIndex(_EPOCA + pd.to_timedelta(idx * 7 + 4, unit="D"))
     return pd.DatetimeIndex([pd.Timestamp(year=1970 + i // 12, month=i % 12 + 1, day=1) for i in idx])
+
+
+NOMBRE_DIA = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+NOMBRE_MES = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+              "septiembre", "octubre", "noviembre", "diciembre")
+_DIA_POR_NOMBRE = {"lunes": 0, "martes": 1, "miercoles": 2, "jueves": 3, "viernes": 4,
+                   "sabado": 5, "domingo": 6}
+
+
+def _sin_tildes(texto: str) -> str:
+    return unicodedata.normalize("NFKD", str(texto)).encode("ascii", "ignore").decode().lower().strip()
+
+
+def dias_semana(valores) -> set:
+    """Días de la semana como 0=lunes ... 6=domingo. Acepta números o nombres."""
+    out = set()
+    for x in valores or ():
+        k = _sin_tildes(x)
+        if k.isdigit() and 0 <= int(k) <= 6:
+            out.add(int(k))
+        elif k in _DIA_POR_NOMBRE:
+            out.add(_DIA_POR_NOMBRE[k])
+        else:
+            raise ValueError(f"día de la semana desconocido: {x!r} (0=lunes ... 6=domingo, o el nombre)")
+    return out
+
+
+def dia_de_semana(dia_epoca) -> np.ndarray:
+    """0=lunes ... 6=domingo, para un número de día desde 1970 (que fue jueves)."""
+    return (np.asarray(dia_epoca, dtype=np.int64) + 3) % 7
+
+
+def limites_periodo(periodos: np.ndarray, grano: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Primer día y día siguiente al último de cada período, en días desde 1970."""
+    periodos = np.asarray(periodos, dtype=np.int64)
+    if grano == "dia":
+        return periodos, periodos + 1
+    if grano == "semana":
+        ini = periodos * 7 + 4
+        return ini, ini + 7
+    ini = ((inicio_periodo(periodos, "mes") - _EPOCA).days).to_numpy(np.int64)
+    fin = ((inicio_periodo(periodos + 1, "mes") - _EPOCA).days).to_numpy(np.int64)
+    return ini, fin
+
+
+def preparar_calendario(calendario: Optional[pd.DataFrame], col_fecha: str) -> Optional[pd.DataFrame]:
+    """El calendario de asuetos tal como viene de tu tabla: FECHA, las columnas que dicen
+    a quién aplica (BD_PAIS, BD_REGION...) y, si hay, BD_MOTIVO. Un valor "*" o vacío en
+    una columna de alcance vale para todos."""
+    if calendario is None or len(calendario) == 0:
+        return None
+    c = calendario.copy()
+    c.columns = [str(x).upper() for x in c.columns]
+    fecha = next((x for x in (col_fecha.upper(), "FECHA") if x in c.columns), None)
+    if fecha is None:
+        raise KeyError(f"el calendario necesita la columna {col_fecha} (o FECHA); trae {list(c.columns)}")
+    c["_dia"] = indice_periodo(pd.to_datetime(c[fecha]), "dia")
+    c["_motivo"] = (c["BD_MOTIVO"].astype(object).where(c["BD_MOTIVO"].notna(), "asueto").astype(str)
+                    if "BD_MOTIVO" in c.columns else "asueto")
+    return c
 
 
 def ultimo_periodo_cerrado(ayer: pd.Timestamp, grano: str) -> int:
@@ -550,6 +639,238 @@ def desestacionalizar_semanal(M: np.ndarray, periodos: np.ndarray,
             a = np.where(np.isfinite(a) & (a > 0.05), a, 1.0)
         ajuste[:, col] = a[:, None]
     return (M - ajuste, ajuste) if aditivo else (M / ajuste, ajuste)
+
+
+_PERIODO = {"dia": ("día", "días"), "semana": ("semana", "semanas"), "mes": ("mes", "meses")}
+
+
+def _num(x: float) -> str:
+    """Un número legible: sin decimales si es grande, con los que hagan falta si es chico."""
+    if x is None or not np.isfinite(x):
+        return "sin dato"
+    a = abs(float(x))
+    return f"{x:,.0f}" if a >= 100 else (f"{x:,.2f}" if a >= 1 else f"{x:.3g}")
+
+
+def _fecha(ts, con_dia: bool = True) -> str:
+    ts = pd.Timestamp(ts)
+    corta = f"{ts.day}-{NOMBRE_MES[ts.month - 1][:3]}-{ts.year}"
+    return f"{NOMBRE_DIA[ts.dayofweek]} {corta}" if con_dia else corta
+
+
+def _cuando(e: dict, grano: str) -> str:
+    ini, fin, n = pd.Timestamp(e["fecha_inicio"]), pd.Timestamp(e["fecha_fin"]), int(e["periodos"])
+    if grano == "dia":
+        return (f"el {_fecha(fin)}" if n <= 1 or ini == fin
+                else f"del {_fecha(ini)} al {_fecha(fin)} ({n} días evaluados)")
+    if grano == "semana":
+        sem = lambda t: f"la semana del lunes {_fecha(t, False)}"
+        return sem(fin) if n <= 1 or ini == fin else f"{n} semanas, desde {sem(ini)} hasta {sem(fin)}"
+    mes = lambda t: f"{NOMBRE_MES[t.month - 1]} {t.year}"
+    return mes(fin) if n <= 1 or ini == fin else f"{n} meses, de {mes(ini)} a {mes(fin)}"
+
+
+def _referencia(detector: str, grano: str, cfg: "VigConfig", fin: pd.Timestamp) -> str:
+    base = cfg.periodos_base[grano]
+    plural = _PERIODO[grano][1]
+    if detector in ("salto", "hueco", "escalon", "racha"):
+        if grano == "dia" and cfg.desestacionalizar_dia:
+            return (f"lo normal para un {NOMBRE_DIA[fin.dayofweek]} (la mediana de los últimos "
+                    f"{base} días, comparando cada día con los de su mismo día de la semana)")
+        return f"lo normal (la mediana de los últimos {base} {plural})"
+    if detector == "tendencia":
+        w = {"dia": 28, "semana": 8, "mes": 6}[grano]
+        articulo = "las" if grano == "semana" else "los"
+        return f"la recta de {articulo} {w} {plural} anteriores"
+    if detector == "estacional":
+        return "el mismo período de años anteriores"
+    if detector == "dia_cerrado":
+        return "lo que suele pasar en sus días sin operación"
+    return "su historia"
+
+
+_PISTA = {
+    "hueco": ("Suele ser una carga que no llegó, o un cierre que no está en el calendario de "
+              "asuetos: si fue asueto, agregalo al calendario y no vuelve a salir."),
+    "salto-": ("Fue puntual: revisar si hubo un cierre parcial, una carga incompleta o un asueto "
+               "que falta en el calendario."),
+    "salto+": "Fue puntual: revisar si hubo una carga duplicada o una operación extraordinaria.",
+    "escalon": ("El nivel cambió y se quedó ahí: una pérdida o ganancia real, o un cambio de criterio "
+                "en la fuente (un código que cambió, un canal que se reclasificó)."),
+    "racha": ("Todavía no es un cambio de nivel claro, pero viene sostenido: conviene mirarlo antes "
+              "de que lo sea."),
+    "tendencia": "La dirección en que venía se quebró.",
+    "estacional": ("Contra el mismo período de otros años se ve distinto; si el año pasado hubo algo "
+                   "puntual, puede ser eso."),
+    "congelado": ("El dato no se está actualizando: revisar el medidor o la carga (un ETL que copia "
+                  "el último valor)."),
+    "dia_cerrado": ("En ventas suele ser alguien que abrió un día que no abre; en consumo (agua, "
+                    "energía), una fuga o algo que quedó prendido."),
+    "nueva": "Es la primera vez que aparece: no hay historia contra la cual compararla.",
+}
+
+
+def explicar_evento(e: dict, v: "Vigilancia", cfg: "VigConfig", grano: str,
+                    variacion: float = float("nan"), variacion_abs: float = float("nan"),
+                    en_log: bool = True, contexto: str = "") -> str:
+    """La razón exacta de un evento, en castellano llano.
+
+    Contra qué se lo comparó, cuánto se movió y cuánto se mueve normalmente esa serie,
+    cuánto duró, qué días no se evaluaron y por qué, cuánto está en juego, por qué quedó
+    en ese nivel y qué suele significar.
+    """
+    det = str(e["detector"])
+    fin = pd.Timestamp(e["fecha_fin"])
+    obs, z, n = float(e["observado"]), float(e["z"]), int(e["periodos"])
+    esp = float(e["esperado"]) if e.get("esperado") is not None and pd.notna(e["esperado"]) else None
+    unidad = v.unidad
+    # un ratio llega como fracción (0,25): con unidad "%" se muestra como 25,0%
+    if v.agregacion == "ratio" and str(unidad).strip().lower() in ("%", "porcentaje", "pct"):
+        _num_local = lambda x: "sin dato" if x is None or not np.isfinite(x) else f"{100 * float(x):.1f}%"
+        unidad = ""
+    else:
+        _num_local = _num
+    singular, plural = _PERIODO[grano]
+    per = singular if n == 1 else plural
+    ref = _referencia(det, grano, cfg, fin)
+    d = (obs - esp) / abs(esp) if esp not in (None, 0.0) else None
+    partes = [f"{_cuando(e, grano).capitalize()}:"]
+
+    if det == "hueco":
+        partes.append(f"no hubo movimiento ({_num_local(obs)} {unidad}) cuando {ref} es {_num_local(esp)}.")
+    elif det == "salto":
+        partes.append(f"{'subió' if z > 0 else 'cayó'} {abs(d):.0%}: vino {_num_local(obs)} {unidad} contra "
+                      f"{_num_local(esp)} de {ref}." if d is not None else
+                      f"vino {_num_local(obs)} {unidad} contra {ref}.")
+    elif det == "escalon":
+        partes.append(f"el nivel cambió y se sostuvo {n} {per}: viene en {_num_local(obs)} {unidad} cuando "
+                      f"{ref} era {_num_local(esp)} ({d:+.0%})." if d is not None else
+                      f"el nivel cambió y se sostuvo {n} {per}.")
+    elif det == "racha":
+        partes.append(f"{n} {per} seguidos {'por encima' if z > 0 else 'por debajo'} de {ref}; el "
+                      f"último, {_num_local(obs)} {unidad} contra {_num_local(esp)} ({d:+.0%})." if d is not None
+                      else f"{n} {per} seguidos del mismo lado de lo normal.")
+    elif det == "tendencia":
+        partes.append(f"la tendencia se quebró: si seguía {ref}, tendría que estar en {_num_local(esp)} "
+                      f"{unidad} y está en {_num_local(obs)} ({d:+.0%})." if d is not None
+                      else "la tendencia se quebró.")
+    elif det == "estacional":
+        partes.append(f"contra {ref} ({_num_local(esp)} {unidad}) vino {_num_local(obs)} ({d:+.0%})."
+                      if d is not None else f"se ve distinto a {ref}.")
+    elif det == "congelado":
+        partes.append(f"el valor no cambia: {abs(z):.0f} {plural} seguidos con exactamente "
+                      f"{_num_local(obs)} {unidad}, algo que en esta serie casi nunca pasa.")
+    elif det == "dia_cerrado":
+        partes.append(f"hubo actividad en un día que normalmente no opera: {_num_local(obs)} {unidad} "
+                      f"contra {_num_local(esp) if esp is not None else 'casi nada'} de {ref}.")
+    elif det == "nueva":
+        partes.append(f"apareció por primera vez, con {_num_local(obs)} {unidad}.")
+    else:
+        partes.append(f"vino {_num_local(obs)} {unidad} contra {_num_local(esp)} esperados.")
+
+    # cuánto se mueve normalmente, para que el tamaño del cambio tenga escala
+    if det in ("hueco", "salto", "escalon", "racha", "estacional", "dia_cerrado"):
+        piso = cfg.piso_sigma_relativo
+        if en_log and np.isfinite(variacion):
+            if variacion < piso:
+                partes.append(f"Esta serie casi no se mueve (±{variacion:.1%} de un {singular} a otro); "
+                              f"para no exagerar, el motor nunca considera menos de ±{piso:.0%}.")
+            else:
+                partes.append(f"Esta serie se mueve normalmente ±{variacion:.0%} de un {singular} a otro.")
+        elif not en_log and np.isfinite(variacion_abs):
+            partes.append(f"Esta serie se mueve normalmente ±{_num_local(variacion_abs)} {unidad} de un "
+                          f"{singular} a otro.")
+        partes.append(f"Este cambio es {abs(z):.1f} veces esa variación.")
+    elif det == "tendencia":
+        partes.append(f"El cambio de pendiente es {abs(z):.1f} veces lo que suele cambiar.")
+
+    if contexto:
+        partes.append(contexto)
+    if det not in ("congelado", "nueva"):
+        partes.append(f"En juego: {_num_local(float(e['materialidad']))} {unidad} (la diferencia acumulada "
+                      f"contra lo esperado).")
+    partes.append(f"Queda en {e['nivel']} porque: {e['motivo_nivel']}.")
+    clave_pista = f"salto{'+' if z > 0 else '-'}" if det == "salto" else det
+    if clave_pista in _PISTA:
+        partes.append(_PISTA[clave_pista])
+    texto = " ".join(partes)
+    for sucio, limpio in (("  ", " "), (" )", ")"), (" .", "."), (" ,", ",")):
+        while sucio in texto:                   # restos de una unidad vacía
+            texto = texto.replace(sucio, limpio)
+    return texto[:2000]
+
+
+def usa_calendario(v: "Vigilancia") -> bool:
+    return v.calendario_por is not None or bool(v.dias_sin_operacion) or bool(v.dias_sin_operacion_por)
+
+
+def alcances(v: "Vigilancia", claves: np.ndarray, crudo: pd.DataFrame,
+             col_fecha: str = "FECHA") -> np.ndarray:
+    """A qué "país" pertenece cada serie: los valores de `calendario_por`, unidos con " | ".
+
+    Si esas columnas son categorías, salen de la clave misma (y sirven aunque la serie no
+    haya traído filas en la relectura). Si son columnas extra del SQL, se toma el valor más
+    reciente de cada serie. None = no se sabe: sólo aplican los asuetos que valen para todos.
+    """
+    cols = [str(c).upper() for c in (v.calendario_por or [])]
+    if not cols:
+        return np.full(len(claves), "", dtype=object)
+    cats = [str(c).upper() for c in v.claves()]
+    if all(c in cats for c in cols):
+        pos = [cats.index(c) for c in cols]
+        out = []
+        for k in claves:
+            partes = str(k).split(" | ")
+            out.append(" | ".join(partes[p] for p in pos) if len(partes) == len(cats) else None)
+        return np.array(out, dtype=object)
+    datos = crudo.copy()
+    datos.columns = [str(c).upper() for c in datos.columns]
+    faltan = [c for c in cols if c not in datos.columns]
+    if faltan:
+        raise KeyError(f"{v.nombre}: calendario_por {faltan} tiene que venir en el SQL")
+    texto = lambda cs: pd.DataFrame({c: datos[c].astype(object).where(datos[c].notna(), "(sin dato)")
+                                     .astype(str) for c in cs})
+    base = texto(cats)
+    base["_clave"] = _clave_texto(base, cats)
+    base["_alcance"] = _clave_texto(texto(cols), cols)
+    fecha = next((c for c in (col_fecha.upper(), "FECHA") if c in datos.columns), None)
+    if fecha is not None:                       # el valor más reciente de cada serie
+        base["_f"] = pd.to_datetime(datos[fecha]).to_numpy()
+        base = base.sort_values("_f", kind="stable")
+    mapa = base.groupby("_clave")["_alcance"].last()
+    return np.array([mapa.get(k) for k in claves], dtype=object)
+
+
+def feriados_de(alcance: Optional[str], calendario: Optional[pd.DataFrame],
+                cols: Sequence[str]) -> Dict[int, str]:
+    """Asuetos que valen para una serie: día -> motivo."""
+    if calendario is None:
+        return {}
+    ok = np.ones(len(calendario), dtype=bool)
+    valores = alcance.split(" | ") if alcance not in (None, "") else [None] * len(cols)
+    for c, val in zip(cols, valores):
+        if c not in calendario.columns:
+            continue
+        col = calendario[c].astype(object)
+        para_todos = col.isna() | (col.astype(str).str.strip().isin(("*", "")))
+        ok &= (para_todos | (col.astype(str) == str(val))).to_numpy() if val is not None else para_todos.to_numpy()
+    sub = calendario[ok]
+    salida: Dict[int, str] = {}
+    for d, m in zip(sub["_dia"].astype(int), sub["_motivo"].astype(str)):
+        salida[d] = m if d not in salida else f"{salida[d]} / {m}"
+    return salida
+
+
+def cierres_por_alcance(v: "Vigilancia", alcance: Optional[str],
+                        calendario: Optional[pd.DataFrame]) -> Tuple[Dict[int, str], set]:
+    """(asuetos día -> motivo, días de la semana sin operación) de una serie."""
+    cols = [str(c).upper() for c in (v.calendario_por or [])]
+    feriados = feriados_de(alcance, calendario, cols) if v.calendario_por is not None else {}
+    semana = set(dias_semana(v.dias_sin_operacion))
+    if alcance is not None and v.dias_sin_operacion_por:
+        por = {str(k): d for k, d in dict(v.dias_sin_operacion_por).items()}
+        semana |= dias_semana(por.get(alcance, ()))
+    return feriados, semana
 
 
 def matriz_series(series: pd.DataFrame, desde: int, hasta: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -942,17 +1263,25 @@ def calcular_nivel(z: float, periodos: int, materialidad: float, peso_relativo: 
     fracción; `factor`, cuántas veces lo esperado llegó a valer.
     """
     nivel = nivel_por_z(z, cfg)
-    razones = [f"desvío {abs(z):.1f}"]
+    u = cfg.umbral_z
+    umbrales = (f"ATENCION desde {u['ATENCION']:g}, ALERTA desde {u['ALERTA']:g}, "
+                f"CRITICO desde {u['CRITICO']:g}")
+    if detector == "congelado":
+        razones = [f"{abs(z):.0f} períodos con el mismo valor ({umbrales})"]
+    elif detector == "tendencia":
+        razones = [f"el cambio de pendiente es {abs(z):.1f} veces lo habitual ({umbrales})"]
+    else:
+        razones = [f"desvío {abs(z):.1f} veces su variación normal ({umbrales})"]
     if (periodos >= cfg.persistencia_sube_nivel and nivel != "INFO"
             and detector not in SIN_PERSISTENCIA):
         nivel = _subir(nivel)
-        razones.append(f"{periodos} períodos seguidos")
+        razones.append(f"lleva {periodos} períodos seguidos: sube un nivel")
     if (nivel == "CRITICO" and detector not in SIN_DESVIO_RELATIVO
             and desvio_rel + 1e-9 < cfg.critico_desvio_relativo_minimo):
         # raro no es lo mismo que grave: un 3% en una serie muy pareja da un desvío enorme
         nivel = "ALERTA"
         razones.append(f"se apartó {desvio_rel:.0%} de lo esperado; para crítico hace falta "
-                       f"{cfg.critico_desvio_relativo_minimo:.0%}")
+                       f"{cfg.critico_desvio_relativo_minimo:.0%}: queda en ALERTA")
     if cfg.factor_sospecha_dato and factor >= cfg.factor_sospecha_dato:
         razones.append(f"posible error de dato: {factor:,.0f} veces lo esperado")
     tope = cfg.nivel_maximo.get(detector)
@@ -961,10 +1290,12 @@ def calcular_nivel(z: float, periodos: int, materialidad: float, peso_relativo: 
         razones.append(f"{detector} llega como máximo a {tope} (nivel_maximo)")
     if materialidad < v.materialidad_minima:
         nivel = _bajar_hasta(nivel, "INFO")
-        razones.append(f"materialidad {materialidad:,.0f} {v.unidad} por debajo del mínimo")
+        razones.append(f"en juego {materialidad:,.0f} {v.unidad}, por debajo del mínimo de "
+                       f"{v.materialidad_minima:,.0f}: queda en INFO")
     elif peso_relativo < cfg.peso_relativo_minimo:
         nivel = _bajar_hasta(nivel, "ATENCION")
-        razones.append(f"pesa {peso_relativo:.2f} veces la serie promedio")
+        razones.append(f"la serie pesa {peso_relativo:.2f} veces la serie promedio (menos de "
+                       f"{cfg.peso_relativo_minimo:g}): no pasa de ATENCION")
     return nivel, "; ".join(razones)
 
 
@@ -1127,6 +1458,9 @@ def conciliar(nuevos: pd.DataFrame, previos: Optional[pd.DataFrame], f: Fechas) 
         cerrado = dict(p)
         cerrado["estado"] = "CERRADO"
         cerrado["fecha_cierre"] = f.hoy
+        previa = str(p.get("explicacion") or "").strip()
+        cerrado["explicacion"] = (f"{previa} " if previa and previa.lower() != "nan" else "") + \
+            f"Se cerró el {_fecha(f.hoy)}: ya no se detecta, volvió a lo normal."
         cerrado["nivel_anterior"] = p.get("nivel", "")
         filas.append(cerrado)
     return pd.DataFrame(filas)
@@ -1222,6 +1556,7 @@ class VigEngine:
         self.cfg = config
         self.fechas = Fechas.desde(config.fecha_ejecucion)
         self.tiempos_: Dict[str, float] = {}
+        self._calendario: Optional[pd.DataFrame] = None     # asuetos, lo pasa run()
         LOGGER.setLevel(logging.INFO if config.verbose else logging.WARNING)
 
     # -- una vigilancia, un grano ------------------------------------------- #
@@ -1265,6 +1600,46 @@ class VigEngine:
         # escalas. No se evalúan, y salen de las medianas y de las rectas.
         cerrados = (dias_cerrados(M, periodos, cfg.dia_cerrado_relativo) if grano == "dia"
                     else np.zeros(M.shape, dtype=bool))
+
+        # lo que ustedes declaran: asuetos de su calendario (por país) y días sin operación
+        alc = (alcances(v, claves, crudo, cfg.col_fecha) if usa_calendario(v)
+               else np.full(len(claves), None, dtype=object))
+        de_alcance = {a: np.fromiter((x == a for x in alc), dtype=bool, count=len(alc))
+                      for a in set(alc.tolist())}
+        cierres: Dict[Any, Tuple[Dict[int, str], set]] = {}
+        for a in set(alc.tolist()):
+            cierres[a] = cierres_por_alcance(v, a, self._calendario) if usa_calendario(v) else ({}, set())
+        ini_p, fin_p = limites_periodo(periodos, grano)
+        if grano == "dia" and usa_calendario(v):
+            semana_de = dia_de_semana(periodos)
+            for a, (feriados, semana) in cierres.items():
+                fila = np.isin(semana_de, list(semana)) | np.isin(periodos, list(feriados))
+                if fila.any():
+                    cerrados[de_alcance[a]] |= fila[None, :]
+
+        # semana y mes: lo esperado se ajusta a los días operados de cada período
+        operados = habituales = None
+        if (grano != "dia" and cfg.ajustar_dias_operados and v.agregacion in ("suma", "conteo")):
+            operados = np.zeros(M.shape)
+            desde_d, hasta_d = int(ini_p.min()), int(fin_p.max())
+            todos = np.arange(desde_d, hasta_d)
+            for a, (feriados, semana) in cierres.items():
+                abierto = ~(np.isin(dia_de_semana(todos), list(semana)) | np.isin(todos, list(feriados)))
+                acum = np.concatenate([[0], np.cumsum(abierto)])
+                por_periodo = acum[fin_p - desde_d] - acum[ini_p - desde_d]
+                operados[de_alcance[a]] = por_periodo[None, :]
+            habituales = _mediana(np.where(operados > 0, operados, np.nan))[:, None]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                factor = np.where(operados > 0, operados / habituales, np.nan)
+            if np.nanmax(np.abs(np.nan_to_num(factor, nan=1.0) - 1.0)) > 1e-9:
+                cerrados |= operados == 0                    # un período entero sin operar
+                ok = np.isfinite(factor) & (factor > 0)
+                if usar_log:
+                    lf = np.where(ok, np.log(np.where(ok, factor, 1.0)), 0.0)
+                    X, ajuste = X - lf, ajuste + lf
+                else:
+                    X, ajuste = np.where(ok, X / np.where(ok, factor, 1.0), X), np.where(ok, factor, ajuste)
+
         if cerrados.any():
             X = np.where(cerrados, np.nan, X)
 
@@ -1323,14 +1698,66 @@ class VigEngine:
         ev["fecha_fin"] = inicio_periodo(ev["periodo_fin"].to_numpy(), grano)
         ev["unidad"] = v.unidad
         ev["categorias"] = " | ".join(v.claves())
+
+        # cuánto se mueve normalmente cada serie: su ventana de referencia, ya sin el
+        # patrón semanal, antes de la ventana evaluada
+        b0 = max(0, int(idx[0]) - int(cfg.periodos_base[grano]))
+        tramo = X[:, b0:int(idx[0])]
+        med_b = _mediana(tramo)
+        sig = 1.4826 * _mediana(np.abs(tramo - med_b[:, None]))
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            var_rel = np.expm1(sig) if usar_log else sig / np.abs(med_b)
+        var_abs = sig
+        ev["variacion_tipica"] = [float(var_rel[i]) for i in ev["fila"]]
+
+        def contexto(i: int, p_ini: int, p_fin: int) -> str:
+            """Qué días no se evaluaron dentro del evento y por qué, y los días operados."""
+            d0 = int(limites_periodo(np.array([p_ini]), grano)[0][0])
+            d1 = int(limites_periodo(np.array([p_fin]), grano)[1][0])
+            feriados, semana = cierres.get(alc[i], ({}, set()))
+            fer = sorted((d, m) for d, m in feriados.items() if d0 <= d < d1)
+            nombres = ", ".join(f"{m} ({_fecha(_EPOCA + pd.Timedelta(days=d), False)})" for d, m in fer)
+            textos = []
+            if grano == "dia":
+                j0, j1 = p_ini - int(periodos[0]), p_fin - int(periodos[0])
+                sin_evaluar = int(cerrados[i, j0:j1 + 1].sum())
+                if sin_evaluar:
+                    cuantos = ("1 día sin operación no se evaluó" if sin_evaluar == 1
+                               else f"{sin_evaluar} días sin operación no se evaluaron")
+                    textos.append(f"Dentro del período, {cuantos}"
+                                  + (f" (asueto: {nombres})" if nombres else "") + ".")
+            else:
+                if operados is not None:
+                    j = p_fin - int(periodos[0])
+                    op, hab = float(operados[i, j]), float(habituales[i, 0])
+                    if np.isfinite(hab) and op != hab and (fer or abs(op / hab - 1) > 0.05):
+                        textos.append(f"El último {_PERIODO[grano][0]} tuvo {op:.0f} días operados de "
+                                      f"{hab:.0f} habituales" + (f" (asueto: {nombres})" if nombres else "")
+                                      + "; lo esperado ya está ajustado por eso.")
+                elif nombres:
+                    textos.append(f"Incluye asueto: {nombres}.")
+            return " ".join(textos)
+
+        ev["explicacion"] = [
+            explicar_evento(fila, v, cfg, grano, float(var_rel[fila["fila"]]),
+                            float(var_abs[fila["fila"]]), usar_log,
+                            contexto(int(fila["fila"]), int(fila["periodo_inicio"]),
+                                     int(fila["periodo_fin"])))
+            for fila in ev.to_dict("records")]
         return filas_serie, ev
 
     # -- todo ---------------------------------------------------------------- #
     def run(self, datos: Dict[str, pd.DataFrame], estado: Optional[pd.DataFrame] = None,
             eventos_previos: Optional[pd.DataFrame] = None,
             causas: Optional[pd.DataFrame] = None,
-            desde_relectura: Optional[pd.Timestamp] = None) -> Resultado:
+            desde_relectura: Optional[pd.Timestamp] = None,
+            calendario: Optional[pd.DataFrame] = None) -> Resultado:
+        """`calendario`: tu historia de asuetos (FECHA, BD_PAIS..., BD_MOTIVO). Cada
+        vigilancia lo usa según su `calendario_por`."""
         cfg, f = self.cfg, self.fechas
+        self._calendario = preparar_calendario(calendario, cfg.col_fecha)
+        if self._calendario is not None:
+            LOGGER.info("calendario de asuetos: %s días", f"{len(self._calendario):,}")
         t_inicio = time.time()
         series_todas, eventos_todos = [], []
         for v in cfg.vigilancias:
@@ -1360,6 +1787,11 @@ class VigEngine:
             return Resultado(series, vacio, vacio, self._resumen(series, vacio))
 
         crudos = unificar(pd.concat([e for _, _, _, e in eventos_todos], ignore_index=True), cfg)
+        if "explicacion" in crudos.columns:
+            con = crudos["principal"] & (crudos["confirman"].astype(str) != "")
+            crudos.loc[con, "explicacion"] = [
+                f"{t} También lo marcan otros detectores: {c}."[:2000]
+                for t, c in zip(crudos.loc[con, "explicacion"], crudos.loc[con, "confirman"])]
         eventos = conciliar(crudos, eventos_previos, f)
         eventos = buscar_causas(eventos, causas, f)
 
@@ -1465,7 +1897,8 @@ def inyectar_fallas(df: pd.DataFrame, v: Vigilancia, cfg: VigConfig, n: int = 20
 def calibrar(datos: Dict[str, pd.DataFrame], cfg_base: VigConfig,
              rejilla: Optional[Dict[str, Sequence[Any]]] = None,
              objetivo_alertas_dia: Optional[float] = None,
-             n_fallas: int = 20, semilla: int = 0, verbose: bool = True) -> pd.DataFrame:
+             n_fallas: int = 20, semilla: int = 0, verbose: bool = True,
+             calendario: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Prueba umbrales sobre TUS datos y devuelve, para cada uno, cuántas alertas tira
     por día y cuántas fallas inyectadas detecta.
 
@@ -1505,12 +1938,12 @@ def calibrar(datos: Dict[str, pd.DataFrame], cfg_base: VigConfig,
         cfg = replace(cfg_base, umbral_z=umbral, verbose=0, **extra)
 
         t0 = time.time()
-        limpio = VigEngine(cfg).run(datos)
+        limpio = VigEngine(cfg).run(datos, calendario=calendario)
         alertas = len(limpio.notificaciones)
 
         detectadas = 0
         if total_fallas:
-            con_falla = VigEngine(cfg).run(datos_falla)
+            con_falla = VigEngine(cfg).run(datos_falla, calendario=calendario)
             avisadas = set(zip(con_falla.notificaciones.get("vigilancia", []),
                                con_falla.notificaciones.get("clave", []))) if len(con_falla.notificaciones) else set()
             detectadas = sum(1 for vig, marcadas in verdad.items()

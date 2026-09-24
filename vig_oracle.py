@@ -85,6 +85,10 @@ VIGILANCIAS = [
         granos=("dia", "mes"),
         atribucion="SK_CLIENTE",
         materialidad_minima=500.0,
+        # con asuetos por país: la categoría BD_PAIS tiene que venir en el SQL
+        # calendario_por=["BD_PAIS"],
+        # dias_sin_operacion=("domingo",),                        # para todos
+        # dias_sin_operacion_por={"SV": ["sabado", "domingo"]},  # distinto por país
     ),
     Vigilancia(
         nombre="TASA_DEVOLUCION",
@@ -124,6 +128,25 @@ TABLA_RESUMEN = "VIG_RESUMEN"
 # ═══════════════════════════════════════════════════════════════════════════
 DIAS_HISTORIA = 1095            # cuánta historia se guarda y sirve de referencia
 DIAS_RELECTURA = 45             # cuántos días se releen de la fuente en cada corrida
+
+# ── Calendario de asuetos ─────────────────────────────────────────────────────
+# La historia de asuetos que ya tienen, en una consulta. Tiene que devolver FECHA y las
+# columnas que dicen a quién aplica (las mismas que pongas en `calendario_por` de cada
+# vigilancia, por ejemplo BD_PAIS). Opcional: BD_MOTIVO, que aparece en la explicación.
+# Un "*" (o vacío) en BD_PAIS vale para todos los países. :desde y :hasta los completa el
+# pipeline con toda la historia que se analiza. None = sin calendario.
+#
+#     CALENDARIO_SQL = """
+#         SELECT c.BD_PAIS, c.FECHA, c.BD_MOTIVO
+#           FROM CAL_ASUETOS c
+#          WHERE c.FECHA >= :desde AND c.FECHA < :hasta
+#     """
+CALENDARIO_SQL: Optional[str] = None
+CALENDARIO_CONEXION = "origen"      # dónde está esa tabla: "origen" o "destino"
+# En semana y mes, lo esperado se ajusta a los días operados de cada período: una semana con
+# asueto vende menos sin que nada ande mal, y febrero tiene tres días menos que marzo. Sólo
+# para sumas y conteos. Sin esto, cada marzo llegan alertas falsas de febrero.
+AJUSTAR_DIAS_OPERADOS = True
 MODO_CORRIDA = "auto"           # auto | completo | incremental
 
 PERIODOS_EVALUADOS = {"dia": 30, "semana": 8, "mes": 6}     # qué tan atrás se revisa
@@ -199,6 +222,7 @@ def build_config(fecha_ejecucion: str | None = None) -> VigConfig:
         critico_desvio_relativo_minimo=CRITICO_DESVIO_RELATIVO_MINIMO,
         factor_sospecha_dato=FACTOR_SOSPECHA_DATO,
         dia_cerrado_relativo=DIA_CERRADO_RELATIVO,
+        ajustar_dias_operados=AJUSTAR_DIAS_OPERADOS,
         suma_exacta=SUMA_EXACTA,
         max_decimales=MAX_DECIMALES,
         tolerancia_cero=TOLERANCIA_CERO,
@@ -364,6 +388,10 @@ COLUMNAS_EVENTO = [
     ("BD_NIVEL", "VARCHAR2(10)", "Gravedad: INFO, ATENCION, ALERTA o CRITICO."),
     ("BD_NIVEL_ANTERIOR", "VARCHAR2(10)", "Nivel que tenía en la corrida anterior."),
     ("BD_MOTIVO_NIVEL", "VARCHAR2(400)", "Por qué ese nivel: desvío, persistencia y peso."),
+    ("BD_EXPLICACION", "VARCHAR2(2000)", "La razón exacta del evento: contra qué se lo comparó, cuánto "
+                                          "se movió y cuánto se mueve normalmente la serie, qué días no se "
+                                          "evaluaron y por qué (asuetos), cuánto está en juego y por qué "
+                                          "quedó en ese nivel."),
     ("BD_ESTADO", "VARCHAR2(10)", "NUEVO, EN_CURSO o CERRADO."),
     ("BD_ATRIBUCION", "VARCHAR2(1000)", "Quiénes explican el cambio, calculado por el motor."),
     ("BD_CAUSA", "VARCHAR2(1000)", "Causa escrita en VIG_CAUSA que cae dentro del evento."),
@@ -543,7 +571,7 @@ def leer_eventos_abiertos(conn, cfg: VigConfig) -> pd.DataFrame:
         SELECT BD_ID_EVENTO, BD_VIGILANCIA, BD_GRANO, BD_CLAVE, BD_DETECTOR, BD_NIVEL, BD_ESTADO,
                FECHA_INICIO, FECHA_FIN, MT_PERIODOS, MT_Z, MT_OBSERVADO, MT_ESPERADO,
                MT_MATERIALIDAD, MT_PARTICIPACION, BD_UNIDAD, BD_CATEGORIAS, BD_MOTIVO_NIVEL,
-               FECHA_DETECCION
+               FECHA_DETECCION, BD_EXPLICACION
           FROM {TABLA_EVENTO}
          WHERE BD_ESTADO <> 'CERRADO'""")
     if df.empty:
@@ -558,6 +586,7 @@ def leer_eventos_abiertos(conn, cfg: VigConfig) -> pd.DataFrame:
         "esperado": df["MT_ESPERADO"], "materialidad": df["MT_MATERIALIDAD"],
         "participacion": df["MT_PARTICIPACION"], "motivo_nivel": df["BD_MOTIVO_NIVEL"],
         "fecha_deteccion": pd.to_datetime(df["FECHA_DETECCION"]),
+        "explicacion": df["BD_EXPLICACION"].fillna("").astype(str),
     })
     out["periodo_inicio"] = [int(vig_engine.indice_periodo(pd.Series([d]), g)[0])
                              for d, g in zip(out["fecha_inicio"], out["grano"])]
@@ -566,6 +595,32 @@ def leer_eventos_abiertos(conn, cfg: VigConfig) -> pd.DataFrame:
     out["principal"] = True
     log.info("eventos abiertos de corridas anteriores: %s", f"{len(out):,}")
     return out
+
+
+def leer_calendario(cfg: VigConfig) -> Optional[pd.DataFrame]:
+    """Tu historia de asuetos (CALENDARIO_SQL), de toda la ventana que se analiza.
+
+    Abre su propia conexión (CALENDARIO_CONEXION), así la tabla puede estar en origen o
+    en destino. Sin CALENDARIO_SQL devuelve None: no hay calendario.
+    """
+    if not CALENDARIO_SQL:
+        return None
+    for bind in (":desde", ":hasta"):
+        if bind not in CALENDARIO_SQL:
+            raise RuntimeError(f"CALENDARIO_SQL tiene que filtrar la fecha con {bind}")
+    f = Fechas.desde(cfg.fecha_ejecucion)
+    desde = f.hoy - pd.Timedelta(days=int(cfg.dias_historia) + 400)   # toda la historia y un año más
+    abrir = conexion_destino if CALENDARIO_CONEXION == "destino" else conexion_origen
+    with abrir() as conn:
+        df = _fetch_df(conn, CALENDARIO_SQL, {"desde": desde.to_pydatetime(),
+                                              "hasta": (f.hoy + pd.Timedelta(days=1)).to_pydatetime()})
+    df.columns = [c.upper() for c in df.columns]
+    if df.empty:
+        log.warning("CALENDARIO_SQL no devolvió asuetos entre %s y %s", desde.date(), f.hoy.date())
+        return None
+    log.info("calendario de asuetos: %s días (%s a %s)", f"{len(df):,}",
+             pd.to_datetime(df["FECHA"]).min().date(), pd.to_datetime(df["FECHA"]).max().date())
+    return df
 
 
 def leer_causas(conn, cfg: VigConfig) -> pd.DataFrame:
@@ -689,6 +744,7 @@ def preparar_tablas(res: Resultado, cfg: VigConfig) -> Dict[str, pd.DataFrame]:
         "BD_UNIDAD": e.get("unidad", ""), "MT_PARTICIPACION": e["participacion"],
         "BD_NIVEL": e["nivel"], "BD_NIVEL_ANTERIOR": _texto(e.get("nivel_anterior", pd.Series([""] * len(e)))),
         "BD_MOTIVO_NIVEL": e["motivo_nivel"], "BD_ESTADO": e["estado"],
+        "BD_EXPLICACION": _texto(e.get("explicacion", pd.Series([""] * len(e)))),
         "BD_ATRIBUCION": _texto(e.get("atribucion", pd.Series([""] * len(e)))),
         "BD_CAUSA": _texto(e.get("causa", pd.Series([""] * len(e)))),
         "BD_HISTORIA_CAUSAS": _texto(e.get("historia_causas", pd.Series([""] * len(e)))),
@@ -714,6 +770,32 @@ def preparar_tablas(res: Resultado, cfg: VigConfig) -> Dict[str, pd.DataFrame]:
 
 
 def mensaje(evento) -> str:
+    """El texto que se manda. Si el motor armó la explicación (casi siempre), va esa: dice la
+    razón exacta. Alrededor: si puede ser un error de carga, si empeoró, quién lo explica
+    y si ya hay una causa anotada. Sin explicación (un evento viejo), el texto de antes."""
+    motivo = str(evento.get("motivo_nivel", "") or "")
+    expl = str(evento.get("explicacion", "") or "").strip()
+    if expl and expl.lower() != "nan":
+        partes = []
+        if "error de dato" in motivo:
+            partes.append("OJO: posible error de carga, revisar la fuente antes de actuar.")
+        partes.append(f"[{evento['nivel']}] {evento['vigilancia']} / {evento['clave']} "
+                      f"({evento['grano']}).")
+        anterior = str(evento.get("nivel_anterior", "") or "")
+        if anterior in vig_engine.NIVELES and anterior != evento["nivel"]:
+            partes.append(f"Empeoró: en la corrida anterior estaba en {anterior}.")
+        partes.append(expl)
+        if str(evento.get("atribucion", "") or ""):
+            partes.append(f"Quién lo explica: {evento['atribucion']}")
+        if str(evento.get("causa", "") or ""):
+            partes.append(f"Causa anotada: {evento['causa']}")
+        elif str(evento.get("historia_causas", "") or ""):
+            partes.append(f"Antecedente: {evento['historia_causas']}")
+        return " ".join(partes)[:2000]
+    return _mensaje_simple(evento)
+
+
+def _mensaje_simple(evento) -> str:
     """El texto que se manda: cuándo, qué pasó, cuánto pesa, quién y si ya sabemos por qué.
 
     El "cuándo" va completo: el rango del evento y, aparte, la fecha del período del que

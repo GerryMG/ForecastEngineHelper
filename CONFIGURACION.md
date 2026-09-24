@@ -159,6 +159,7 @@ Una entrada por métrica en `VIGILANCIAS`, con estos campos:
 | `MIN_PERIODOS` | menos datos que esto y el detector no opina | 6 |
 | `DETECTORES` | hueco, salto, escalon, tendencia, estacional, racha, nueva, congelado, dia_cerrado | todos |
 | `NIVEL_MAXIMO` | tope de nivel por detector | `{"dia_cerrado": "ATENCION"}` |
+| `CALENDARIO_SQL`, `CALENDARIO_CONEXION` | tu historia de asuetos, y en qué base está (ver abajo) | `None` / origen |
 | `UMBRAL_Z` | desvíos robustos que definen ATENCION / ALERTA / CRITICO | 3 / 5 / 8 |
 | `DESVIO_RELATIVO_MINIMO` | diferencia mínima contra lo esperado para que sea un evento | 5% |
 | `PISO_SIGMA_RELATIVO` | el ruido nunca se considera menor a esto del nivel | 2% |
@@ -249,6 +250,94 @@ sube. Calculá el consumo en el SQL (`LECTURA - LAG(LECTURA) OVER (PARTITION BY 
 | eventos raros | reclamos | auto | 0,30 | 0,20 | escalon, racha (**sin hueco**) | semana + mes |
 | salud del ETL | filas cargadas | auto | 0,05 | 0,02 | **hueco** + escalon | día |
 
+### Asuetos y días sin operación
+
+Un día en que no se opera no se evalúa: un cero ahí es lo normal. El motor ya aprende solo, de la
+historia, los días de la semana que casi siempre están en cero. Pero hay dos cosas que no puede saber:
+
+1. **Los asuetos**, que caen en una fecha distinta cada año y son distintos por país.
+2. **Los días que no deberían tener venta** en tiendas que igual abren algunos: si una tienda abre 6
+   de cada 10 domingos, su domingo no parece cerrado, y cada domingo que cierra parece un apagón.
+
+Medido con tiendas de dos países de asuetos distintos: sin calendario, **56 notificaciones, 31
+críticos en asuetos y 22 en domingos**; con calendario, **1 notificación: la caída real**, que sigue
+llegando como CRÍTICO. El asueto de un país no toca al otro.
+
+**El calendario** es tu tabla de asuetos, en una consulta:
+
+```python
+CALENDARIO_SQL = """
+    SELECT c.BD_PAIS, c.FECHA, c.BD_MOTIVO
+      FROM CAL_ASUETOS c
+     WHERE c.FECHA >= :desde AND c.FECHA < :hasta
+"""
+CALENDARIO_CONEXION = "origen"      # o "destino", según dónde esté la tabla
+```
+
+- `FECHA`: el día del asueto.
+- Las columnas de alcance (`BD_PAIS`, o las que sean): a quién aplica. Un `*` o vacío vale para todos.
+- `BD_MOTIVO` (opcional): aparece en la explicación, "asueto: Día de la Independencia (15-sep-2026)".
+- `:desde` y `:hasta` los completa el pipeline con toda la historia que se analiza. Pasale la historia
+  completa, no sólo los próximos: los asuetos pasados también se sacan de las medianas.
+
+**En cada vigilancia**, cómo se une:
+
+```python
+Vigilancia(nombre="VENTA_TIENDA", ..., categorias=["BD_PAIS", "BD_TIENDA"],
+           calendario_por=["BD_PAIS"],                      # cada tienda usa los asuetos de su país
+           dias_sin_operacion=("domingo",),                 # para todas
+           dias_sin_operacion_por={"SV": ["sabado", "domingo"]})   # distinto por país
+```
+
+`calendario_por` tiene que venir en el SQL de la vigilancia, como categoría o como columna extra.
+`None` (el default) = esa vigilancia no usa el calendario. `[]` = todo el calendario vale para todas.
+Los días aceptan nombre (`"domingo"`, `"sábado"`) o número (0 = lunes ... 6 = domingo).
+
+Un día sin operación **con actividad** sí se ve: es el detector `dia_cerrado` (ATENCION por defecto).
+
+### Semana y mes: días operados (`AJUSTAR_DIAS_OPERADOS`)
+
+Una suma depende de cuántos días se operó. Una semana con asueto vende menos sin que nada ande mal, y
+febrero tiene tres días menos que marzo. Por defecto, en semana y mes lo esperado se ajusta a los días
+operados de cada período (sólo para `agregacion` `suma` y `conteo`: un promedio o un ratio no dependen
+de cuántos días tuvo el período).
+
+| con febrero evaluado, 2.000 series sanas | sin ajuste | con ajuste |
+|---|---:|---:|
+| avisos falsos en grano mes | 43 (38 de febrero) | **6** |
+
+El resto del año el grano mes queda algo más sensible, porque la diferencia de largo entre meses ya no
+se confunde con ruido: en el mismo panel, 12 avisos en vez de 8, por tendencias lentas que existen.
+
+### Qué dice la explicación
+
+Cada evento guarda en `BD_EXPLICACION` la razón exacta, y es lo que se manda como mensaje:
+
+```
+[CRITICO] VENTA_TIENDA / GT | GT_CAIDA (dia). Del domingo 20-sep-2026 al martes 22-sep-2026
+(3 días evaluados): no hubo movimiento (0 USD) cuando lo normal para un martes (la mediana de
+los últimos 91 días, comparando cada día con los de su mismo día de la semana) es 8,467. Esta
+serie se mueve normalmente ±11% de un día a otro. Este cambio es 35.4 veces esa variación.
+En juego: 21,385 USD (la diferencia acumulada contra lo esperado). Queda en CRITICO porque:
+desvío 35.4 veces su variación normal (ATENCION desde 3, ALERTA desde 5, CRITICO desde 8);
+lleva 3 períodos seguidos: sube un nivel. Suele ser una carga que no llegó, o un cierre que
+no está en el calendario de asuetos: si fue asueto, agregalo al calendario y no vuelve a salir.
+```
+
+- **Contra qué exactamente** se comparó (la mediana de qué días, ajustada cómo).
+- **Cuánto se mueve normalmente** esa serie, y cuántas veces eso fue el cambio. Es la misma escala de
+  los umbrales: CRÍTICO es "8 veces su variación normal".
+- **Qué días no se evaluaron** y por qué, con el nombre del asueto; en semana y mes, cuántos días se
+  operaron contra los habituales.
+- **Por qué ese nivel**, con los umbrales a la vista y cada regla que lo subió o lo bajó.
+- **Qué suele significar** ese tipo de evento, y qué revisar.
+
+La columna es nueva. Si tu `VIG_EVENTO` ya existe, el pipeline te pide:
+
+```sql
+ALTER TABLE VIG_EVENTO ADD (BD_EXPLICACION VARCHAR2(2000));
+```
+
 ### Dos detectores para datos que no son venta
 
 **`congelado`** — el dato dejó de actualizarse y repite exactamente el mismo valor. Es la falla
@@ -287,14 +376,13 @@ de dato: 341 veces lo esperado`), igual que `BD_MOTIVO_NIVEL`.
 
 ### Las fechas de un evento
 
-Un evento es un **rango**, no un punto: `FECHA_INICIO`, `FECHA_FIN` y `MT_PERIODOS`. `MT_OBSERVADO`
-y `MT_ESPERADO` son del **último período**, o sea de `FECHA_FIN`. `BD_MENSAJE` lo dice completo:
+En grano semana, la fecha es el **lunes** de la semana. Antes se mostraba el jueves anterior (el
+1-1-1970, desde donde se cuentan los días, fue jueves); el período guardado siempre fue el correcto.
 
-```
-[CRITICO] STOCK / PLANTA_A (dia) 4 período(s), del 2026-09-19 al 2026-09-22:
-cayó contra lo esperado. En 2026-09-22: 46,925.62 unidades contra 49,927.77
-esperados, desvío 7.1. En juego: 188,849 unidades.
-```
+Un evento es un **rango**, no un punto: `FECHA_INICIO`, `FECHA_FIN` y `MT_PERIODOS`. `MT_OBSERVADO`
+y `MT_ESPERADO` son del **último período**, o sea de `FECHA_FIN`. La explicación dice las dos cosas en
+palabras: "del domingo 20-sep-2026 al martes 22-sep-2026 (3 días evaluados) [...] cuando lo normal para
+un martes [...] es 8,467" (ver *Qué dice la explicación*, más arriba).
 
 `MT_ESPERADO` es siempre un **nivel** comparable con `MT_OBSERVADO`, en cualquier detector. En
 `tendencia` es el nivel que daría la recta de la ventana anterior proyectada hasta ese período; en
