@@ -130,12 +130,30 @@ PERIODOS_EVALUADOS = {"dia": 30, "semana": 8, "mes": 6}     # qué tan atrás se
 PERIODOS_BASE = {"dia": 91, "semana": 26, "mes": 18}        # referencia de lo normal
 MIN_PERIODOS = 6                # menos datos que esto: el detector no opina
 
-DETECTORES = ("hueco", "salto", "escalon", "tendencia", "estacional", "racha", "nueva")
+# congelado: el dato repite exactamente el mismo valor (medidor trabado, ETL que copia el
+#            último). dia_cerrado: actividad en un día que normalmente está cerrado.
+DETECTORES = ("hueco", "salto", "escalon", "tendencia", "estacional", "racha", "nueva",
+              "congelado", "dia_cerrado")
+# Nivel máximo por detector. dia_cerrado queda en ATENCION: en ventas, abrir un domingo no
+# es grave. En una vigilancia de consumo (agua, energía), subilo con sus `ajustes`:
+#     ajustes={"nivel_maximo": {"dia_cerrado": "CRITICO"}}
+NIVEL_MAXIMO = {"dia_cerrado": "ATENCION"}
 UMBRAL_Z = {"ATENCION": 3.0, "ALERTA": 5.0, "CRITICO": 8.0}
 PERSISTENCIA_SUBE_NIVEL = 3     # períodos seguidos que suben un nivel (detectores de punto)
 PESO_RELATIVO_MINIMO = 0.2      # serie que pesa menos que 0,2 veces la serie promedio: no pasa de ATENCION
 DESVIO_RELATIVO_MINIMO = 0.05   # diferencia mínima contra lo esperado para que sea un evento
 PISO_SIGMA_RELATIVO = 0.02      # piso del ruido: nunca menos del 2% del nivel de la serie
+
+# Que un CRÍTICO valga la pena. La calibración ajusta cuántas alertas salen, pero no mira
+# cuánto se movió de verdad ni si el dato tiene sentido: eso lo deciden estas tres.
+CRITICO_DESVIO_RELATIVO_MINIMO = 0.20   # para ser CRÍTICO, apartarse al menos 20% de lo esperado
+                                        # (un 3% puede ser rarísimo y no importar). Bajalo por
+                                        # vigilancia con `ajustes` en métricas muy estables.
+FACTOR_SOSPECHA_DATO = 20.0     # 20 veces lo esperado en un período: casi seguro una carga mal
+                                # hecha. Se avisa igual, con "OJO: posible error de carga". 0 = apagado
+DIA_CERRADO_RELATIVO = 0.05     # grano día: un día de la semana que casi siempre es cero (el domingo
+                                # de un B2B) está cerrado y no se evalúa. Sin esto, cada domingo
+                                # cerrado era un CRÍTICO "hueco" falso. 0 = apagado
 
 NIVEL_NOTIFICACION = "ALERTA"   # desde qué nivel se notifica
 NIVEL_MINIMO_EVENTO = "ATENCION"    # desde qué nivel se guarda un evento ("INFO" = todo)
@@ -170,6 +188,7 @@ def build_config(fecha_ejecucion: str | None = None) -> VigConfig:
         periodos_base=PERIODOS_BASE,
         min_periodos=MIN_PERIODOS,
         detectores=DETECTORES,
+        nivel_maximo=NIVEL_MAXIMO,
         umbral_z=UMBRAL_Z,
         persistencia_sube_nivel=PERSISTENCIA_SUBE_NIVEL,
         peso_relativo_minimo=PESO_RELATIVO_MINIMO,
@@ -177,6 +196,9 @@ def build_config(fecha_ejecucion: str | None = None) -> VigConfig:
         piso_sigma_relativo=PISO_SIGMA_RELATIVO,
         nivel_notificacion=NIVEL_NOTIFICACION,
         nivel_minimo_evento=NIVEL_MINIMO_EVENTO,
+        critico_desvio_relativo_minimo=CRITICO_DESVIO_RELATIVO_MINIMO,
+        factor_sospecha_dato=FACTOR_SOSPECHA_DATO,
+        dia_cerrado_relativo=DIA_CERRADO_RELATIVO,
         suma_exacta=SUMA_EXACTA,
         max_decimales=MAX_DECIMALES,
         tolerancia_cero=TOLERANCIA_CERO,
@@ -704,6 +726,26 @@ def mensaje(evento) -> str:
     cuando = (f"el {fin}" if n <= 1 or ini == fin
               else f"{n} período(s), del {ini} al {fin}")
     unidad = evento.get("unidad", "")
+    detector = str(evento.get("detector", ""))
+    if detector == "congelado":          # no es un desvío: es un dato que dejó de moverse
+        partes = [f"[{evento['nivel']}] {evento['vigilancia']} / {evento['clave']} ({evento['grano']}) "
+                  f"desde el {ini}: el valor NO cambia. {int(abs(float(evento['z'])))} período(s) "
+                  f"seguidos con exactamente el mismo valor ({float(evento['observado']):,.2f} "
+                  f"{unidad}), algo que en esta serie casi nunca pasa: el dato no se está "
+                  f"actualizando. Revisar el medidor o la carga."]
+        if str(evento.get("motivo_nivel", "")):
+            partes.append(f"Por qué {evento['nivel']}: {evento['motivo_nivel']}.")
+        return " ".join(partes)[:2000]
+    if detector == "dia_cerrado":
+        esperado_txt = (f"{float(evento['esperado']):,.2f}" if pd.notna(evento["esperado"])
+                        else "casi nada")
+        partes = [f"[{evento['nivel']}] {evento['vigilancia']} / {evento['clave']} ({evento['grano']}) "
+                  f"el {fin}: hubo actividad en un día que normalmente está cerrado: "
+                  f"{float(evento['observado']):,.2f} {unidad} contra {esperado_txt} habituales. "
+                  f"En consumo (agua, energía) suele ser una fuga o algo que quedó prendido."]
+        if str(evento.get("motivo_nivel", "")):
+            partes.append(f"Por qué {evento['nivel']}: {evento['motivo_nivel']}.")
+        return " ".join(partes)[:2000]
     esperado = float(evento["esperado"]) if pd.notna(evento["esperado"]) else None
     contra = (f"contra {esperado:,.2f} esperados, desvío {abs(float(evento['z'])):.1f}"
               if esperado is not None else "sin referencia previa (serie nueva)")
@@ -711,6 +753,11 @@ def mensaje(evento) -> str:
               f"{cuando}: {signo} contra lo esperado. En {fin}: {evento['observado']:,.2f} "
               f"{unidad} {contra}.",
               f"En juego: {float(evento['materialidad']):,.0f} {unidad}."]
+    motivo = str(evento.get("motivo_nivel", "") or "")
+    if "error de dato" in motivo:        # lo primero que hay que mirar: puede no ser negocio
+        partes.insert(0, "OJO: posible error de carga, revisar la fuente antes de actuar.")
+    if motivo:
+        partes.append(f"Por qué {evento['nivel']}: {motivo}.")
     if str(evento.get("atribucion", "")):
         partes.append(f"Quién: {evento['atribucion']}")
     if str(evento.get("causa", "")):

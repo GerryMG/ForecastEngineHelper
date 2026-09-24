@@ -164,7 +164,8 @@ class VigConfig:
     #: mínimo de períodos con datos para que un detector opine (abajo de eso, sólo INFO)
     min_periodos: int = 6
 
-    detectores: Sequence[str] = ("hueco", "salto", "escalon", "tendencia", "estacional", "racha")
+    detectores: Sequence[str] = ("hueco", "salto", "escalon", "tendencia", "estacional", "racha",
+                                 "congelado", "dia_cerrado")
     #: detectores que NO corren en cierto grano. Comparar contra "el mismo día de la semana"
     #: es ruido: la estacionalidad se mira en semana y mes.
     detectores_excluidos: Dict[str, Sequence[str]] = field(
@@ -172,7 +173,8 @@ class VigConfig:
     #: en grano día, comparar cada día contra los de su mismo día de la semana
     desestacionalizar_dia: bool = True
     #: cuando varios detectores marcan lo mismo, cuál manda (de más específico a menos)
-    prioridad_detectores: Sequence[str] = ("hueco", "escalon", "salto", "tendencia", "racha",
+    prioridad_detectores: Sequence[str] = ("hueco", "congelado", "escalon", "salto", "tendencia",
+                                           "racha", "dia_cerrado",
                                            "estacional", "nueva")
     unificar_eventos: bool = True   #: un problema = un evento, con los demás como confirmación
     #: períodos seguidos que necesita cada detector para que sea un evento y no una casualidad.
@@ -191,13 +193,32 @@ class VigConfig:
     #: largas, marcar desde ATENCION llena la tabla de eventos que no son nada.
     umbral_marca: Dict[str, str] = field(default_factory=lambda: {
         "salto": "ALERTA", "estacional": "ALERTA", "hueco": "ATENCION",
-        "escalon": "ATENCION", "tendencia": "ATENCION"})
+        "escalon": "ATENCION", "tendencia": "ATENCION", "congelado": "ATENCION",
+        "dia_cerrado": "ATENCION"})
+    #: Nivel máximo al que puede llegar cada detector. `dia_cerrado` es actividad en un día
+    #: que normalmente está cerrado: en ventas es alguien que abrió un domingo (queda
+    #: anotado, no se avisa); en consumo de agua o energía es LA fuga. Para esas métricas,
+    #: por vigilancia: ajustes={"nivel_maximo": {"dia_cerrado": "CRITICO"}}.
+    nivel_maximo: Dict[str, str] = field(default_factory=lambda: {"dia_cerrado": "ATENCION"})
     #: desvío mínimo contra lo esperado para que sea un evento, en fracción.
     #: Sin esto, una serie muy estable convierte una diferencia del 2% en un desvío enorme.
     desvio_relativo_minimo: float = 0.05
     #: piso del ruido: el desvío nunca se considera menor a esta fracción del nivel de la
     #: serie. Los totales mensuales son tan parejos que, sin piso, un 4% da "desvío 17".
     piso_sigma_relativo: float = 0.02
+    #: Para ser CRÍTICO, lo observado tiene que apartarse al menos esta fracción de lo
+    #: esperado. Una serie muy estable puede dar un desvío estadístico enorme con un 3%
+    #: de diferencia: es raro, pero no es grave. Por debajo, el evento queda en ALERTA.
+    #: En una métrica muy estable (un stock) bajalo por vigilancia con `ajustes`.
+    critico_desvio_relativo_minimo: float = 0.20
+    #: Un valor que es esta cantidad de veces lo esperado en un período casi nunca es
+    #: negocio: es una carga duplicada, un acumulado anual en un día o un error de
+    #: unidades. Se avisa igual, con la etiqueta "posible error de dato". 0 lo apaga.
+    factor_sospecha_dato: float = 20.0
+    #: En grano día, un día de la semana cuya mediana no llega a esta fracción de la
+    #: mediana de la serie es un día CERRADO (el domingo de un B2B): sus valores no se
+    #: evalúan, porque un cero ahí es lo normal y no un apagón.
+    dia_cerrado_relativo: float = 0.05
     #: desde qué nivel se notifica
     nivel_notificacion: str = "ALERTA"
     #: desde qué nivel se guarda un evento. Lo que queda abajo no se pierde: la serie y su
@@ -278,6 +299,15 @@ class VigConfig:
             raise ValueError(f"{donde}umbral_z tiene que ir de menor a mayor: {self.umbral_z}")
         if self.min_periodos < 2:
             raise ValueError(f"{donde}min_periodos tiene que ser al menos 2")
+        if not 0 <= self.critico_desvio_relativo_minimo <= 10:
+            raise ValueError(f"{donde}critico_desvio_relativo_minimo va de 0 a 10 (fracción)")
+        if self.factor_sospecha_dato < 0:
+            raise ValueError(f"{donde}factor_sospecha_dato no puede ser negativo (0 = apagado)")
+        if not 0 <= self.dia_cerrado_relativo < 1:
+            raise ValueError(f"{donde}dia_cerrado_relativo va de 0 a 1")
+        malos = {k: x for k, x in self.nivel_maximo.items() if x not in NIVELES}
+        if malos:
+            raise ValueError(f"{donde}nivel_maximo tiene niveles desconocidos {malos}; hay {NIVELES}")
 
     def umbral_de(self, detector: str) -> float:
         return self.umbral_z.get(self.umbral_marca.get(detector, "ATENCION"), 3.0)
@@ -467,13 +497,41 @@ def combinar_historia(guardada: Optional[pd.DataFrame], nueva: pd.DataFrame, v: 
     return pd.concat([viejo, nueva[["clave", "periodo", "valor"]]], ignore_index=True)
 
 
+def dias_cerrados(M: np.ndarray, periodos: np.ndarray, umbral: float = 0.05) -> np.ndarray:
+    """Qué celdas son de un día de la semana en que la serie está CERRADA.
+
+    Un día cuya mediana no llega a `umbral` veces el nivel típico de la serie, o que
+    nunca trae dato, está cerrado: el domingo de un B2B. Ahí un cero es lo normal, no
+    un apagón. Se mide sobre los valores ORIGINALES y en valor absoluto, así sirve en
+    escala lineal y logarítmica, y con métricas que pueden ser negativas. El nivel
+    típico es la mediana de los valores no nulos: con una serie que abre tres días
+    por semana, la mediana de todo daría cero y nada parecería cerrado.
+    """
+    cerrados = np.zeros(M.shape, dtype=bool)
+    if not umbral or M.size == 0:
+        return cerrados
+    A = np.abs(np.asarray(M, dtype=float))
+    base = _mediana(np.where(np.isfinite(A) & (A > 0), A, np.nan))
+    hay_base = np.isfinite(base) & (base > 0)
+    dow = np.asarray(periodos, dtype=np.int64) % 7
+    for d in range(7):
+        col = dow == d
+        if not col.any():
+            continue
+        med = _mediana(A[:, col])
+        cierra = hay_base & (~np.isfinite(med) | (med <= umbral * np.where(hay_base, base, 0.0)))
+        cerrados[:, col] = cierra[:, None]
+    return cerrados
+
+
 def desestacionalizar_semanal(M: np.ndarray, periodos: np.ndarray,
                               aditivo: bool = False) -> Tuple[np.ndarray, np.ndarray]:
     """Quita el patrón de día de la semana de cada serie.
 
     Sin esto, "siete días seguidos por encima de lo normal" pasa todas las semanas en
     cualquier negocio que venda distinto los lunes que los sábados. Devuelve la serie
-    ajustada y el factor de cada día, para poder informar los valores originales.
+    ajustada y el factor de cada día, para poder informar los valores originales. Los
+    días cerrados los resuelve `dias_cerrados`.
     """
     dow = np.asarray(periodos, dtype=np.int64) % 7
     with np.errstate(invalid="ignore"):
@@ -615,11 +673,17 @@ def _pendiente(M: np.ndarray, desde: int, hasta: int) -> np.ndarray:
     tramo = M[:, desde:hasta]
     if tramo.shape[1] < 3:
         return np.zeros(M.shape[0])
-    y = np.where(np.isfinite(tramo), tramo, 0.0)
-    x = np.arange(tramo.shape[1], dtype=float)
-    x = x - x.mean()
-    den = float((x * x).sum())
-    return (y * x).sum(axis=1) / den if den else np.zeros(M.shape[0])
+    # sólo con los períodos que tienen dato: un día cerrado o faltante no es un cero,
+    # y tratarlo como cero doblaba la recta hacia abajo
+    ok = np.isfinite(tramo)
+    cuantos = ok.sum(axis=1)
+    x = np.broadcast_to(np.arange(tramo.shape[1], dtype=float), tramo.shape)
+    xm = np.where(ok, x, 0.0).sum(axis=1) / np.maximum(cuantos, 1)
+    ym = np.where(ok, tramo, 0.0).sum(axis=1) / np.maximum(cuantos, 1)
+    dx = np.where(ok, x - xm[:, None], 0.0)
+    dy = np.where(ok, tramo - ym[:, None], 0.0)
+    den = (dx * dx).sum(axis=1)
+    return np.where((cuantos >= 3) & (den > 0), (dx * dy).sum(axis=1) / np.where(den > 0, den, 1.0), 0.0)
 
 
 def _error_pendiente(sigma: np.ndarray, w: int) -> np.ndarray:
@@ -716,6 +780,91 @@ def det_racha(M, idx, cfg: VigConfig, v: "Vigilancia", grano: str, log: bool = F
     return Deteccion(marca=marca, z=z, esperado=mediana)
 
 
+def det_congelado(M, idx, cfg: VigConfig, v: "Vigilancia", grano: str, log: bool = False,
+                  extra: Optional[dict] = None) -> Deteccion:
+    """El dato dejó de actualizarse: repite exactamente el mismo valor.
+
+    Es la falla típica de cualquier telemetría (un medidor trabado, un ETL que copia
+    el último valor) y ningún otro detector la ve, porque el valor está en su nivel
+    normal. Repetir sólo es sospechoso si en ESA serie es raro: se estima de su propia
+    historia la probabilidad p de que un período repita el anterior, y se avisa
+    cuando la racha es improbable (p elevado a la racha, menos de 1 en 1.000). Un
+    contrato fijo repite siempre y nunca salta; un consumo con ruido casi nunca repite.
+    El z es la cantidad de períodos iguales: con los umbrales por defecto, 3 es
+    ATENCION, 5 ALERTA y 8 CRITICO. Los ceros los ve `hueco`, no éste.
+    """
+    A = np.asarray(extra["original"], dtype=float)
+    C = extra["cerrados"]
+    n, T = A.shape
+    E = len(idx)
+    B = np.where(C, np.nan, A)                       # los días cerrados no cuentan
+    finito = np.isfinite(B)
+    pos = np.where(finito, np.arange(T)[None, :], -1)
+    ultimo = np.maximum.accumulate(pos, axis=1)
+    previo_idx = np.concatenate([np.full((n, 1), -1), ultimo[:, :-1]], axis=1)
+    previo = np.where(previo_idx >= 0,
+                      np.take_along_axis(B, np.maximum(previo_idx, 0), axis=1), np.nan)
+    comparable = finito & np.isfinite(previo)
+    igual = comparable & (B != 0) & (np.abs(B - previo) <= 1e-9 * np.maximum(np.abs(B), 1.0))
+
+    ini = int(idx[0])
+    p = (igual[:, :ini].sum(axis=1) + 1.0) / (comparable[:, :ini].sum(axis=1) + 2.0)
+    racha = np.zeros(n)
+    rachas = np.zeros((n, T))
+    for t in range(T):                               # un día cerrado ni suma ni corta
+        racha = np.where(finito[:, t], np.where(igual[:, t], racha + 1.0, 0.0), racha)
+        rachas[:, t] = racha
+    r = rachas[:, idx]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        improbable = np.power(p[:, None], r) <= 1e-3
+    marca = (r >= 2) & improbable & finito[:, idx]
+    z = np.where(marca, r + 1.0, 0.0)                # períodos con el mismo valor
+    # no hay un nivel "esperado" contra el cual medir: el valor no es confiable
+    return Deteccion(marca=marca, z=z, esperado=np.full((n, E), np.nan))
+
+
+def det_dia_cerrado(M, idx, cfg: VigConfig, v: "Vigilancia", grano: str, log: bool = False,
+                    extra: Optional[dict] = None) -> Deteccion:
+    """Hubo actividad en un día que normalmente está cerrado.
+
+    Los días cerrados (ver `dias_cerrados`) no se evalúan con los demás detectores: un
+    cero ahí es lo normal. Pero lo contrario sí importa: consumo de agua o energía en un
+    día sin operación es una fuga o algo que quedó prendido. Se compara contra lo que
+    suele pasar esos días (casi nada), con un piso de ruido relativo al nivel típico
+    de la serie. Llega como máximo a `nivel_maximo["dia_cerrado"]` (ATENCION por
+    defecto: en ventas, abrir un domingo no es grave).
+    """
+    A = np.asarray(extra["original"], dtype=float)
+    C = extra["cerrados"]
+    n, E = A.shape[0], len(idx)
+    marca = np.zeros((n, E), dtype=bool)
+    z = np.zeros((n, E))
+    esperado = np.full((n, E), np.nan)
+    if not C.any():
+        return Deteccion(marca=marca, z=z, esperado=esperado)
+    Aa = np.abs(A)
+    tipico = _mediana(np.where(~C & np.isfinite(Aa) & (Aa > 0), Aa, np.nan))
+    for j, t in enumerate(idx):
+        cerrado_hoy = C[:, t] & np.isfinite(A[:, t])
+        if not cerrado_hoy.any():
+            continue
+        antes = np.where(C[:, :t], A[:, :t], np.nan)
+        med = _mediana(antes)
+        mad = _mediana(np.abs(antes - med[:, None]))
+        escala = np.maximum(1.4826 * np.nan_to_num(mad),
+                            cfg.piso_sigma_relativo * np.nan_to_num(tipico))
+        escala = np.where(escala > 0, escala, np.nan)
+        exceso = A[:, t] - np.nan_to_num(med)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            zz = exceso / escala
+        relevante = exceso >= cfg.desvio_relativo_minimo * np.nan_to_num(tipico)
+        ok = cerrado_hoy & np.isfinite(zz) & relevante
+        z[:, j] = np.where(ok, zz, 0.0)
+        esperado[:, j] = med
+        marca[:, j] = ok & (zz >= cfg.umbral_de("dia_cerrado"))
+    return Deteccion(marca=marca, z=z, esperado=esperado)
+
+
 def det_nueva(M, idx, cfg: VigConfig, v: "Vigilancia", grano: str, log: bool = False) -> Deteccion:
     """Categoría que aparece por primera vez. Nunca es grave, pero queda anotada."""
     n, E = M.shape[0], len(idx)
@@ -742,6 +891,12 @@ DETECTORES: Dict[str, Detector] = {d.nombre: d for d in [
     Detector("racha", "Varios períodos seguidos del mismo lado de lo normal: avisa antes de que el "
                       "escalón sea evidente.", det_racha),
     Detector("nueva", "Categoría que aparece por primera vez.", det_nueva),
+    Detector("congelado", "El dato dejó de actualizarse: repite exactamente el mismo valor, en una "
+                          "serie donde repetir es raro. Medidor trabado o ETL que copia el último valor.",
+             det_congelado),
+    Detector("dia_cerrado", "Actividad en un día que normalmente está cerrado. En agua o energía es una "
+                            "fuga; en ventas, alguien que abrió un domingo (por eso tiene nivel máximo).",
+             det_dia_cerrado),
 ]}
 
 
@@ -770,17 +925,40 @@ def _bajar_hasta(nivel: str, tope: str) -> str:
 #: detectores que ya miran una ventana: su "persistencia" son ventanas que se pisan,
 #: no evidencia nueva, así que no sube el nivel.
 DETECTORES_VENTANA = ("escalon", "tendencia", "racha")
+#: no suben de nivel por persistencia: su z ya mide cuánto dura (o no es un desvío)
+SIN_PERSISTENCIA = DETECTORES_VENTANA + ("congelado", "dia_cerrado")
+#: su "esperado" no es un nivel normal contra el cual medir cuánto se movió
+SIN_DESVIO_RELATIVO = ("nueva", "congelado")
+#: miran los valores ORIGINALES (sin ajuste semanal ni logaritmo) y los días cerrados
+NECESITAN_ORIGINAL = ("congelado", "dia_cerrado")
 
 
 def calcular_nivel(z: float, periodos: int, materialidad: float, peso_relativo: float,
-                   v: Vigilancia, cfg: VigConfig, detector: str = "") -> Tuple[str, str]:
-    """Gravedad = cuán raro es, cuánto lleva así y cuánto pesa. Devuelve (nivel, por qué)."""
+                   v: Vigilancia, cfg: VigConfig, detector: str = "",
+                   desvio_rel: float = float("inf"), factor: float = 0.0) -> Tuple[str, str]:
+    """Gravedad = cuán raro es, cuánto se movió, cuánto lleva así y cuánto pesa.
+
+    Devuelve (nivel, por qué). `desvio_rel` es cuánto se apartó de lo esperado, en
+    fracción; `factor`, cuántas veces lo esperado llegó a valer.
+    """
     nivel = nivel_por_z(z, cfg)
     razones = [f"desvío {abs(z):.1f}"]
     if (periodos >= cfg.persistencia_sube_nivel and nivel != "INFO"
-            and detector not in DETECTORES_VENTANA):
+            and detector not in SIN_PERSISTENCIA):
         nivel = _subir(nivel)
         razones.append(f"{periodos} períodos seguidos")
+    if (nivel == "CRITICO" and detector not in SIN_DESVIO_RELATIVO
+            and desvio_rel + 1e-9 < cfg.critico_desvio_relativo_minimo):
+        # raro no es lo mismo que grave: un 3% en una serie muy pareja da un desvío enorme
+        nivel = "ALERTA"
+        razones.append(f"se apartó {desvio_rel:.0%} de lo esperado; para crítico hace falta "
+                       f"{cfg.critico_desvio_relativo_minimo:.0%}")
+    if cfg.factor_sospecha_dato and factor >= cfg.factor_sospecha_dato:
+        razones.append(f"posible error de dato: {factor:,.0f} veces lo esperado")
+    tope = cfg.nivel_maximo.get(detector)
+    if tope in NIVELES and NIVELES.index(nivel) > NIVELES.index(tope):
+        nivel = tope
+        razones.append(f"{detector} llega como máximo a {tope} (nivel_maximo)")
     if materialidad < v.materialidad_minima:
         nivel = _bajar_hasta(nivel, "INFO")
         razones.append(f"materialidad {materialidad:,.0f} {v.unidad} por debajo del mínimo")
@@ -798,39 +976,52 @@ def id_evento(vigilancia: str, grano: str, clave: str, detector: str, inicio: st
 def agrupar_eventos(marca: np.ndarray, z: np.ndarray, esperado: np.ndarray, obs: np.ndarray,
                     claves: np.ndarray, periodos: np.ndarray, detector: str,
                     v: Vigilancia, cfg: VigConfig, participacion: np.ndarray,
-                    peso: np.ndarray) -> List[dict]:
-    """Períodos marcados seguidos de la misma serie = un evento."""
+                    peso: np.ndarray, neutros: Optional[np.ndarray] = None) -> List[dict]:
+    """Períodos marcados seguidos de la misma serie = un evento.
+
+    `neutros` son los días cerrados: no inician ni cortan un evento (un apagón de dos
+    semanas no se parte en dos por el domingo del medio) y tampoco suman materialidad.
+    """
     eventos = []
     for i in range(marca.shape[0]):
         fila = marca[i]
         if not fila.any():
             continue
-        cortes = np.flatnonzero(np.r_[True, fila[1:] != fila[:-1]])
-        for ini in cortes:
-            if not fila[ini]:
-                continue
+        neutro = neutros[i] if neutros is not None else np.zeros(len(fila), dtype=bool)
+        fin = -1
+        for ini in np.flatnonzero(fila):
+            if ini <= fin:
+                continue                    # ya quedó adentro del evento anterior
             fin = ini
-            while fin + 1 < len(fila) and fila[fin + 1]:
+            while fin + 1 < len(fila) and (fila[fin + 1] or neutro[fin + 1]):
                 fin += 1
-            tramo = slice(ini, fin + 1)
+            while fin > ini and neutro[fin]:
+                fin -= 1                    # un evento no termina en un día cerrado
+            activos = ~neutro[ini:fin + 1]
+            tramo = np.arange(ini, fin + 1)[activos]
             zs = z[i, tramo]
             peor = float(zs[np.argmax(np.abs(zs))]) if len(zs) else 0.0
-            if v.direccion == "baja" and peor > 0:
-                continue
-            if v.direccion == "sube" and peor < 0:
-                continue
-            diferencia = np.where(np.isfinite(obs[i, tramo]), obs[i, tramo], 0.0) - np.nan_to_num(esperado[i, tramo])
-            materialidad = float(np.nansum(np.abs(diferencia)))
-            n_periodos = int(fin - ini + 1)
-            if n_periodos < int(cfg.duracion_minima.get(detector, 1)):
-                continue
+            if detector != "congelado":        # un dato que no se actualiza no tiene dirección
+                if v.direccion == "baja" and peor > 0:
+                    continue
+                if v.direccion == "sube" and peor < 0:
+                    continue
             esp = np.nan_to_num(esperado[i, tramo])
             ob = np.where(np.isfinite(obs[i, tramo]), obs[i, tramo], 0.0)
-            escala = np.maximum(np.abs(esp), 1e-12)
-            if detector not in ("nueva",) and np.max(np.abs(ob - esp) / escala) < cfg.desvio_relativo_minimo:
+            materialidad = float(np.nansum(np.abs(ob - esp)))
+            n_periodos = int(len(tramo))
+            if n_periodos < int(cfg.duracion_minima.get(detector, 1)):
                 continue
+            escala = np.maximum(np.abs(esp), 1e-12)
+            desvio_rel = float(np.max(np.abs(ob - esp) / escala)) if len(tramo) else 0.0
+            if detector not in SIN_DESVIO_RELATIVO and desvio_rel < cfg.desvio_relativo_minimo:
+                continue
+            # la sospecha de dato compara contra un nivel normal; un día cerrado espera ~0
+            con_base = (np.abs(esp) > 0) & (detector not in ("dia_cerrado", "congelado"))
+            factor = (float(np.max(np.abs(ob[con_base]) / np.abs(esp[con_base])))
+                      if con_base.any() else 0.0)
             nivel, motivo = calcular_nivel(peor, n_periodos, materialidad, float(peso[i]),
-                                           v, cfg, detector)
+                                           v, cfg, detector, desvio_rel, factor)
             if (detector != "nueva"
                     and NIVELES.index(nivel) < NIVELES.index(cfg.nivel_minimo_evento)):
                 continue
@@ -884,7 +1075,10 @@ def unificar(eventos: pd.DataFrame, cfg: VigConfig) -> pd.DataFrame:
             principal, otros = orden[0], orden[1:]
             eventos.loc[otros, "principal"] = False
             eventos.at[principal, "confirman"] = ", ".join(sorted({eventos.at[i, "detector"] for i in otros}))
-            eventos.at[principal, "materialidad"] = float(max(eventos.loc[b["idx"], "materialidad"]))
+            # "en juego" es el del principal: el que cuadra con SUS períodos, observado y
+            # esperado. Heredar el más grande de otro detector mezclaba tramos y esperados
+            # distintos y daba "1 período, esperado 8k, en juego 3M". Los otros quedan
+            # guardados como filas propias (principal = NO) con su propia materialidad.
     return eventos
 
 
@@ -1067,6 +1261,12 @@ class VigEngine:
         ajuste = np.zeros_like(M) if usar_log else np.ones_like(M)
         if grano == "dia" and cfg.desestacionalizar_dia:
             X, ajuste = desestacionalizar_semanal(X, periodos, aditivo=usar_log)
+        # días cerrados (el domingo de un B2B): sobre los valores originales, en las dos
+        # escalas. No se evalúan, y salen de las medianas y de las rectas.
+        cerrados = (dias_cerrados(M, periodos, cfg.dia_cerrado_relativo) if grano == "dia"
+                    else np.zeros(M.shape, dtype=bool))
+        if cerrados.any():
+            X = np.where(cerrados, np.nan, X)
 
         def a_original(esperado_detectado: np.ndarray) -> np.ndarray:
             """Del espacio en el que miran los detectores, de vuelta a USD (o lo que sea)."""
@@ -1078,12 +1278,23 @@ class VigEngine:
         eventos: List[dict] = []
         esperado_ultimo = np.full(len(claves), np.nan)
         z_ultimo = np.zeros(len(claves))
+        neutros = cerrados[:, idx]          # días cerrados: ni marcan ni cortan un evento
+        extra = {"original": M, "cerrados": cerrados}
         for nombre in cfg.detectores_de(v, grano):
-            d = DETECTORES[nombre].funcion(M_det, idx, cfg, v, grano, usar_log)
-            esperado = a_original(d.esperado)
+            if nombre in NECESITAN_ORIGINAL:
+                d = DETECTORES[nombre].funcion(M_det, idx, cfg, v, grano, usar_log, extra=extra)
+                esperado = d.esperado        # ya viene en unidades originales
+            else:
+                d = DETECTORES[nombre].funcion(M_det, idx, cfg, v, grano, usar_log)
+                esperado = a_original(d.esperado)
+            en_cerrados = nombre == "dia_cerrado"      # éste justamente mira los días cerrados
+            if neutros.any() and not en_cerrados:
+                d = Deteccion(marca=d.marca & ~neutros, z=np.where(neutros, 0.0, d.z),
+                              esperado=d.esperado)
             eventos += [dict(e, vigilancia=v.nombre, grano=grano)
                         for e in agrupar_eventos(d.marca, d.z, esperado, M[:, idx], claves,
-                                                 periodos[idx], nombre, v, cfg, participacion, peso)]
+                                                 periodos[idx], nombre, v, cfg, participacion, peso,
+                                                 None if en_cerrados else neutros)]
             if nombre == "salto":
                 esperado_ultimo = esperado[:, -1]
                 z_ultimo = d.z[:, -1]
@@ -1365,4 +1576,4 @@ __all__ = ["Vigilancia", "VigConfig", "VigEngine", "Resultado", "Fechas", "DETEC
            "unificar", "conciliar",
            "GRANOS", "ESTADOS", "catalogo_detectores", "historial_json", "historial_a_serie",
            "indice_periodo", "inicio_periodo", "nivel_por_z", "ultimo_periodo_cerrado",
-           "desestacionalizar_semanal", "calibrar", "inyectar_fallas", "bloque_config_vig"]
+           "desestacionalizar_semanal", "dias_cerrados", "calibrar", "inyectar_fallas", "bloque_config_vig"]

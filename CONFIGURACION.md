@@ -157,10 +157,14 @@ Una entrada por métrica en `VIGILANCIAS`, con estos campos:
 | `PERIODOS_EVALUADOS` | qué tan atrás se revisa, por grano | 30 / 8 / 6 |
 | `PERIODOS_BASE` | referencia de lo normal, por grano | 91 / 26 / 18 |
 | `MIN_PERIODOS` | menos datos que esto y el detector no opina | 6 |
-| `DETECTORES` | hueco, salto, escalon, tendencia, estacional, racha, nueva | todos |
+| `DETECTORES` | hueco, salto, escalon, tendencia, estacional, racha, nueva, congelado, dia_cerrado | todos |
+| `NIVEL_MAXIMO` | tope de nivel por detector | `{"dia_cerrado": "ATENCION"}` |
 | `UMBRAL_Z` | desvíos robustos que definen ATENCION / ALERTA / CRITICO | 3 / 5 / 8 |
 | `DESVIO_RELATIVO_MINIMO` | diferencia mínima contra lo esperado para que sea un evento | 5% |
 | `PISO_SIGMA_RELATIVO` | el ruido nunca se considera menor a esto del nivel | 2% |
+| `CRITICO_DESVIO_RELATIVO_MINIMO` | para ser CRÍTICO, apartarse al menos esto de lo esperado | 20% |
+| `FACTOR_SOSPECHA_DATO` | tantas veces lo esperado = posible error de carga | 20 |
+| `DIA_CERRADO_RELATIVO` | día de la semana casi siempre en cero = cerrado, no se evalúa | 5% |
 | `PESO_RELATIVO_MINIMO` | serie que pesa menos que esto × la serie promedio no pasa de ATENCION | 0,2 |
 | `PERSISTENCIA_SUBE_NIVEL` | períodos seguidos que suben un nivel (sólo detectores de punto) | 3 |
 | `NIVEL_MINIMO_EVENTO` | desde qué nivel se guarda un evento (`INFO` = todo) | ATENCION |
@@ -203,14 +207,83 @@ validar, antes de correr.
 
 ### Perfiles por tipo de dato
 
+El motor detecta lo raro en cualquier variable: el "ruido normal" sale de los datos de cada serie.
+Lo que **no** puede saber solo es **qué tan grande tiene que ser un cambio para importar**, porque
+eso depende del dominio: un 10% en la venta de un día es ruido, un 10% en el consumo de agua de una
+planta es una fuga. Eso se declara por vigilancia con `ajustes`.
+
+Probado con cuatro tipos de variable muy distintos a una venta. Con los valores por defecto, **cero
+notificaciones en las 80 series sanas**, y así llega cada falla:
+
+| variable | falla | por defecto | con su perfil |
+|---|---|---|---|
+| agua (ruido 1,5%) | fuga +10% | ALERTA | **CRÍTICO** |
+| | fuga +40% | CRÍTICO | CRÍTICO |
+| | medidor en cero | CRÍTICO | CRÍTICO |
+| | medidor congelado 7 días | CRÍTICO | CRÍTICO |
+| | pico ×1,6 en un día | CRÍTICO | CRÍTICO |
+| agua, cierra el domingo | fuga **en domingo** | ATENCION, guardada | **CRÍTICO** |
+| valor constante (contrato) | baja −20% | CRÍTICO | CRÍTICO |
+| | sube +3% | no avisa (bien) | no avisa |
+| temperatura (cruza el cero) | +8 grados 4 días | ALERTA | ALERTA |
+
+Perfil de consumo (agua, energía, gas) — cualquier cambio chico importa y un día cerrado con consumo
+es una fuga:
+
+```python
+ajustes={"desvio_relativo_minimo": 0.03, "piso_sigma_relativo": 0.005,
+         "critico_desvio_relativo_minimo": 0.05,
+         "nivel_maximo": {"dia_cerrado": "CRITICO"}}
+```
+
+Si la fuente trae la **lectura acumulada** del medidor, no la vigiles así: una lectura acumulada sólo
+sube. Calculá el consumo en el SQL (`LECTURA - LAG(LECTURA) OVER (PARTITION BY MEDIDOR ORDER BY FECHA)`).
+
 | tipo de dato | ejemplo | `escala` | `desvio_relativo_minimo` | `piso_sigma_relativo` | detectores | grano |
 |---|---|---|---|---|---|---|
+| consumo continuo | agua, energía, gas | auto | 0,03 | 0,005 | todos, `dia_cerrado` hasta CRÍTICO | día |
 | contador estable | stock, nómina | auto | 0,02–0,03 | 0,005 | escalon, hueco, tendencia | día |
 | dinero diario ruidoso | venta por canal | auto | 0,25–0,40 | 0,15–0,25 | salto, escalon, racha | día + semana |
 | ratio / porcentaje | tasa de devolución | lineal | 0,10–0,20 | 0,05 | escalon, salto | día + mes |
 | puede ser negativa | margen, resultado | **lineal** | 0,10 | 0,05 | escalon, tendencia | mes |
 | eventos raros | reclamos | auto | 0,30 | 0,20 | escalon, racha (**sin hueco**) | semana + mes |
 | salud del ETL | filas cargadas | auto | 0,05 | 0,02 | **hueco** + escalon | día |
+
+### Dos detectores para datos que no son venta
+
+**`congelado`** — el dato dejó de actualizarse y repite exactamente el mismo valor. Es la falla
+típica de cualquier telemetría (un medidor trabado, un ETL que copia el último valor) y ningún otro
+detector la ve, porque el valor está en su nivel normal. Sólo avisa si en **esa** serie repetir es
+raro: se estima de su propia historia la probabilidad de que un período repita el anterior. Un
+contrato fijo repite siempre y nunca salta; un consumo con ruido casi nunca repite. Con los umbrales
+por defecto: 3 períodos iguales es ATENCION, 5 es ALERTA, 8 es CRÍTICO. Los ceros los ve `hueco`.
+
+**`dia_cerrado`** — actividad en un día que normalmente está cerrado. Los días cerrados no se evalúan
+con los demás detectores (un cero ahí es lo normal), pero lo contrario sí importa: consumo en un día
+sin operación. Llega como máximo a ATENCION por defecto, porque en ventas es alguien que abrió un
+domingo; en consumo se sube con `nivel_maximo`.
+
+### Qué hace que algo sea CRÍTICO
+
+La calibración ajusta **cuántas** alertas salen. No mira cuánto se movió cada cosa ni si el dato
+tiene sentido, así que no alcanza para que un CRÍTICO valga la pena. Eso lo deciden cuatro reglas:
+
+1. **Un día cerrado no es un apagón.** Un día de la semana cuya mediana no llega al 5% del nivel de
+   la serie (el domingo de un B2B) está cerrado: sus valores no se evalúan, y un evento que lo cruza
+   no se corta. Antes cada domingo cerrado era un CRÍTICO "hueco": en un panel de 2.000 series con un
+   tercio cerrando los domingos, eran **2.523 críticos falsos de 2.570**. Ahora son 0.
+2. **Raro no es lo mismo que grave.** Una serie muy pareja da un desvío estadístico enorme con un 3%
+   de diferencia. Para ser CRÍTICO hace falta apartarse al menos `CRITICO_DESVIO_RELATIVO_MINIMO` (20%)
+   de lo esperado; si no, queda en ALERTA. En una métrica muy estable, bajalo con `ajustes`.
+3. **"En juego" cuadra con el evento.** Es la diferencia acumulada contra lo esperado **en los
+   períodos del propio evento**. Antes, al unificar, el principal heredaba la materialidad más grande
+   de los detectores que lo confirmaban, de otro tramo y con otro esperado.
+4. **Un valor imposible se marca.** Si algo vale 20 veces lo esperado en un período, casi nunca es
+   negocio: es una carga duplicada, un acumulado anual cargado en un día o un error de unidades. Sigue
+   siendo CRÍTICO — hay que verlo —, pero el mensaje empieza con *"OJO: posible error de carga"*.
+
+El mensaje dice además **por qué** tiene ese nivel (`Por qué CRITICO: desvío 37.8; posible error
+de dato: 341 veces lo esperado`), igual que `BD_MOTIVO_NIVEL`.
 
 ### Las fechas de un evento
 
