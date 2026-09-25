@@ -166,7 +166,11 @@ Una entrada por métrica en `VIGILANCIAS`, con estos campos:
 | `CRITICO_DESVIO_RELATIVO_MINIMO` | para ser CRÍTICO, apartarse al menos esto de lo esperado | 20% |
 | `FACTOR_SOSPECHA_DATO` | tantas veces lo esperado = posible error de carga | 20 |
 | `DIA_CERRADO_RELATIVO` | día de la semana casi siempre en cero = cerrado, no se evalúa | 5% |
-| `PESO_RELATIVO_MINIMO` | serie que pesa menos que esto × la serie promedio no pasa de ATENCION | 0,2 |
+| `PESO_RELATIVO_MINIMO` | serie que pesa menos que esto × la serie promedio no pasa de ATENCION (0 = todas pesan igual) | 0,2 |
+| `VENTANAS_REFERENCIA` | contra cuántos períodos anteriores se compara, por grano | 8 / 8 / 12 |
+| `MIN_VENTANAS_REFERENCIA` | con menos, no se puede comprobar: queda en ATENCION | 4 |
+| `VECES_POR_ANIO` | si a esa serie le pasó más veces que esto en el año, no es raro para ella | 1 |
+| `NOTIFICAR_ULTIMOS_PERIODOS` | sólo se avisa lo que sigue pasando en los últimos N períodos | 3 / 1 / 1 |
 | `PERSISTENCIA_SUBE_NIVEL` | períodos seguidos que suben un nivel (sólo detectores de punto) | 3 |
 | `NIVEL_MINIMO_EVENTO` | desde qué nivel se guarda un evento (`INFO` = todo) | ATENCION |
 | `NIVEL_NOTIFICACION` | desde qué nivel se notifica | ALERTA |
@@ -259,9 +263,12 @@ historia, los días de la semana que casi siempre están en cero. Pero hay dos c
 2. **Los días que no deberían tener venta** en tiendas que igual abren algunos: si una tienda abre 6
    de cada 10 domingos, su domingo no parece cerrado, y cada domingo que cierra parece un apagón.
 
-Medido con tiendas de dos países de asuetos distintos: sin calendario, **56 notificaciones, 31
-críticos en asuetos y 22 en domingos**; con calendario, **1 notificación: la caída real**, que sigue
-llegando como CRÍTICO. El asueto de un país no toca al otro.
+Sin calendario, la verificación igual evita casi todos los avisos falsos de asuetos: si la tienda
+cierra ese día todos los años, no es raro para ella. Pero entonces **esa tienda "cierra seguido"**, y
+un apagón real de un día, en un día hábil, pasa como normal. Con el calendario, los asuetos no
+cuentan como cierres: medido con tiendas de dos países, ese apagón de un día **no se detectaba sin
+calendario y sale CRÍTICO con él**. El asueto de un país no toca al otro. Y un asueto nuevo, que no
+está en la historia, sólo se puede saber por el calendario.
 
 **El calendario** es tu tabla de asuetos, en una consulta:
 
@@ -309,28 +316,105 @@ de cuántos días tuvo el período).
 El resto del año el grano mes queda algo más sensible, porque la diferencia de largo entre meses ya no
 se confunde con ruido: en el mismo panel, 12 avisos en vez de 8, por tendencias lentas que existen.
 
+### Cómo se decide que algo es una anomalía
+
+**Los detectores proponen, la verificación decide**, y decide como lo haría una persona mirando los
+datos, con números que se pueden rehacer:
+
+1. **Contra las mismas fechas anteriores.** Un día, contra los mismos días de la semana de las 8
+   semanas anteriores. Un tramo de varios días, por su **total**, contra los 8 tramos anteriores de
+   igual largo con los mismos días de la semana. Una semana, contra las 8 anteriores; un mes, contra
+   los 12 anteriores. Los tramos de referencia no se pisan entre sí ni con el evento.
+2. **Fuera de todo el rango.** Es anomalía sólo si queda por debajo del mínimo o por encima del máximo
+   de esas referencias, y se aparta al menos `DESVIO_RELATIVO_MINIMO` de su mediana.
+3. **Descontada la temporada.** Se hace la misma comparación en las mismas fechas de hace un año. Si
+   hace un año también estuvo fuera de lo normal (diciembre contra noviembre, el otoño contra el
+   verano), eso es temporada y se descuenta. Si hace un año estuvo normal, no hay nada que descontar.
+4. **¿Le pasa seguido a esta serie?** Si en el último año tuvo más de `VECES_POR_ANIO` días con un
+   desvío así (o tramos así de largos sin movimiento), no es raro **para ella**. Esto es lo que separa
+   a una tienda errática, que cierra días sueltos, de una que nunca cierra.
+5. **Tendencia**, por su cambio: cuánto cambió el último tramo contra el anterior, frente a cuánto
+   venía cambiando de un tramo al siguiente. Un canal que venía creciendo y cae se ve ahí, aunque
+   vuelva a un nivel que ya tuvo.
+
+Y para avisar:
+
+- **Sólo lo vigente**: lo que sigue pasando en los últimos 3 días (último mes o semana cerrados). Lo
+  que terminó antes queda guardado en `VIG_EVENTO`, pero no se notifica.
+- **Un evento es el mismo entre corridas** si sus fechas se pisan o se tocan con uno abierto de la
+  misma serie y detector. No se vuelve a avisar, salvo que suba de nivel.
+- **"Empeoró"** sólo si el evento ya estaba abierto y subió de nivel. Nunca en la primera corrida.
+- Cuando varios detectores marcan lo mismo, **manda el de mayor nivel**; entre iguales, el más
+  específico.
+
+Medido con 300 tiendas de dos países, un tercio muy erráticas, corriendo 6 días seguidos:
+
+| | antes | ahora |
+|---|---:|---:|
+| avisos | 147 | 9 |
+| de fallas reales | 12 (8%) | 8 (89%) |
+| sobre días viejos | 105 | 0 |
+
+Y en el benchmark de 2.000 series de siempre, los avisos en series sanas bajaron de 11 a 4, con las
+20 fallas detectadas igual.
+
+Dos cosas que conviene saber:
+
+- **Una serie chica no pasa de ATENCION** (`PESO_RELATIVO_MINIMO`: pesa menos de 0,2 veces la serie
+  promedio de su vigilancia). En tiendas, una que vende la décima parte que el promedio. Si todas te
+  importan igual, poné `PESO_RELATIVO_MINIMO = 0` en esa vigilancia con `ajustes`.
+- **Un pico en una tienda errática no se avisa** si esa tienda tuvo más de un pico así en el año:
+  para ella es normal. Subí `VECES_POR_ANIO` si querés ser más estricto, o bajalo a 0 para que sólo
+  salga lo que nunca pasó en el año.
+
+### Incremental: igual que recalcular todo
+
+En modo incremental la vigilancia relee los últimos `DIAS_RELECTURA` días de la fuente y toma el resto
+del historial guardado en `VIG_SERIE`. Tiene que dar **exactamente** lo mismo que leer todo, y está
+probado así: dos corridas diarias en paralelo con la misma fuente, una incremental y otra completa,
+comparando `VIG_SERIE`, `VIG_EVENTO` y `VIG_NOTIFICACION` después de cada día. Dan idéntico:
+
+| escenario | resultado |
+|---|---|
+| 6 días seguidos, cruzando un cierre de semana | idéntico |
+| 6 días seguidos, cruzando un cierre de mes | idéntico |
+| 11 días y 70 días sin correr | idéntico |
+| BI corrige un día de hace 3 semanas entre corridas | idéntico |
+
+Cómo se logra:
+
+- **La relectura arranca al inicio de la semana y del mes** donde cae. Antes arrancaba en un día
+  cualquiera, y la semana y el mes de ese día se rearmaban sólo con los días releídos: julio quedaba en
+  13.090 en vez de 509.298, cada día un poco peor, y eso generaba decenas de eventos falsos.
+- **Un período releído a medias conserva el valor guardado**, que estaba completo.
+- **El período más viejo de la historia, si vino a medias, no se usa** (en los dos modos): la
+  comparación contra "la misma semana hace 3 años" caía justo en él.
+- **El historial guardado se acota a `DIAS_HISTORIA`**; antes crecía todos los días.
+
+Lo único que el incremental no ve, a propósito: una corrección de la fuente **más vieja que la
+relectura** (por defecto, unos 45 días). Si BI recarga algo de hace meses, corré una vez con
+`VG_MODO=completo`.
+
 ### Qué dice la explicación
 
-Cada evento guarda en `BD_EXPLICACION` la razón exacta, y es lo que se manda como mensaje:
+Cada evento guarda en `BD_EXPLICACION` los mismos números que lo decidieron, y es lo que se manda:
 
 ```
-[CRITICO] VENTA_TIENDA / GT | GT_CAIDA (dia). Del domingo 20-sep-2026 al martes 22-sep-2026
-(3 días evaluados): no hubo movimiento (0 USD) cuando lo normal para un martes (la mediana de
-los últimos 91 días, comparando cada día con los de su mismo día de la semana) es 8,467. Esta
-serie se mueve normalmente ±11% de un día a otro. Este cambio es 35.4 veces esa variación.
-En juego: 21,385 USD (la diferencia acumulada contra lo esperado). Queda en CRITICO porque:
-desvío 35.4 veces su variación normal (ATENCION desde 3, ALERTA desde 5, CRITICO desde 8);
-lleva 3 períodos seguidos: sube un nivel. Suele ser una carga que no llegó, o un cierre que
-no está en el calendario de asuetos: si fue asueto, agregalo al calendario y no vuelve a salir.
+[CRITICO] VENTA_TIENDA / SV | T151 (dia). El miércoles 16-sep-2026: no hubo movimiento
+(0 USD). Los 8 miércoles anteriores: 14,307 (9-sep) · 10,533 (2-sep) · 12,079 (26-ago) ·
+9,571 (19-ago) · 8,947 (12-ago) · 14,072 (5-ago) · 10,370 (29-jul) · 11,272 (22-jul).
+Mediana 10,902, entre 8,947 y 14,307. Hace un año, en las mismas fechas (el miércoles
+17-sep-2025), estuvo dentro de lo normal (10,915 contra 10,481): no es temporada. Ninguna de
+esas referencias estuvo en cero y el año pasado en esas fechas sí hubo movimiento. En el último
+año, esta serie nunca tuvo día sin movimiento fuera de sus días sin operación. En juego: 10,902
+USD. Queda en CRITICO porque: desvío 31.8 veces su variación normal (ATENCION desde 3, ALERTA
+desde 5, CRITICO desde 8). Suele ser una carga que no llegó, o un cierre que no está en el
+calendario de asuetos: si fue asueto, agregalo al calendario y no vuelve a salir.
 ```
 
-- **Contra qué exactamente** se comparó (la mediana de qué días, ajustada cómo).
-- **Cuánto se mueve normalmente** esa serie, y cuántas veces eso fue el cambio. Es la misma escala de
-  los umbrales: CRÍTICO es "8 veces su variación normal".
-- **Qué días no se evaluaron** y por qué, con el nombre del asueto; en semana y mes, cuántos días se
-  operaron contra los habituales.
-- **Por qué ese nivel**, con los umbrales a la vista y cada regla que lo subió o lo bajó.
-- **Qué suele significar** ese tipo de evento, y qué revisar.
+Un tramo de varios días se explica por su total, contra los mismos días de la semana en los tramos
+anteriores de igual largo, con la fecha en que empieza cada uno. Todo se puede comprobar sumando esos
+días en los datos.
 
 La columna es nueva. Si tu `VIG_EVENTO` ya existe, el pipeline te pide:
 

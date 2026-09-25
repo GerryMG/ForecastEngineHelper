@@ -244,6 +244,23 @@ class VigConfig:
     #: desde qué nivel se guarda un evento. Lo que queda abajo no se pierde: la serie y su
     #: historia siempre se guardan en la tabla de series. "INFO" guarda absolutamente todo.
     nivel_minimo_evento: str = "ATENCION"
+    #: Contra cuántos períodos anteriores se compara cada alerta, por grano. En día son
+    #: los mismos días de la semana de las N semanas anteriores; en semana, las N semanas
+    #: anteriores; en mes, los N meses anteriores. Es la referencia que la explicación
+    #: lista, fecha por fecha, para que se pueda comprobar mirando los datos.
+    ventanas_referencia: Dict[str, int] = field(default_factory=lambda: {"dia": 8, "semana": 8, "mes": 12})
+    #: con menos ventanas de referencia que esto, la alerta no se puede comprobar: queda en
+    #: ATENCION (guardada, no se avisa)
+    min_ventanas_referencia: int = 4
+    #: Un día fuera de lo normal que a ESTA serie le pasa seguido no es una anomalía para
+    #: ella: si en el último año tuvo más de esta cantidad de días con un desvío así o
+    #: mayor (o tramos sin movimiento así de largos), no se marca. Es lo que separa a una
+    #: tienda errática, que cierra días sueltos, de una que nunca cierra.
+    veces_por_anio: int = 1
+    #: Qué eventos se notifican: los que siguen pasando en los últimos N períodos cerrados.
+    #: Lo que terminó antes queda guardado en VIG_EVENTO, pero no se vuelve a avisar: una
+    #: alerta sobre algo de hace tres semanas no sirve para actuar.
+    notificar_ultimos_periodos: Dict[str, int] = field(default_factory=lambda: {"dia": 3, "semana": 1, "mes": 1})
     #: cuántos causantes se guardan al explicar un evento
     top_atribucion: int = 5
     #: Suma los valores de cada período en su escala decimal (centavos): un importe y
@@ -327,6 +344,10 @@ class VigConfig:
             raise ValueError(f"{donde}umbral_z tiene que ir de menor a mayor: {self.umbral_z}")
         if self.min_periodos < 2:
             raise ValueError(f"{donde}min_periodos tiene que ser al menos 2")
+        if self.min_ventanas_referencia < 2:
+            raise ValueError(f"{donde}min_ventanas_referencia tiene que ser al menos 2")
+        if self.veces_por_anio < 0:
+            raise ValueError(f"{donde}veces_por_anio no puede ser negativo")
         if not 0 <= self.critico_desvio_relativo_minimo <= 10:
             raise ValueError(f"{donde}critico_desvio_relativo_minimo va de 0 a 10 (fracción)")
         if self.factor_sospecha_dato < 0:
@@ -563,10 +584,15 @@ def historial_a_serie(texto: str) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def combinar_historia(guardada: Optional[pd.DataFrame], nueva: pd.DataFrame, v: Vigilancia,
-                      cfg: VigConfig, grano: str, desde_relectura: int) -> pd.DataFrame:
+                      cfg: VigConfig, grano: str, desde_relectura: int,
+                      parcial: bool = False) -> pd.DataFrame:
     """Historia guardada (antes de la relectura) + lo que se acaba de leer.
 
     Lo releído pisa a lo guardado: si la fuente se corrigió, la corrección entra sola.
+    Pero sólo en períodos que se releyeron ENTEROS: si la relectura empezó a mitad de una
+    semana o de un mes (`parcial`), ese período conserva el valor guardado, que estaba
+    completo. Rearmarlo con los días releídos lo dejaba con días de menos, y cada día un
+    poco peor. Si no hay nada guardado para él, se usa lo releído.
     """
     if guardada is None or guardada.empty:
         return nueva
@@ -575,15 +601,21 @@ def combinar_historia(guardada: Optional[pd.DataFrame], nueva: pd.DataFrame, v: 
         if fila["BD_VIGILANCIA"] != v.nombre or fila["BD_GRANO"] != grano:
             continue
         periodos, valores = historial_a_serie(fila["BD_HISTORIAL"])
-        ok = np.isfinite(valores) & (periodos < desde_relectura)
+        hasta = desde_relectura + (1 if parcial else 0)      # el período a medias, de lo guardado
+        ok = np.isfinite(valores) & (periodos < hasta)
         if not ok.any():
             continue
         filas.append(pd.DataFrame({"clave": fila["BD_CLAVE"], "periodo": periodos[ok], "valor": valores[ok]}))
     if not filas:
         return nueva
     viejo = pd.concat(filas, ignore_index=True)
-    nueva = nueva[nueva["periodo"] >= desde_relectura]
-    return pd.concat([viejo, nueva[["clave", "periodo", "valor"]]], ignore_index=True)
+    nueva_ok = nueva[nueva["periodo"] >= desde_relectura + (1 if parcial else 0)]
+    if parcial:
+        # el período a medias sólo entra de lo releído para las series que no lo tenían guardado
+        guardadas = set(viejo.loc[viejo["periodo"] == desde_relectura, "clave"])
+        media = nueva[(nueva["periodo"] == desde_relectura) & ~nueva["clave"].isin(guardadas)]
+        nueva_ok = pd.concat([media, nueva_ok], ignore_index=True)
+    return pd.concat([viejo, nueva_ok[["clave", "periodo", "valor"]]], ignore_index=True)
 
 
 def dias_cerrados(M: np.ndarray, periodos: np.ndarray, umbral: float = 0.05) -> np.ndarray:
@@ -710,15 +742,149 @@ _PISTA = {
 }
 
 
+def _etiqueta_periodo(p: int, grano: str) -> str:
+    t = inicio_periodo(np.array([p]), grano)[0]
+    if grano == "mes":
+        return f"{NOMBRE_MES[t.month - 1][:3]}-{t.year}"
+    return f"{t.day}-{NOMBRE_MES[t.month - 1][:3]}"
+
+
+def _explicar_verificado(e: dict, v: "Vigilancia", cfg: "VigConfig", grano: str, info: dict,
+                         contexto: str = "") -> str:
+    """La explicación con los números que se pueden rehacer mirando los datos.
+
+    Qué pasó en el período (o en el tramo, en total), contra qué se comparó —cada valor
+    de referencia con su fecha—, cuánto se apartó, cuántas veces le pasó algo así a esta
+    serie en el último año, qué no se evaluó, por qué ese nivel y qué suele significar.
+    """
+    det = str(e["detector"])
+    ini, fin = pd.Timestamp(e["fecha_inicio"]), pd.Timestamp(e["fecha_fin"])
+    L, suma = int(info["L"]), bool(info["suma"])
+    unidad = v.unidad
+    if v.agregacion == "ratio" and str(unidad).strip().lower() in ("%", "porcentaje", "pct"):
+        num = lambda x: "sin dato" if x is None or not np.isfinite(x) else f"{100 * float(x):.1f}%"
+        unidad = ""
+    else:
+        num = _num
+    singular, plural = _PERIODO[grano]
+    obs = float(e["observado"])
+
+    # 1. qué pasó
+    if grano == "dia":
+        cuando = f"El {_fecha(fin)}" if L == 1 else f"Del {_fecha(ini)} al {_fecha(fin)} ({L} días evaluados)"
+    elif grano == "semana":
+        cuando = (f"La semana del lunes {_fecha(fin, False)}" if L == 1
+                  else f"Las {L} semanas del {_fecha(ini, False)} al {_fecha(fin + pd.Timedelta(days=6), False)}")
+    else:
+        cuando = (f"{NOMBRE_MES[fin.month - 1].capitalize()} {fin.year}" if L == 1
+                  else f"De {NOMBRE_MES[ini.month - 1]} {ini.year} a {NOMBRE_MES[fin.month - 1]} {fin.year} ({L} meses)")
+    total = " en total" if (L > 1 and suma) else (" en promedio" if L > 1 else "")
+    if obs == 0 and suma:
+        partes = [f"{cuando}: no hubo movimiento (0 {unidad})."]
+    else:
+        partes = [f"{cuando}: {num(obs)} {unidad}{total}."]
+
+    # 2. contra qué, fecha por fecha
+    ventanas = info.get("ventanas", [])
+    k = len(ventanas)
+    if grano == "dia":
+        ref = (f"Los {k} {NOMBRE_DIA[fin.dayofweek]} anteriores" if L == 1
+               else f"Los mismos días de la semana en los {k} tramos anteriores de {L} días (entre paréntesis, "
+                    f"el día en que empieza cada uno)")
+    elif grano == "semana":
+        ref = (f"Las {k} semanas anteriores" if L == 1
+               else f"Los {k} tramos anteriores de {L} semanas (entre paréntesis, dónde empieza cada uno)")
+    else:
+        ref = (f"Los {k} meses anteriores" if L == 1
+               else f"Los {k} tramos anteriores de {L} meses (entre paréntesis, dónde empieza cada uno)")
+    lista = " · ".join(f"{num(w[3])} ({_etiqueta_periodo(w[0], grano)})" for w in ventanas)
+    if info.get("insuficiente"):
+        partes.append(f"{ref}: {lista or 'ninguno'}. Son muy pocos para comprobar si es raro: "
+                      f"queda guardado en ATENCION, sin avisar.")
+    elif info.get("tendencia"):
+        tt = info["tendencia"]
+        partes.append(f"{ref}: {lista}. Contra el tramo anterior ({num(tt['anterior'])}) cambió "
+                      f"{tt['actual']}. Antes, de un tramo al siguiente, venía cambiando: "
+                      f"{' · '.join(tt['historia'])} (mediana {tt['mediana']}). Si seguía como venía, "
+                      f"lo esperado era {num(info['E'])}; quedó {abs(info['d']):.0%} "
+                      f"{'arriba' if info['d'] > 0 else 'abajo'}, un cambio fuera de todo lo que venía haciendo.")
+    else:
+        ajuste = " (comparados por día operado)" if info.get("ajustado") else ""
+        partes.append(f"{ref}{ajuste}: {lista}. Mediana {num(info['E_base'])}, entre {num(info['lo'])} "
+                      f"y {num(info['hi'])}.")
+        t = info.get("temporada")
+        if t:
+            cambio = (t["ratio"] - 1.0) if t["delta"] == 0 else None
+            fechas = (f"el {_fecha(inicio_periodo(np.array([t['ini']]), grano)[0], grano == 'dia')}"
+                      if L == 1 else f"del {_etiqueta_periodo(t['ini'], grano)} al {_etiqueta_periodo(t['fin'], grano)}")
+            efecto = (f"{abs(cambio):.0%} {'arriba' if cambio > 0 else 'abajo'} de sus propios períodos "
+                      f"anteriores" if cambio is not None else
+                      f"{num(t['delta'])} {unidad} {'arriba' if t['delta'] > 0 else 'abajo'} de sus propios "
+                      f"períodos anteriores")
+            if not t.get("hubo", True):
+                partes.append(f"Hace un año, en las mismas fechas ({fechas}), estuvo dentro de lo normal "
+                              f"({num(t['S'])} contra {num(t['E'])}): no es temporada.")
+            elif cambio is not None and abs(cambio) < 0.05:
+                partes.append(f"Hace un año, en las mismas fechas ({fechas}), no hubo efecto de temporada: "
+                              f"{num(t['S'])} contra {num(t['E'])}.")
+            else:
+                partes.append(f"Hace un año, en las mismas fechas ({fechas}), estuvo {efecto} "
+                              f"({num(t['S'])} contra {num(t['E'])}): eso es temporada, y se descuenta. "
+                              f"Lo esperado para esta época era {num(info['E'])}.")
+        elif info.get("sin_anio"):
+            partes.append("Todavía no hay un año de historia: no se puede descontar la temporada.")
+        d = float(info["d"])
+        if obs == 0 and suma:
+            partes.append("Ninguna de esas referencias estuvo en cero"
+                          + (" y el año pasado en esas fechas sí hubo movimiento." if t else "."))
+        elif np.isfinite(d):
+            con_temporada = bool(t) and t.get("hubo", False)
+            contra = "de lo esperado para esta época" if con_temporada else "de la mediana"
+            partes.append(f"Quedó {abs(d):.0%} {'arriba' if d > 0 else 'abajo'} {contra}, fuera de todo "
+                          f"ese rango{' aun descontando la temporada' if con_temporada else ''}.")
+
+    # 3. qué tan seguido le pasa esto a esta serie
+    veces = info.get("veces")
+    if veces is not None:
+        if obs == 0 and suma:
+            if L == 1:
+                partes.append(f"En el último año, esta serie {'nunca tuvo' if veces == 0 else 'tuvo sólo 1'} "
+                              f"{singular} sin movimiento{' fuera de sus días sin operación' if veces == 0 else ''}.")
+            else:
+                partes.append(f"En el último año, esta serie {'nunca estuvo' if veces == 0 else 'estuvo sólo 1 vez'} "
+                              f"{L} {plural} seguidos sin movimiento.")
+        else:
+            que = f"{singular} con {'una subida' if float(info['d']) > 0 else 'una caída'} así o mayor"
+            partes.append(f"En el último año, esta serie {'no tuvo ningún' if veces == 0 else 'tuvo sólo 1'} {que}.")
+
+    if contexto:
+        partes.append(contexto)
+    if not info.get("insuficiente"):
+        partes.append(f"En juego: {num(float(e['materialidad']))} {unidad} (la diferencia contra lo esperado).")
+    partes.append(f"Queda en {e['nivel']} porque: {e['motivo_nivel']}.")
+    d_signo = float(info.get("d", 0) or 0)
+    clave_pista = f"salto{'+' if d_signo > 0 else '-'}" if det == "salto" else det
+    if clave_pista in _PISTA:
+        partes.append(_PISTA[clave_pista])
+    texto = " ".join(partes)
+    for sucio, limpio in (("  ", " "), (" )", ")"), (" .", "."), (" ,", ",")):
+        while sucio in texto:
+            texto = texto.replace(sucio, limpio)
+    return texto[:2000]
+
+
 def explicar_evento(e: dict, v: "Vigilancia", cfg: "VigConfig", grano: str,
                     variacion: float = float("nan"), variacion_abs: float = float("nan"),
                     en_log: bool = True, contexto: str = "") -> str:
     """La razón exacta de un evento, en castellano llano.
 
-    Contra qué se lo comparó, cuánto se movió y cuánto se mueve normalmente esa serie,
-    cuánto duró, qué días no se evaluaron y por qué, cuánto está en juego, por qué quedó
-    en ese nivel y qué suele significar.
+    Si el evento pasó por la verificación (casi todos), la explicación lista los números
+    que la decidieron. Los que no se verifican (congelado, día cerrado, serie nueva,
+    estacional) tienen su propia redacción.
     """
+    info = e.get("verificacion")
+    if isinstance(info, dict):
+        return _explicar_verificado(e, v, cfg, grano, info, contexto)
     det = str(e["detector"])
     fin = pd.Timestamp(e["fecha_fin"])
     obs, z, n = float(e["observado"]), float(e["z"]), int(e["periodos"])
@@ -798,6 +964,333 @@ def explicar_evento(e: dict, v: "Vigilancia", cfg: "VigConfig", grano: str,
         while sucio in texto:                   # restos de una unidad vacía
             texto = texto.replace(sucio, limpio)
     return texto[:2000]
+
+
+#: detectores cuya alerta se verifica contra las mismas fechas anteriores. `estacional`
+#: ya compara contra años anteriores; `congelado`, `dia_cerrado` y `nueva` no son desvíos.
+VERIFICABLES = ("hueco", "salto", "escalon", "racha", "tendencia")
+
+
+def _valores_comparables(M: np.ndarray, cerrados: np.ndarray, i: int, suma: bool) -> np.ndarray:
+    """La serie tal como una persona la compararía. Los días sin operación quedan fuera
+    (NaN). En una suma, un día sin filas después de que la serie arrancó es un día en
+    cero (en ventas, un día sin filas es un día sin venta); antes de arrancar no existe."""
+    a = M[i].astype(float).copy()
+    fin = np.isfinite(a)
+    primero = int(np.argmax(fin)) if fin.any() else len(a)
+    if suma:
+        a[~fin] = 0.0
+    a[:primero] = np.nan
+    a[cerrados[i]] = np.nan
+    return a
+
+
+def _unidad_desplazamiento(grano: str) -> int:
+    """De a cuánto se desplaza la referencia: en día, de a una semana (mismo día)."""
+    return 7 if grano == "dia" else 1
+
+
+def _agregar(valores: np.ndarray, largo: int, suma: bool) -> float:
+    """Total (o promedio) de un tramo. Si faltan algunos días, se completa con el promedio
+    de los que hay: un asueto en la semana de referencia no la hace parecer floja."""
+    ok = np.isfinite(valores)
+    if not ok.any():
+        return float("nan")
+    media = float(valores[ok].mean())
+    return media * largo if suma else media
+
+
+def _desvios_historicos(a: np.ndarray, j0: int, unidad: int, K: int, horizonte: int,
+                        en_log: bool) -> np.ndarray:
+    """Cuánto se apartó cada período del último año de SU propia referencia (la mediana
+    de sus K mismos períodos anteriores), en log (métricas positivas) o en la unidad de
+    la métrica. Es el ruido real de la serie, sin temporada lenta que lo infle."""
+    desde = max(0, j0 - horizonte)
+    p = np.arange(desde, j0)
+    if len(p) == 0:
+        return np.zeros(0)
+    refs = np.full((K, len(p)), np.nan)
+    for m in range(1, K + 1):
+        q = p - unidad * m
+        ok = q >= 0
+        refs[m - 1, ok] = a[q[ok]]
+    esperado = _mediana(refs, axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dev = np.log(a[p] / esperado) if en_log else a[p] - esperado
+    valido = np.isfinite(dev) & (np.isfinite(refs).sum(axis=0) >= max(2, K // 2))
+    return dev[valido]
+
+
+def _ruido_serie(a: np.ndarray, j0: int, unidad: int, horizonte: int, en_log: bool) -> Optional[float]:
+    """El ruido de UN período de la serie: cuánto cambia contra el mismo período de la
+    semana anterior (o el período anterior, en semana y mes), dividido por raíz de 2. Una
+    semana es muy poco para que la temporada arrastre, y el patrón semanal se cancela: es
+    el ruido limpio. None con menos de 20 pares para estimarlo."""
+    p = np.arange(max(unidad, j0 - horizonte), j0)
+    x, y = a[p], a[p - unidad]
+    ok = np.isfinite(x) & np.isfinite(y)
+    if en_log:
+        ok &= (x > 0) & (y > 0)
+    if ok.sum() < 20:
+        return None
+    with np.errstate(divide="ignore", invalid="ignore"):
+        dif = np.log(x[ok] / y[ok]) if en_log else x[ok] - y[ok]
+    return 1.4826 * float(np.median(np.abs(dif - np.median(dif)))) / np.sqrt(2.0)
+
+
+def _veces_desvio(a: np.ndarray, j0: int, unidad: int, K: int, horizonte: int,
+                  desvio: float, relativo: bool = True) -> int:
+    """En el último `horizonte` de períodos antes de j0, cuántos se apartaron de SU propia
+    referencia (mediana de los mismos K anteriores) tanto o más que `desvio`, en el mismo
+    sentido. Es "¿cuántas veces le pasó algo así en el último año?"."""
+    desde = max(0, j0 - horizonte)
+    p = np.arange(desde, j0)
+    if len(p) == 0:
+        return 0
+    refs = np.full((K, len(p)), np.nan)
+    for m in range(1, K + 1):
+        q = p - unidad * m
+        ok = q >= 0
+        refs[m - 1, ok] = a[q[ok]]
+    esperado = _mediana(refs, axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        # en una métrica que ronda el cero (grados) el % no significa nada: se cuenta en
+        # la unidad de la métrica
+        r = a[p] / esperado - 1.0 if relativo else a[p] - esperado
+    valido = np.isfinite(r) & np.isfinite(esperado) & ((esperado != 0) | (not relativo)) & \
+        (np.isfinite(refs).sum(axis=0) >= max(2, K // 2))
+    return int(((r <= desvio) if desvio < 0 else (r >= desvio))[valido].sum())
+
+
+def _veces_sin_movimiento(a: np.ndarray, j0: int, largo: int, horizonte: int) -> int:
+    """Cuántas veces, en el último `horizonte` antes de j0, la serie estuvo al menos `largo`
+    períodos seguidos sin movimiento (los días sin operación ni suman ni cortan)."""
+    racha, veces = 0, 0
+    for x in a[max(0, j0 - horizonte):j0]:
+        if not np.isfinite(x):
+            continue
+        if x == 0:
+            racha += 1
+            if racha == largo:
+                veces += 1
+        else:
+            racha = 0
+    return veces
+
+
+#: un año hacia atrás, conservando el día de la semana en grano día
+_UN_ANIO = {"dia": 364, "semana": 52, "mes": 12}
+
+
+def _comparacion(ajustado: np.ndarray, crudo: np.ndarray, activos: np.ndarray, j0: int, j1: int,
+                 unidad: int, K: int, L: int, suma: bool):
+    """El tramo y sus K ventanas anteriores: las mismas fechas, corridas hacia atrás de a
+    un tramo entero (redondeado a semanas en grano día, para conservar el día de la
+    semana). Así las ventanas no se pisan entre ellas ni con el tramo: si se pisaran, el
+    rango de referencia sería artificialmente angosto y cualquier tendencia lenta
+    quedaría "fuera de rango"."""
+    paso = unidad * int(np.ceil((j1 - j0 + 1) / unidad))
+    ventanas = []                                  # (j inicio, j fin, ajustado, crudo)
+    for m in range(K):
+        despl = paso * (m + 1)
+        idx = activos - despl
+        if idx.min() < 0:
+            break
+        vals = ajustado[idx]
+        if np.isfinite(vals).sum() < max(1, int(np.ceil(L / 2))):
+            continue
+        ventanas.append((j0 - despl, j1 - despl, _agregar(vals, L, suma), _agregar(crudo[idx], L, suma)))
+    return _agregar(ajustado[activos], L, suma), _agregar(crudo[activos], L, suma), ventanas
+
+
+def _verificar_tendencia(e: dict, S: float, S_crudo: float, refs: np.ndarray, crudos: np.ndarray,
+                         ventanas: list, info: dict, en_log: bool, L: int, suma: bool,
+                         peso_i: float, cfg: "VigConfig", v: "Vigilancia") -> Optional[dict]:
+    """Un quiebre de tendencia no se ve en el nivel: una serie que venía creciendo y cae
+    puede volver a un nivel que ya tuvo. Se compara el CAMBIO de este tramo contra el
+    anterior con los cambios habituales entre tramos: "venía +5%, +4%, +6% por tramo y
+    ahora -15%". Comprobable con las mismas ventanas que se listan."""
+    serie = np.concatenate([[S], refs])            # del más reciente al más viejo
+    if en_log and np.all(serie > 0):
+        cambios = np.log(serie[:-1] / serie[1:])   # cambio de cada tramo contra el anterior
+    else:
+        cambios = serie[:-1] - serie[1:]
+    actual, historia = float(cambios[0]), cambios[1:]
+    if len(historia) < cfg.min_ventanas_referencia - 1:
+        return None
+    med = float(np.median(historia))
+    tol = 1e-12
+    if historia.min() - tol <= actual <= historia.max() + tol:
+        return None                                # cambió como suele cambiar
+    anterior = float(refs[0])
+    esperado = anterior * np.exp(med) if en_log else anterior + med
+    d = (S - esperado) / abs(esperado) if esperado else 0.0
+    if abs(d) < cfg.desvio_relativo_minimo:
+        return None
+    if v.direccion == "baja" and d > 0 or v.direccion == "sube" and d < 0:
+        return None
+    escala = max(1.4826 * float(np.median(np.abs(historia - med))),
+                 np.log1p(cfg.piso_sigma_relativo) if en_log else cfg.piso_sigma_relativo * abs(anterior), 1e-12)
+    z = (actual - med) / escala
+    crudo_ant = float(crudos[0])
+    E_crudo = crudo_ant * np.exp(med) if en_log else crudo_ant + med
+    materialidad = abs(S_crudo - E_crudo) if suma else abs(S_crudo - E_crudo) * L
+    nivel, motivo = calcular_nivel(z, L, materialidad, peso_i, v, cfg, "tendencia", abs(d),
+                                   abs(S / esperado) if esperado else 0.0)
+    if NIVELES.index(nivel) < NIVELES.index(cfg.nivel_minimo_evento):
+        return None
+    fmt = (lambda c: f"{np.expm1(c):+.0%}") if en_log else (lambda c: f"{c:+,.2f}")
+    info.update({"tendencia": {"actual": fmt(actual), "historia": [fmt(c) for c in historia],
+                               "mediana": fmt(med), "anterior": crudo_ant},
+                 "E": E_crudo, "E_base": float(np.median(crudos)), "lo": float(crudos.min()),
+                 "hi": float(crudos.max()), "d": d})
+    e = dict(e)
+    e.update({"observado": float(S_crudo), "esperado": float(E_crudo), "z": round(float(z), 4),
+              "materialidad": round(float(materialidad), 2), "periodos": L, "nivel": nivel,
+              "motivo_nivel": motivo, "verificacion": info})
+    return e
+
+
+def verificar_evento(e: dict, M: np.ndarray, cerrados: np.ndarray, periodos: np.ndarray,
+                     grano: str, cfg: "VigConfig", v: "Vigilancia", peso_i: float,
+                     factor: Optional[np.ndarray] = None, usar_log: bool = True) -> Optional[dict]:
+    """Vuelve a juzgar un candidato con una referencia que se puede comprobar a mano.
+
+    1. El tramo contra sus mismas fechas en los K períodos anteriores (mediana y rango).
+    2. La temporada: la misma comparación hace un año. Si el año pasado en esas fechas
+       también bajó (o subió) contra sus semanas anteriores, eso se descuenta.
+    3. Es anomalía sólo si, descontada la temporada, queda fuera de todo el rango y se
+       aparta lo suficiente.
+    4. ¿Le pasa seguido a ESTA serie? Si en el último año tuvo más de `veces_por_anio`
+       días así (o tramos sin movimiento así de largos), no es raro para ella.
+
+    Devuelve el evento con sus números recalculados, o None si mirado así no es anomalía.
+    """
+    det = str(e["detector"])
+    if det not in VERIFICABLES:
+        return e
+    i, p0 = int(e["fila"]), int(periodos[0])
+    j0, j1 = int(e["periodo_inicio"]) - p0, int(e["periodo_fin"]) - p0
+    suma = v.agregacion in ("suma", "conteo")
+    crudo = _valores_comparables(M, cerrados, i, suma)
+    ajustado = crudo / factor[i] if factor is not None else crudo
+    activos = np.array([j for j in range(j0, j1 + 1) if not cerrados[i, j]], dtype=int)
+    L = len(activos)
+    if L == 0:
+        return None
+    unidad = _unidad_desplazamiento(grano)
+    K = int(cfg.ventanas_referencia[grano])
+    S, S_crudo, ventanas = _comparacion(ajustado, crudo, activos, j0, j1, unidad, K, L, suma)
+    if not np.isfinite(S):
+        return None
+    horizonte = periodos_por_ano(grano)
+    info = {"L": L, "suma": suma, "unidad": unidad, "horizonte": horizonte, "veces": None,
+            "ventanas": [(p0 + a, p0 + b, x, y) for a, b, x, y in ventanas], "temporada": None,
+            "sin_anio": True,
+            "ajustado": factor is not None and bool(np.any(np.abs(np.nan_to_num(factor[i, activos], nan=1) - 1) > 1e-9)),
+            "insuficiente": len(ventanas) < cfg.min_ventanas_referencia}
+    if info["insuficiente"]:
+        e = dict(e)
+        e["periodos"] = L
+        e["verificacion"] = info
+        e["nivel"] = _bajar_hasta(e["nivel"], "ATENCION")
+        e["motivo_nivel"] = (f"{e['motivo_nivel']}; sólo hay {len(ventanas)} período(s) anteriores "
+                             f"para comparar (hacen falta {cfg.min_ventanas_referencia}): no se "
+                             f"puede comprobar, no pasa de ATENCION")
+        return e
+
+    refs = np.array([w[2] for w in ventanas])
+    crudos = np.array([w[3] for w in ventanas])
+    E, lo, hi = float(np.median(refs)), float(refs.min()), float(refs.max())
+    en_log = usar_log and np.all(refs > 0)
+    if det == "tendencia":
+        return _verificar_tendencia(e, S, S_crudo, refs, crudos, ventanas, info, en_log, L, suma,
+                                    peso_i, cfg, v)
+
+    # la temporada: la misma comparación, en las mismas fechas de hace un año
+    Y = _UN_ANIO[grano]
+    ratio_t, delta_t = 1.0, 0.0
+    if activos.min() - Y >= 0:
+        info["sin_anio"] = False
+        S_a, S_a_crudo, vent_a = _comparacion(ajustado, crudo, activos - Y, j0 - Y, j1 - Y,
+                                              unidad, K, L, suma)
+        if np.isfinite(S_a) and len(vent_a) >= cfg.min_ventanas_referencia:
+            refs_a = np.array([w[2] for w in vent_a])
+            E_a = float(np.median(refs_a))
+            if S == 0 and suma and S_a == 0:
+                return None                    # las mismas fechas del año pasado tampoco hubo: es de temporada
+            # sólo es temporada si hace un año, en esas fechas, TAMBIÉN estuvo fuera de lo
+            # normal. Si estuvo normal, no hay nada que descontar (y usar su diferencia
+            # sería confundir la tendencia o el ruido de un año con una temporada).
+            tol_a = 1e-9 * max(abs(E_a), 1.0)
+            fuera_a = S_a < refs_a.min() - tol_a or S_a > refs_a.max() + tol_a
+            if fuera_a:
+                if en_log and S_a > 0 and E_a > 0 and np.all(refs_a > 0):
+                    ratio_t = S_a / E_a
+                elif not en_log:
+                    delta_t = S_a - E_a
+            info["temporada"] = {"ini": p0 + j0 - Y, "fin": p0 + j1 - Y, "S": S_a_crudo,
+                                 "E": float(np.median([w[3] for w in vent_a])),
+                                 "ratio": ratio_t, "delta": delta_t, "hubo": bool(fuera_a)}
+
+    # lo esperado para esta época, y el tramo llevado a la escala de las semanas anteriores
+    esperado = E * ratio_t + delta_t
+    S_cmp = S / ratio_t - delta_t
+    tol = 1e-9 * max(abs(E), 1.0)
+    fuera = S_cmp < lo - tol or S_cmp > hi + tol
+    d = (S - esperado) / abs(esperado) if esperado != 0 else (
+        float("inf") if S > 0 else float("-inf") if S < 0 else 0.0)
+    if not fuera or abs(d) < cfg.desvio_relativo_minimo:
+        return None                            # mirado así, no es raro
+    if v.direccion == "baja" and d > 0 or v.direccion == "sube" and d < 0:
+        return None
+
+    # ¿cuántas veces le pasó algo así a esta serie en el último año?
+    if S == 0 and suma:
+        veces = _veces_sin_movimiento(crudo, int(activos[0]), L, horizonte)
+    elif L == 1:
+        veces = (_veces_desvio(ajustado, int(activos[0]), unidad, K, horizonte, d) if en_log else
+                 _veces_desvio(ajustado, int(activos[0]), unidad, K, horizonte, S - esperado,
+                               relativo=False))
+    else:
+        veces = None                           # un tramo: las K ventanas son la historia
+    info["veces"] = veces
+    if veces is not None and veces > cfg.veces_por_anio:
+        return None
+
+    # cuán raro. Un período suelto: contra lo que la serie se desvía de su referencia a lo
+    # largo de todo el último año (mucho más estable que 8 valores). Un tramo: contra lo
+    # que varían sus K ventanas, que ya son tramos independientes.
+    ruido_hist = _ruido_serie(ajustado, int(activos[0]), unidad, horizonte, en_log) if L == 1 else None
+    if en_log and S_cmp > 0:
+        lr = np.log(refs)
+        escala = ruido_hist if ruido_hist else 1.4826 * float(np.median(np.abs(lr - np.median(lr))))
+        escala = max(escala, np.log1p(cfg.piso_sigma_relativo))
+        z = (np.log(S_cmp) - float(np.median(lr))) / escala
+    elif S == 0 and E > 0:
+        z = float(e["z"]) if np.isfinite(e["z"]) and e["z"] < 0 else -cfg.umbral_z["CRITICO"]
+    else:
+        escala = ruido_hist if ruido_hist else 1.4826 * float(np.median(np.abs(refs - E)))
+        escala = max(escala, cfg.piso_sigma_relativo * abs(E), 1e-12)
+        z = (S_cmp - E) / escala
+
+    base_crudo = float(np.median(crudos))
+    if info["ajustado"] and S != 0 and np.isfinite(S_crudo / S):
+        E_crudo = esperado * (S_crudo / S)
+    else:
+        E_crudo = base_crudo * ratio_t + delta_t
+    materialidad = abs(S_crudo - E_crudo) if suma else abs(S_crudo - E_crudo) * L
+    factor_dato = abs(S / esperado) if esperado else 0.0
+    nivel, motivo = calcular_nivel(z, L, materialidad, peso_i, v, cfg, det, abs(d), factor_dato)
+    if NIVELES.index(nivel) < NIVELES.index(cfg.nivel_minimo_evento):
+        return None
+    info.update({"E_base": base_crudo, "E": E_crudo, "lo": float(crudos.min()), "hi": float(crudos.max()),
+                 "d": d})
+    e = dict(e)
+    e.update({"observado": float(S_crudo), "esperado": float(E_crudo), "z": round(float(z), 4),
+              "materialidad": round(float(materialidad), 2), "periodos": L, "nivel": nivel,
+              "motivo_nivel": motivo, "verificacion": info})
+    return e
 
 
 def usa_calendario(v: "Vigilancia") -> bool:
@@ -1401,7 +1894,10 @@ def unificar(eventos: pd.DataFrame, cfg: VigConfig) -> pd.DataFrame:
         for b in bloques:
             if len(b["idx"]) == 1:
                 continue
-            orden = sorted(b["idx"], key=lambda i: (prioridad.get(eventos.at[i, "detector"], 99),
+            # manda el de mayor nivel (la lectura más fuerte, ya verificada); entre iguales,
+            # el detector más específico
+            orden = sorted(b["idx"], key=lambda i: (-NIVELES.index(eventos.at[i, "nivel"]),
+                                                    prioridad.get(eventos.at[i, "detector"], 99),
                                                     -abs(float(eventos.at[i, "z"]))))
             principal, otros = orden[0], orden[1:]
             eventos.loc[otros, "principal"] = False
@@ -1419,27 +1915,45 @@ def conciliar(nuevos: pd.DataFrame, previos: Optional[pd.DataFrame], f: Fechas) 
     Sin esto, el mismo problema se notificaría como nuevo todos los días. Los eventos
     abiertos que ya no aparecen se cierran.
     """
-    abiertos: Dict[Tuple[str, str, str, str], dict] = {}
+    # una misma serie puede tener varios eventos abiertos del mismo detector (dos cierres
+    # en el mes): se guardan todos, y cada evento nuevo se une al anterior cuyas fechas
+    # se pisan o se tocan con las suyas. Antes quedaba uno solo por serie y detector, y
+    # un evento del día 1 podía heredar la identidad y el nivel del evento del día 8.
+    abiertos: Dict[Tuple[str, str, str, str], List[dict]] = {}
     if previos is not None and len(previos):
         for _, p in previos.iterrows():
             if str(p.get("estado", "")) == "CERRADO":
                 continue
-            abiertos[(p["vigilancia"], p["grano"], p["clave"], p["detector"])] = p.to_dict()
+            abiertos.setdefault((p["vigilancia"], p["grano"], p["clave"], p["detector"]), []).append(p.to_dict())
 
     filas = []
     usados = set()
     for _, n in nuevos.iterrows():
         llave = (n["vigilancia"], n["grano"], n["clave"], n["detector"])
-        previo = abiertos.get(llave)
+        ni, nf = int(n["periodo_inicio"]), int(n["periodo_fin"])
+        previo, mejor = None, -1
+        for k, p in enumerate(abiertos.get(llave, [])):
+            if (llave, k) in usados:
+                continue
+            pi, pf = int(p["periodo_inicio"]), int(p["periodo_fin"])
+            if ni <= pf + 1 and nf >= pi - 1:                 # se pisan o se tocan
+                solape = min(nf, pf) - max(ni, pi)
+                if solape > mejor:
+                    previo, mejor, elegido = p, solape, k
         fila = n.to_dict()
-        continua = previo is not None and int(n["periodo_inicio"]) <= int(previo["periodo_fin"]) + 1
+        continua = previo is not None
         if continua:
-            usados.add(llave)
+            usados.add((llave, elegido))
             fila["id_evento"] = previo["id_evento"]
-            fila["periodo_inicio"] = int(previo["periodo_inicio"])
-            if previo.get("fecha_inicio") is not None:
-                fila["fecha_inicio"] = pd.Timestamp(previo["fecha_inicio"])
-            fila["periodos"] = int(n["periodo_fin"]) - int(previo["periodo_inicio"]) + 1
+            # el evento conserva su inicio más temprano, y sus períodos lo incluyen
+            if int(previo["periodo_inicio"]) < ni:
+                fila["periodo_inicio"] = int(previo["periodo_inicio"])
+                fila["periodos"] = int(n["periodos"]) + (ni - int(previo["periodo_inicio"]))
+                if previo.get("fecha_inicio") is not None:
+                    fila["fecha_inicio"] = pd.Timestamp(previo["fecha_inicio"])
+                    if str(fila.get("explicacion") or ""):
+                        fila["explicacion"] = (f"{fila['explicacion']} El evento viene desde el "
+                                               f"{_fecha(previo['fecha_inicio'])}.")[:2000]
             fila["estado"] = "EN_CURSO"
             fila["nivel_anterior"] = previo.get("nivel", "")
             fila["fecha_deteccion"] = previo.get("fecha_deteccion", f.hoy)
@@ -1452,17 +1966,18 @@ def conciliar(nuevos: pd.DataFrame, previos: Optional[pd.DataFrame], f: Fechas) 
         fila["fecha_cierre"] = pd.NaT
         filas.append(fila)
 
-    for llave, p in abiertos.items():
-        if llave in usados:
-            continue
-        cerrado = dict(p)
-        cerrado["estado"] = "CERRADO"
-        cerrado["fecha_cierre"] = f.hoy
-        previa = str(p.get("explicacion") or "").strip()
-        cerrado["explicacion"] = (f"{previa} " if previa and previa.lower() != "nan" else "") + \
-            f"Se cerró el {_fecha(f.hoy)}: ya no se detecta, volvió a lo normal."
-        cerrado["nivel_anterior"] = p.get("nivel", "")
-        filas.append(cerrado)
+    for llave, lista in abiertos.items():
+        for k, p in enumerate(lista):
+            if (llave, k) in usados:
+                continue
+            cerrado = dict(p)
+            cerrado["estado"] = "CERRADO"
+            cerrado["fecha_cierre"] = f.hoy
+            previa = str(p.get("explicacion") or "").strip()
+            cerrado["explicacion"] = (f"{previa} " if previa and previa.lower() != "nan" else "") + \
+                f"Se cerró el {_fecha(f.hoy)}: ya no se detecta, volvió a lo normal."
+            cerrado["nivel_anterior"] = p.get("nivel", "")
+            filas.append(cerrado)
     return pd.DataFrame(filas)
 
 
@@ -1561,10 +2076,11 @@ class VigEngine:
 
     # -- una vigilancia, un grano ------------------------------------------- #
     def _procesar(self, v: Vigilancia, grano: str, crudo: pd.DataFrame,
-                  estado: Optional[pd.DataFrame], desde_relectura: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+                  estado: Optional[pd.DataFrame], desde_relectura: int,
+                  parcial: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
         cfg, f = self.cfg.para(v), self.fechas      # con los `ajustes` de esta vigilancia
         series = armar_series(crudo, v, cfg, grano)
-        series = combinar_historia(estado, series, v, cfg, grano, desde_relectura)
+        series = combinar_historia(estado, series, v, cfg, grano, desde_relectura, parcial)
         if series.empty:
             return pd.DataFrame(), pd.DataFrame()
 
@@ -1572,7 +2088,11 @@ class VigEngine:
         series = series[series["periodo"] <= ultimo]
         if series.empty:
             return pd.DataFrame(), pd.DataFrame()
-        primero = int(indice_periodo(pd.Series([f.ayer - pd.Timedelta(days=cfg.dias_historia)]), grano)[0])
+        d_ini = f.ayer - pd.Timedelta(days=cfg.dias_historia)
+        primero = int(indice_periodo(pd.Series([d_ini]), grano)[0])
+        if _dia(d_ini) > int(limites_periodo(np.array([primero]), grano)[0][0]):
+            primero += 1                                   # el período más viejo vino a medias: no se usa
+        series = series[series["periodo"] >= primero]      # lo guardado no crece sin límite
         claves, periodos, M = matriz_series(series, primero, ultimo)
         evaluados = min(int(cfg.periodos_evaluados[grano]), M.shape[1])
         idx = np.arange(M.shape[1] - evaluados, M.shape[1])
@@ -1618,7 +2138,7 @@ class VigEngine:
                     cerrados[de_alcance[a]] |= fila[None, :]
 
         # semana y mes: lo esperado se ajusta a los días operados de cada período
-        operados = habituales = None
+        operados = habituales = factor_dias = None
         if (grano != "dia" and cfg.ajustar_dias_operados and v.agregacion in ("suma", "conteo")):
             operados = np.zeros(M.shape)
             desde_d, hasta_d = int(ini_p.min()), int(fin_p.max())
@@ -1632,6 +2152,7 @@ class VigEngine:
             with np.errstate(divide="ignore", invalid="ignore"):
                 factor = np.where(operados > 0, operados / habituales, np.nan)
             if np.nanmax(np.abs(np.nan_to_num(factor, nan=1.0) - 1.0)) > 1e-9:
+                factor_dias = factor
                 cerrados |= operados == 0                    # un período entero sin operar
                 ok = np.isfinite(factor) & (factor > 0)
                 if usar_log:
@@ -1691,6 +2212,10 @@ class VigEngine:
             "fecha_ultimo_periodo": inicio_periodo([periodos[-1]] * len(claves), grano),
             "historial": [textos.get(k, historial_json(np.zeros(0), np.zeros(0))) for k in claves],
         })
+        # los detectores proponen; esto decide, con una referencia que se puede comprobar
+        eventos = [x for x in (verificar_evento(e, M, cerrados, periodos, grano, cfg, v,
+                                                float(peso[int(e["fila"])]), factor_dias, usar_log)
+                               for e in eventos) if x is not None]
         if not eventos:
             return filas_serie, pd.DataFrame()
         ev = pd.DataFrame(eventos)
@@ -1771,7 +2296,10 @@ class VigEngine:
                 t0 = time.time()
                 corte = (int(indice_periodo(pd.Series([desde_relectura]), grano)[0])
                          if desde_relectura is not None else -10 ** 9)
-                s, e = self._procesar(v, grano, crudo, estado, corte)
+                # ¿la relectura empezó a mitad de ese período? entonces vino con días de menos
+                parcial = (desde_relectura is not None and
+                           _dia(desde_relectura) > int(limites_periodo(np.array([corte]), grano)[0][0]))
+                s, e = self._procesar(v, grano, crudo, estado, corte, parcial)
                 if len(s):
                     series_todas.append(s)
                 if len(e):
@@ -1781,13 +2309,17 @@ class VigEngine:
                             f"{len(s):,}", f"{len(e):,}", time.time() - t0)
 
         series = pd.concat(series_todas, ignore_index=True) if series_todas else pd.DataFrame()
-        if not eventos_todos:
+        hay_previos = eventos_previos is not None and len(eventos_previos) > 0
+        if not eventos_todos and not hay_previos:
             vacio = pd.DataFrame()
             self.tiempos_["total"] = time.time() - t_inicio
             return Resultado(series, vacio, vacio, self._resumen(series, vacio))
 
-        crudos = unificar(pd.concat([e for _, _, _, e in eventos_todos], ignore_index=True), cfg)
-        if "explicacion" in crudos.columns:
+        # sin nada nuevo igual hay que conciliar: los eventos que venían abiertos se cierran
+        crudos = (unificar(pd.concat([e for _, _, _, e in eventos_todos], ignore_index=True), cfg)
+                  if eventos_todos else pd.DataFrame(columns=["vigilancia", "grano", "clave", "detector",
+                                                              "periodo_inicio", "periodo_fin"]))
+        if "explicacion" in crudos.columns and len(crudos):
             con = crudos["principal"] & (crudos["confirman"].astype(str) != "")
             crudos.loc[con, "explicacion"] = [
                 f"{t} También lo marcan otros detectores: {c}."[:2000]
@@ -1831,7 +2363,15 @@ class VigEngine:
         nuevo = eventos["estado"] == "NUEVO"
         empeoro = (eventos["estado"] == "EN_CURSO") & (actual > anterior)
         principal = eventos["principal"].fillna(True) if "principal" in eventos else True
-        sel = eventos[grave & (nuevo | empeoro) & principal].copy()
+        # sólo lo vigente: lo que sigue pasando en los últimos períodos cerrados. Lo que
+        # terminó antes queda guardado, pero avisarlo hoy no sirve para actuar.
+        def vigente(fila) -> bool:
+            g = str(fila["grano"])
+            ultimo = ultimo_periodo_cerrado(self.fechas.ayer, g)
+            n_ult = int(cfg.notificar_ultimos_periodos.get(g, 1))
+            return int(fila["periodo_fin"]) >= ultimo - (n_ult - 1)
+        vigentes = eventos.apply(vigente, axis=1) if len(eventos) else pd.Series([], dtype=bool)
+        sel = eventos[grave & (nuevo | empeoro) & principal & vigentes].copy()
         sel["motivo_notificacion"] = np.where(sel["estado"] == "NUEVO", "evento nuevo",
                                               "el evento empeoró de nivel")
         return sel.sort_values(["nivel", "materialidad"], ascending=[True, False]).reset_index(drop=True)

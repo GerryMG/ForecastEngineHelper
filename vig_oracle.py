@@ -167,6 +167,21 @@ PESO_RELATIVO_MINIMO = 0.2      # serie que pesa menos que 0,2 veces la serie pr
 DESVIO_RELATIVO_MINIMO = 0.05   # diferencia mínima contra lo esperado para que sea un evento
 PISO_SIGMA_RELATIVO = 0.02      # piso del ruido: nunca menos del 2% del nivel de la serie
 
+# ── Cómo se decide si algo es una anomalía (comprobable mirando los datos) ─────────
+# Un día se compara contra los mismos días de la semana de las N semanas anteriores; un
+# tramo, por su total, contra los tramos anteriores de igual largo; una semana contra las
+# N anteriores; un mes contra los N anteriores. Es anomalía sólo si queda FUERA de todo ese
+# rango, descontada la temporada (lo que pasó en las mismas fechas hace un año).
+VENTANAS_REFERENCIA = {"dia": 8, "semana": 8, "mes": 12}
+MIN_VENTANAS_REFERENCIA = 4     # con menos, no se puede comprobar: queda en ATENCION, sin avisar
+# Algo que a ESA serie le pasa seguido no es anomalía para ella: si en el último año tuvo
+# más de esta cantidad de días así (o de tramos sin movimiento así de largos), no se marca.
+# Es lo que separa a una tienda errática, que cierra días sueltos, de una que nunca cierra.
+VECES_POR_ANIO = 1
+# Sólo se avisa lo que sigue pasando en los últimos N períodos cerrados. Lo anterior queda
+# guardado en VIG_EVENTO, pero una alerta sobre algo de hace semanas no sirve para actuar.
+NOTIFICAR_ULTIMOS_PERIODOS = {"dia": 3, "semana": 1, "mes": 1}
+
 # Que un CRÍTICO valga la pena. La calibración ajusta cuántas alertas salen, pero no mira
 # cuánto se movió de verdad ni si el dato tiene sentido: eso lo deciden estas tres.
 CRITICO_DESVIO_RELATIVO_MINIMO = 0.20   # para ser CRÍTICO, apartarse al menos 20% de lo esperado
@@ -223,6 +238,10 @@ def build_config(fecha_ejecucion: str | None = None) -> VigConfig:
         factor_sospecha_dato=FACTOR_SOSPECHA_DATO,
         dia_cerrado_relativo=DIA_CERRADO_RELATIVO,
         ajustar_dias_operados=AJUSTAR_DIAS_OPERADOS,
+        ventanas_referencia=VENTANAS_REFERENCIA,
+        min_ventanas_referencia=MIN_VENTANAS_REFERENCIA,
+        veces_por_anio=VECES_POR_ANIO,
+        notificar_ultimos_periodos=NOTIFICAR_ULTIMOS_PERIODOS,
         suma_exacta=SUMA_EXACTA,
         max_decimales=MAX_DECIMALES,
         tolerancia_cero=TOLERANCIA_CERO,
@@ -380,9 +399,13 @@ COLUMNAS_EVENTO = [
     ("FECHA_FIN", "DATE", "Último período con la anomalía."),
     ("MT_PERIODOS", "NUMBER", "Cuántos períodos lleva."),
     ("MT_Z", "NUMBER", "Peor desvío robusto del evento. Negativo = por debajo de lo esperado."),
-    ("MT_OBSERVADO", "NUMBER", "Valor observado en el último período del evento."),
-    ("MT_ESPERADO", "NUMBER", "Valor esperado en ese período."),
-    ("MT_MATERIALIDAD", "NUMBER", "Diferencia acumulada contra lo esperado, en la unidad de la métrica."),
+    ("MT_OBSERVADO", "NUMBER", "Lo observado: el valor del período si el evento es de un período; "
+                                "el total (o el promedio, en métricas que no se suman) del tramo si "
+                                "es de varios."),
+    ("MT_ESPERADO", "NUMBER", "Lo esperado para eso mismo: la mediana de los mismos períodos "
+                               "anteriores (ver BD_EXPLICACION, que los lista), descontada la temporada."),
+    ("MT_MATERIALIDAD", "NUMBER", "Lo que está en juego: la diferencia entre lo observado y lo esperado, "
+                                   "en la unidad de la métrica."),
     ("BD_UNIDAD", "VARCHAR2(20)", "Unidad de la métrica."),
     ("MT_PARTICIPACION", "NUMBER", "Cuánto pesa la serie sobre el total de su vigilancia."),
     ("BD_NIVEL", "VARCHAR2(10)", "Gravedad: INFO, ATENCION, ALERTA o CRITICO."),
@@ -526,7 +549,13 @@ def planificar(conn, cfg: VigConfig, modo: str = MODO_CORRIDA) -> Tuple[pd.Times
     if siguiente < desde:
         desde = siguiente
         motivo = f"la última corrida llegó hasta {corte.date()}: se relee desde el día siguiente"
-    return desde, True, motivo
+    # La relectura arranca al inicio de la semana y del mes donde cae: una semana o un mes
+    # releídos a medias se rearmarían con días de menos (y pisarían al valor guardado).
+    lunes = desde - pd.Timedelta(days=desde.dayofweek)
+    inicio = min(lunes, desde.replace(day=1))
+    if inicio < desde:
+        motivo += f", desde el {inicio.date()} para tomar semanas y meses enteros"
+    return inicio, True, motivo
 
 
 def leer_fuente(conn, cfg: VigConfig, desde: pd.Timestamp) -> Dict[str, pd.DataFrame]:
@@ -781,8 +810,11 @@ def mensaje(evento) -> str:
             partes.append("OJO: posible error de carga, revisar la fuente antes de actuar.")
         partes.append(f"[{evento['nivel']}] {evento['vigilancia']} / {evento['clave']} "
                       f"({evento['grano']}).")
+        # "empeoró" sólo si el evento ya estaba abierto y SUBIÓ de nivel (no si bajó, y
+        # nunca en un evento nuevo)
         anterior = str(evento.get("nivel_anterior", "") or "")
-        if anterior in vig_engine.NIVELES and anterior != evento["nivel"]:
+        if (str(evento.get("estado", "")) == "EN_CURSO" and anterior in vig_engine.NIVELES
+                and vig_engine.NIVELES.index(evento["nivel"]) > vig_engine.NIVELES.index(anterior)):
             partes.append(f"Empeoró: en la corrida anterior estaba en {anterior}.")
         partes.append(expl)
         if str(evento.get("atribucion", "") or ""):
