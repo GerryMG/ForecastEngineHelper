@@ -47,6 +47,7 @@ Variables de entorno: `ST_MODO`, `ST_RELEER_MESES`, `ST_RELEER_DESDE`, `ST_FECHA
 | `SEGMENTOS` | con quién se compara: jerarquía del **más grueso al más fino** |
 | `SQL_FUENTE` | la consulta, con `:desde` y `:hasta` |
 | `TABLA_DESTINO`, `TABLA_DIAGNOSTICO`, `GUARDAR_DIAGNOSTICO` | dónde escribe |
+| `TABLA_EVIDENCIA`, `GUARDAR_EVIDENCIA` | con quién se comparó cada recomendación (ver abajo) |
 
 ### Cómo se mide la afinidad
 
@@ -118,6 +119,54 @@ La evidencia queda en la tabla: `MT_DIAS_COMPRA_ITEM` (cuántas veces lo compró
 
 Sale **una fila por cliente e ítem**: si un ítem califica como reposición y como brecha, queda el tipo
 que mejor lo explica.
+
+### La evidencia: con quién se comparó cada recomendación
+
+| Perilla | Qué hace | Default |
+|---|---|---|
+| `GUARDAR_EVIDENCIA` | escribe `TABLA_EVIDENCIA`. `False` = ni se la pide ni se la toca | True |
+| `TABLA_EVIDENCIA` | la tabla nueva (las otras dos no cambian) | `REC_EVIDENCIA` |
+| `MAX_EVIDENCIAS` | pares (o ítems) listados por recomendación y por clase de evidencia. Los totales van siempre completos | 5 |
+| `EVIDENCIA_HASTA_RANKING` | evidencia sólo para las primeras N de cada entidad. 0 = todas | 0 |
+
+`BD_MOTIVO` dice "12 de sus pares más parecidos lo compran"; la evidencia dice **cuáles**. Se une
+con `TABLA_DESTINO` por entidad + ítem, y cada recomendación trae:
+
+- **`CALCULO`** (`MT_ORDEN = 0`): el USD en juego desarmado. Por ejemplo: *"No lo compra. En su
+  segmento lo compran 215 de 375 entidades (57,3%). Un comprador gasta 185 por compra y compra cada
+  32 días: en 90 días son 2,8 compras, 514. Su compra es 0,87 veces la del cliente medio: 447.
+  Probabilidad de adopción 5,5% (lo que acertó coseno_entidad en el backtest del segmento): 24,6
+  esperados."* Si se aplicó un tope, lo dice.
+- La evidencia de su tipo:
+
+| Quién la produjo | `BD_EVIDENCIA` | Qué lista |
+|---|---|---|
+| `popularidad` | `COMPRADOR_SEGMENTO` | pares del segmento que compran el ítem (los de tamaño más parecido) |
+| `coseno_entidad` | `VECINO` | los pares más parecidos que lo compran, con su coseno y su aporte al puntaje |
+| `kmeans_valor` | `MIEMBRO_GRUPO` | entidades del mismo grupo de k-means que lo compran |
+| `coseno_item` | `ITEM_AFIN` + `CO_COMPRADOR` | lo que ya compra y se compra con el recomendado, y quiénes compran los dos |
+| `reglas` | `REGLA` + `CO_COMPRADOR` | las reglas que le aplican (confianza, lift) y quiénes las cumplen |
+| `svd` | `FACTOR_LATENTE` + `CO_COMPRADOR` | lo que ya compra y va con el recomendado en el patrón de consumo |
+| `rrf` / `ponderado` | la de cada uno | cada algoritmo de la batería deja la suya |
+| REPOSICION | `PAR_RITMO` | pares que lo compran con ritmo: cada cuántos días y por cuánto |
+| BRECHA | `PAR_PARTICIPACION` | pares de tamaño parecido y qué parte de su compra le dedican |
+
+Cada par trae lo que compró del ítem en la ventana (`MT_USD_PAR_ITEM`, `MT_DIAS_PAR_ITEM`), así se
+comprueba contra la fuente. Los totales (`MT_TAMANO_GRUPO`, `MT_COMPRAN_EN_GRUPO`) son los de todo el
+grupo aunque se listen 5. Para explicar una recomendación:
+
+```sql
+SELECT MT_ORDEN, BD_EVIDENCIA, PAR_SK_CLIENTE, REF_BK_SUBMARCA, BD_DETALLE
+  FROM REC_EVIDENCIA
+ WHERE SK_CLIENTE = :cliente AND BK_SUBMARCA = :submarca
+ ORDER BY MT_ORDEN;
+```
+
+La evidencia lee las recomendaciones, no las cambia: con y sin ella el motor da exactamente lo mismo.
+Volumen: unas 7 filas por recomendación (11 en `coseno_item`, `reglas` y `svd`, que suman los
+co-compradores). Medido con 60.000 clientes y 600.000 recomendaciones: de 4 a 6,4 millones de filas,
+entre 50 y 65 segundos más, y de 3,5 a 5,5 GB más de memoria durante la corrida. Si el pod queda
+justo, `EVIDENCIA_HASTA_RANKING = 3` la deja en menos de un tercio.
 
 Variables de entorno: `RC_FECHA_EJECUCION`, `RC_SELECCION`, `RC_DRY_RUN`.
 Para calibrar: `RC_NIVELES` y `RC_REJILLA` (JSON) en `calibrar_recomendaciones.ipynb`.

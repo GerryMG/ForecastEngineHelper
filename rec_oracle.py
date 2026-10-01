@@ -31,7 +31,7 @@ import pandas as pd
 import oracledb
 
 import rec_engine
-from rec_engine import RecConfig, RecEngine, Fechas, catalogo
+from rec_engine import RecConfig, RecEngine, Fechas, catalogo, catalogo_evidencia
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  1. CONEXIONES  (origen y destino son distintos)
@@ -86,6 +86,21 @@ EXCLUIR_NETOS_NO_POSITIVOS = True      # comprado y devuelto entero no es una co
 TABLA_DESTINO = "REC_CLIENTE_ITEM"        # una fila por entidad e ítem recomendado
 TABLA_DIAGNOSTICO = "REC_DIAGNOSTICO"     # qué algoritmo ganó en cada segmento y con qué números
 GUARDAR_DIAGNOSTICO = True
+
+# ── Evidencia: con quién se comparó cada recomendación ─────────────────────
+# Por cada recomendación: una fila CALCULO con el USD en juego desarmado número por número,
+# y los pares, el grupo de k-means, los ítems o las reglas que la sostienen, con lo que
+# cada par compró. Se une con TABLA_DESTINO por entidad + ítem. No cambia ninguna
+# recomendación: sólo las deja verificables.
+TABLA_EVIDENCIA = "REC_EVIDENCIA"
+GUARDAR_EVIDENCIA = True
+# Pares (o ítems) que se listan por recomendación y por clase de evidencia. Los totales
+# (de cuántos, cuántos lo compran) van siempre completos. Con 5, son unas 6 a 11 filas por
+# recomendación.
+MAX_EVIDENCIAS = 5
+# Evidencia sólo para las primeras N de cada entidad (0 = todas). Con 3, la tabla queda en
+# menos de un tercio.
+EVIDENCIA_HASTA_RANKING = 0
 
 # "delete"   : DELETE + INSERT en una transacción. Si algo falla, la tabla queda como estaba.
 # "truncate" : TRUNCATE + INSERT. Más rápido, pero si el INSERT falla la tabla queda VACÍA.
@@ -250,6 +265,10 @@ def build_config(fecha_ejecucion: str | None = None, seleccion: str | None = Non
         min_casos_recuperacion=MIN_CASOS_RECUPERACION,
         tope_potencial_por_historico=TOPE_POTENCIAL_POR_HISTORICO,
         tope_potencial_relativo=TOPE_POTENCIAL_RELATIVO,
+
+        guardar_evidencia=GUARDAR_EVIDENCIA,
+        max_evidencias=MAX_EVIDENCIAS,
+        evidencia_hasta_ranking=EVIDENCIA_HASTA_RANKING,
     )
 
 
@@ -378,6 +397,34 @@ def columnas_destino(cfg: RecConfig) -> List[Tuple[str, str, str]]:
     return salida + COLUMNAS_CONTROL
 
 
+def columnas_evidencia(cfg: RecConfig) -> List[Tuple[str, str, str]]:
+    """Columnas de TABLA_EVIDENCIA. Las del par (PAR_) y del ítem de referencia (REF_)
+    tienen el mismo tipo que la columna de la que salen."""
+    propias = {c.upper(): c for c in list(cfg.entidad) + list(cfg.item)}
+    salida = []
+    for c, t, d in catalogo_evidencia(cfg):
+        base = c[4:] if c.startswith(("PAR_", "REF_")) and c[4:] in propias else c
+        if base in propias:
+            t = tipo_categoria(base)
+        salida.append((c, t, d))
+    return salida + COLUMNAS_CONTROL
+
+
+def _tablas(cfg: RecConfig) -> List[Tuple[str, List[Tuple[str, str, str]], str]]:
+    """(tabla, columnas, comentario) de cada tabla que escribe este pipeline."""
+    out = [(TABLA_DESTINO, columnas_destino(cfg),
+            f"Recomendaciones por {', '.join(cfg.claves_entidad())}. Se reemplaza completa en cada ejecución.")]
+    if GUARDAR_DIAGNOSTICO:
+        out.append((TABLA_DIAGNOSTICO, COLUMNAS_DIAGNOSTICO,
+                    "Backtest: qué algoritmo acertó más en cada segmento. Se reemplaza completa."))
+    if GUARDAR_EVIDENCIA:
+        out.append((TABLA_EVIDENCIA, columnas_evidencia(cfg),
+                    f"Evidencia de cada recomendación de {TABLA_DESTINO}: con qué pares, grupos, ítems o "
+                    f"reglas se la comparó y cómo se calculó el USD en juego. Se une por entidad e ítem. "
+                    f"Se reemplaza completa."))
+    return out
+
+
 def _ddl(tabla: str, cols: List[Tuple[str, str, str]], comentario: str) -> str:
     largos = [c for c, _, _ in cols if len(c) > 30]
     ancho = max(len(c) for c, _, _ in cols)
@@ -391,22 +438,14 @@ def _ddl(tabla: str, cols: List[Tuple[str, str, str]], comentario: str) -> str:
 
 
 def ddl_sugerido(cfg: RecConfig) -> str:
-    """CREATE TABLE de las dos tablas, sin constraints y con la descripción de cada columna."""
-    texto = _ddl(TABLA_DESTINO, columnas_destino(cfg),
-                 f"Recomendaciones por {', '.join(cfg.claves_entidad())}. Se reemplaza completa en cada ejecución.")
-    if GUARDAR_DIAGNOSTICO:
-        texto += "\n" + _ddl(TABLA_DIAGNOSTICO, COLUMNAS_DIAGNOSTICO,
-                             "Backtest: qué algoritmo acertó más en cada segmento. Se reemplaza completa.")
-    return texto
+    """CREATE TABLE de las tablas, sin constraints y con la descripción de cada columna."""
+    return "\n".join(_ddl(tabla, cols, comentario) for tabla, cols, comentario in _tablas(cfg))
 
 
 def validar_tabla(conn, cfg: RecConfig) -> None:
     """Corta antes de leer nada si falta alguna columna, e imprime el ALTER exacto."""
     _exigir(conn, "destino", "validar_tabla()")
-    objetivo = [(TABLA_DESTINO, columnas_destino(cfg))]
-    if GUARDAR_DIAGNOSTICO:
-        objetivo.append((TABLA_DIAGNOSTICO, COLUMNAS_DIAGNOSTICO))
-    for tabla, cols in objetivo:
+    for tabla, cols, comentario in _tablas(cfg):
         owner, _, nombre = tabla.rpartition(".")
         sql = "SELECT OWNER, COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = :t"
         params = {"t": nombre.upper()}
@@ -416,7 +455,7 @@ def validar_tabla(conn, cfg: RecConfig) -> None:
         enc = _fetch_df(conn, sql, params)
         if enc.empty:
             raise RuntimeError(f"El usuario de destino ({ORA_DEST_USER}) no ve la tabla {tabla}.\n"
-                               f"Si hay que crearla:\n\n{ddl_sugerido(cfg)}")
+                               f"Si hay que crearla:\n\n{_ddl(tabla, cols, comentario)}")
         duenos = sorted(set(enc["OWNER"]))
         if len(duenos) > 1:
             propio = [d for d in duenos if d.upper() == ORA_DEST_USER.upper()]
@@ -574,8 +613,16 @@ def preparar_diagnostico(diag: pd.DataFrame, cfg: RecConfig) -> pd.DataFrame:
     })
 
 
-def guardar(conn, df: pd.DataFrame, cfg: RecConfig, diagnostico: Optional[pd.DataFrame] = None) -> int:
-    """Reemplaza las dos tablas en una sola transacción."""
+def preparar_evidencia(evidencia: Optional[pd.DataFrame], cfg: RecConfig) -> pd.DataFrame:
+    """La evidencia del motor, con la huella de la configuración."""
+    if evidencia is None or evidencia.empty:
+        return pd.DataFrame(columns=[c for c, _, _ in columnas_evidencia(cfg) if c != "FECHA_CARGA"])
+    return anotar(evidencia, cfg)
+
+
+def guardar(conn, df: pd.DataFrame, cfg: RecConfig, diagnostico: Optional[pd.DataFrame] = None,
+            evidencia: Optional[pd.DataFrame] = None) -> int:
+    """Reemplaza las tablas en una sola transacción: si algo falla, quedan como estaban."""
     _exigir(conn, "destino", f"guardar() en {TABLA_DESTINO}")
     if df.empty:
         log.warning("no hay nada para guardar")
@@ -585,6 +632,11 @@ def guardar(conn, df: pd.DataFrame, cfg: RecConfig, diagnostico: Optional[pd.Dat
         n = _escribir(conn, TABLA_DESTINO, df, columnas_destino(cfg))
         if GUARDAR_DIAGNOSTICO and diagnostico is not None and len(diagnostico):
             _escribir(conn, TABLA_DIAGNOSTICO, diagnostico, COLUMNAS_DIAGNOSTICO)
+        if GUARDAR_EVIDENCIA and evidencia is not None:
+            # se escribe aunque venga vacía: la evidencia vieja no puede quedar colgada
+            # de recomendaciones que ya no existen
+            n_ev = _escribir(conn, TABLA_EVIDENCIA, evidencia, columnas_evidencia(cfg))
+            log.info("insertadas %s filas en %s", f"{n_ev:,}", TABLA_EVIDENCIA)
         conn.commit()
     except Exception:
         conn.rollback()
