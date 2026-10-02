@@ -151,7 +151,7 @@ class RecConfig:
 
     # -- batería ------------------------------------------------------------ #
     algoritmos: Sequence[str] = ("popularidad", "coseno_item", "coseno_entidad",
-                                 "svd", "kmeans_valor", "reglas")
+                                 "svd", "kmeans_valor", "reglas", "ease", "secuencia", "tendencia")
     #: backtest = mide y elige el mejor por segmento; rrf = fusiona todos;
     #: ponderado = usa `pesos`; o el nombre de un algoritmo para forzarlo.
     seleccion: str = "backtest"
@@ -172,6 +172,25 @@ class RecConfig:
     #: Un cliente que compró en enero, en marzo y en diciembre no está "atrasado".
     max_cv_intervalo: Optional[float] = 1.0
     brecha_ratio: float = 0.5          #: compra menos de esta fracción de lo que compran sus pares
+    #: con quién se compara una BRECHA: los N compradores del ítem en el segmento de tamaño
+    #: más parecido. Se listan TODOS en la evidencia, así que el número se puede recalcular.
+    pares_comparables: int = 30
+    #: con menos pares comparables que esto no hay con qué comparar y no se recomienda.
+    min_pares_comparables: int = 5
+    #: cómo se resume lo que le dedican esos pares: "mediana" (la mitad le dedica más, la mitad
+    #: menos; no la mueven los extremos), "agregado" (USD del ítem / USD total de todos ellos)
+    #: o "media" (promedio simple de los porcentajes: la inflan los clientes chicos).
+    estadistico_pares: str = "mediana"
+
+    # -- algoritmos nuevos ----------------------------------------------------- #
+    #: regularización de EASE, relativa al soporte medio de los ítems. Más alta = más
+    #: parecido a la popularidad; más baja = más personal y más ruidoso.
+    lambda_ease: float = 0.5
+    #: EASE invierte una matriz ítem x ítem: con más ítems activos que esto se queda con los
+    #: de más soporte (el resto no participa del modelo).
+    max_items_ease: int = 4000
+    #: "tendencia": qué tan reciente tiene que ser la primera compra para contar como adopción.
+    dias_tendencia: int = 90
 
     # -- topes del USD potencial --------------------------------------------- #
     escalar_potencial: bool = True     #: ajusta el USD potencial por tamaño de la entidad
@@ -223,6 +242,17 @@ class RecConfig:
     #: cuando no llega a esta fracción de lo que pasó por ella.
     tolerancia_cero: float = 1e-9
 
+    # -- tablas para comprobar --------------------------------------------------- #
+    #: valores de cada ítem en cada segmento (soporte, ticket, ritmo, participación...).
+    guardar_referencia: bool = True
+    #: la matriz de compras entidad x ítem de la ventana: con ella cualquier número del
+    #: segmento se recalcula en SQL. Es la tabla más grande (una fila por par comprado).
+    guardar_matriz: bool = True
+    #: la curva de recuperación con sus conteos (de dónde sale la probabilidad de recompra).
+    guardar_curva: bool = True
+    #: los vecinos de cada entidad (coseno_entidad) y su grupo (kmeans_valor).
+    guardar_vecindario: bool = True
+
     # -- evidencia ------------------------------------------------------------ #
     #: arma, para cada recomendación, con quién se la comparó: los pares, el grupo, los
     #: ítems y las reglas que la sostienen, y el cálculo del USD en juego. No cambia nada
@@ -230,7 +260,7 @@ class RecConfig:
     guardar_evidencia: bool = True
     #: pares (o ítems) que se listan por recomendación y por clase de evidencia. Los
     #: totales (cuántos hay, cuántos compran) van siempre completos.
-    max_evidencias: int = 5
+    max_evidencias: int = 3
     #: evidencia sólo para las recomendaciones con ranking hasta este. 0 = todas.
     evidencia_hasta_ranking: int = 0
 
@@ -273,6 +303,14 @@ class RecConfig:
             cols.append(self.col_documento)
         return cols
 
+    def cfg_dias_tendencia_invalido(self) -> bool:
+        """Sólo importa si se usa "tendencia": tiene que quedar historia antes del tramo reciente."""
+        if "tendencia" not in self.algoritmos:
+            return False
+        if self.dias_tendencia < 1:
+            return True
+        return bool(self.dias_afinidad) and self.dias_tendencia >= self.dias_afinidad
+
     def validate(self) -> None:
         if not list(self.entidad):
             raise ValueError("entidad no puede estar vacía: es a quién se le recomienda")
@@ -296,6 +334,16 @@ class RecConfig:
             raise ValueError("max_decimales debe estar entre 0 y 15")
         if not 0 <= self.tolerancia_cero < 1:
             raise ValueError("tolerancia_cero debe estar entre 0 y 1 (0 = sin limpieza)")
+        if self.estadistico_pares not in ("mediana", "agregado", "media"):
+            raise ValueError("estadistico_pares debe ser mediana, agregado o media")
+        if self.pares_comparables < 1 or self.min_pares_comparables < 1:
+            raise ValueError("pares_comparables y min_pares_comparables deben ser >= 1")
+        if self.min_pares_comparables > self.pares_comparables:
+            raise ValueError("min_pares_comparables no puede superar a pares_comparables")
+        if self.lambda_ease <= 0:
+            raise ValueError("lambda_ease debe ser > 0")
+        if self.cfg_dias_tendencia_invalido():
+            raise ValueError("dias_tendencia debe ser >= 1 y menor que dias_afinidad")
         if self.max_evidencias < 1:
             raise ValueError("max_evidencias debe ser >= 1 (para no guardar evidencia: guardar_evidencia=False)")
         if self.evidencia_hasta_ranking < 0:
@@ -427,23 +475,29 @@ class Matriz:
         rejilla = np.array(self.REJILLA_ATRASO, dtype=float)
         por_item = np.full((self.n_item, len(rejilla)), np.nan)
         global_ = np.full(len(rejilla), np.nan)
+        # los conteos quedan guardados: son la evidencia de cada probabilidad de recompra
+        casos = np.zeros((self.n_item, len(rejilla)))
+        volvieron = np.zeros((self.n_item, len(rejilla)))
         for k, a in enumerate(rejilla):
-            umbral_h = a * iv_h
-            umbral_c = a * iv_c
+            # justo en el umbral cuenta (con una tolerancia que absorbe el redondeo de a x intervalo)
+            umbral_h = a * iv_h - 1e-9
+            umbral_c = a * iv_c - 1e-9
             en_riesgo_h = gap >= umbral_h
             # un silencio abierto sólo cuenta como "no volvió" si ya observamos el horizonte
             # completo después de haberse atrasado; si no, todavía no sabemos y se excluye
             en_riesgo_c = sil >= umbral_c + horizonte
-            volvio = en_riesgo_h & (gap <= umbral_h + horizonte)
+            volvio = en_riesgo_h & (gap <= umbral_h + horizonte + 2e-9)
             riesgo_item = (np.bincount(it_h[en_riesgo_h], minlength=self.n_item)
                            + np.bincount(it_c[en_riesgo_c], minlength=self.n_item)).astype(float)
             volvio_item = np.bincount(it_h[volvio], minlength=self.n_item).astype(float)
+            casos[:, k], volvieron[:, k] = riesgo_item, volvio_item
             suficiente = riesgo_item >= min_casos
             por_item[suficiente, k] = volvio_item[suficiente] / riesgo_item[suficiente]
             riesgo_total = float(en_riesgo_h.sum() + en_riesgo_c.sum())
             if riesgo_total >= min_casos:
                 global_[k] = float(volvio.sum()) / riesgo_total
         self._curva_cache = (clave, (rejilla, por_item, global_))
+        self.curva_conteos = (casos, volvieron)
         return self._curva_cache[1]
 
     def __repr__(self) -> str:
@@ -524,13 +578,15 @@ class Panel:
         dias_ent = por_dia.drop_duplicates(["e", "d"]).groupby("e").size()
         m.dias_entidad = dias_ent.reindex(range(self.n_ent), fill_value=0).to_numpy(float)
         ok_h = con_hueco["intervalo_medio"].notna().to_numpy()
+        # float64: en float32 un silencio de justo 1,5 veces el intervalo quedaba de un lado o
+        # del otro según el redondeo, y los conteos de la curva no se podían rehacer
         m.huecos = (con_hueco["i"].to_numpy(np.int32)[ok_h],
-                    con_hueco["hueco"].to_numpy(np.float32)[ok_h],
-                    con_hueco["intervalo_medio"].to_numpy(np.float32)[ok_h])
+                    con_hueco["hueco"].to_numpy(np.float64)[ok_h],
+                    con_hueco["intervalo_medio"].to_numpy(np.float64)[ok_h])
         ok_c = censura["intervalo_medio"].notna().to_numpy()
         m.censuras = (censura["i"].to_numpy(np.int32)[ok_c],
-                      censura["silencio"].to_numpy(np.float32)[ok_c],
-                      censura["intervalo_medio"].to_numpy(np.float32)[ok_c])
+                      censura["silencio"].to_numpy(np.float64)[ok_c],
+                      censura["intervalo_medio"].to_numpy(np.float64)[ok_c])
         return m
 
     def pares(self, desde: int, hasta: int) -> sp.csr_matrix:
@@ -693,6 +749,7 @@ class Bloque:
         self.n_item = matriz.n_item
         self._pares: Optional[pd.DataFrame] = None            # caché de los pares del bloque
         self.dias_ventana = float(cfg.dias_afinidad or 365)   # el motor la ajusta a la real
+        self.d_ayer = d_ayer                                  # último día de la ventana (época)
         self.p_adopcion = 1.0                                 # el backtest la ajusta
         self.origen_prob = ""                                 # de dónde salió, para la evidencia
 
@@ -745,6 +802,9 @@ class Bloque:
         # quien tiene poca historia propia
         self.iv_item = np.full(self.n_item, np.nan)
         self.cv_item = np.full(self.n_item, np.nan)
+        self.n_ritmo_item = np.zeros(self.n_item)       # compradores con ritmo: de quiénes sale iv_item
+        self.dias_item = np.zeros(self.n_item)          # días de compra sumados: el divisor del ticket
+        self.usd_item = np.zeros(self.n_item)
         self.ticket_item = np.zeros(self.n_item)
         pares = matriz.tab
         propios = np.isin(pares["e"].to_numpy(np.int64), filas)
@@ -755,6 +815,7 @@ class Bloque:
             usd_sub = sub["usd"].to_numpy(float)
             total_dias = np.bincount(i_sub, weights=dias_sub, minlength=self.n_item)
             total_usd = np.bincount(i_sub, weights=usd_sub, minlength=self.n_item)
+            self.dias_item, self.usd_item = total_dias, total_usd
             self.ticket_item = np.where(total_dias > 0, total_usd / np.maximum(total_dias, 1.0), 0.0)
             iv = pd.to_numeric(sub["intervalo_medio"], errors="coerce").to_numpy(float)
             de = pd.to_numeric(sub["intervalo_desvio"], errors="coerce").to_numpy(float)
@@ -762,9 +823,10 @@ class Bloque:
             if con_ritmo.any():
                 tabla = pd.DataFrame({"i": i_sub[con_ritmo], "iv": iv[con_ritmo],
                                       "cv": np.where(iv[con_ritmo] > 0, de[con_ritmo] / iv[con_ritmo], np.nan)})
-                agr = tabla.groupby("i").agg(iv=("iv", "median"), cv=("cv", "median"))
+                agr = tabla.groupby("i").agg(iv=("iv", "median"), cv=("cv", "median"), n=("iv", "size"))
                 self.iv_item[agr.index.to_numpy()] = agr["iv"].to_numpy()
                 self.cv_item[agr.index.to_numpy()] = agr["cv"].to_numpy()
+                self.n_ritmo_item[agr.index.to_numpy()] = agr["n"].to_numpy()
 
         self.venta_entidad = _sumar(self.V, 1, esc, tol)
         self.dias_entidad = matriz.dias_entidad[filas]
@@ -977,6 +1039,19 @@ class Svd(Algoritmo):
             return np.repeat(self.b.penetracion[self.cand][None, :], len(filas), axis=0)
         return self.U[filas] @ self.Vt
 
+    def explicar(self, filas: np.ndarray, items: np.ndarray) -> np.ndarray:
+        """El puntaje es la suma, sobre lo que ya compra, del aporte latente de cada ítem
+        (U = R·Vt): se nombra el que más empuja, como en los demás modelos ítem a ítem."""
+        if self.U is None:
+            return super().explicar(filas, items)
+        V = self.V
+
+        class Aporte:
+            def __getitem__(self, clave):
+                j, i = clave
+                return np.einsum("kn,kn->n", V[:, np.asarray(j)], V[:, np.asarray(i)])
+        return _explicar_por_afinidad(self, Aporte(), filas, items, "patrón de consumo (SVD) con lo que ya compra:")
+
 
 class KmeansValor(Algoritmo):
     nombre = "kmeans_valor"
@@ -1064,8 +1139,163 @@ class Reglas(Algoritmo):
         return _explicar_por_afinidad(self, self.C, filas, items, "regla: como compra")
 
 
+class _Indexada:
+    """Una matriz densa sobre un subconjunto de ítems que se lee con índices de TODOS los
+    ítems, como una dispersa: lo que no está en el subconjunto vale 0."""
+
+    def __init__(self, M: np.ndarray, posicion: np.ndarray):
+        self.M, self.posicion = M, posicion
+
+    def __getitem__(self, clave):
+        j, i = clave
+        pj, pi = self.posicion[np.asarray(j)], self.posicion[np.asarray(i)]
+        out = np.zeros(np.broadcast(pj, pi).shape)
+        ok = (pj >= 0) & (pi >= 0)
+        out[ok] = self.M[pj[ok], pi[ok]]
+        return out
+
+
+class Ease(Algoritmo):
+    nombre = "ease"
+    descripcion = ("EASE (Steck, 2019): modelo lineal ítem a ítem resuelto de forma cerrada. Aprende cuánto "
+                   "empuja cada ítem que ya compra hacia cada candidato, descontando lo que ya explican los "
+                   "demás. Suele igualar o superar a modelos mucho más complejos, y el puntaje es la suma "
+                   "exacta de los aportes de cada ítem propio.")
+
+    def ajustar(self, b: Bloque) -> None:
+        super().ajustar(b)
+        X = (b.A > 0).astype(np.float64).tocsc()
+        soporte = np.asarray(X.sum(0)).ravel()
+        activos = np.flatnonzero(soporte > 0)
+        if len(activos) > self.cfg.max_items_ease:
+            activos = np.sort(activos[np.argsort(-soporte[activos], kind="stable")[:self.cfg.max_items_ease]])
+        self.posicion = -np.ones(b.n_item, dtype=np.int64)
+        self.posicion[activos] = np.arange(len(activos))
+        self.activos = activos
+        if len(activos) < 2:
+            self.B = np.zeros((len(activos), len(activos)))
+        else:
+            G = (X[:, activos].T @ X[:, activos]).toarray()
+            lam = float(self.cfg.lambda_ease) * float(np.mean(np.diag(G)))
+            G[np.diag_indices_from(G)] += lam
+            P = np.linalg.inv(G)
+            self.B = P / (-np.diag(P))[None, :]
+            np.fill_diagonal(self.B, 0.0)
+        col = self.posicion[self.cand]
+        self.Bc = np.zeros((len(activos), len(self.cand)))
+        ok = col >= 0
+        self.Bc[:, ok] = self.B[:, col[ok]]
+        self.pesos = _Indexada(self.B, self.posicion)
+
+    def puntuar(self, filas: np.ndarray) -> np.ndarray:
+        Rf = (self.b.R[filas] > 0).astype(np.float64).tocsc()[:, self.activos].tocsr()
+        return np.asarray(Rf @ self.Bc)
+
+    def explicar(self, filas: np.ndarray, items: np.ndarray) -> np.ndarray:
+        return _explicar_por_afinidad(self, self.pesos, filas, items, "por lo que ya compra (EASE):")
+
+
+class Secuencia(Algoritmo):
+    nombre = "secuencia"
+    descripcion = ("Reglas de secuencia: de las entidades que compraron A, qué fracción compró B DESPUÉS (las "
+                   "que ya tenían B antes no cuentan). Recomienda lo que suele venir a continuación de lo que ya "
+                   "compra, exigiendo lift mayor a 1. Cada regla se comprueba con las fechas de primera compra.")
+
+    def ajustar(self, b: Bloque) -> None:
+        super().ajustar(b)
+        R = (b.R > 0).astype(np.float64).tocsr()
+        Pr = b.P.tocsr()
+        Pr.sort_indices()
+        R.sort_indices()
+        n_item = b.n_item
+        soporte = np.asarray(R.sum(0)).ravel()
+        # cuántas entidades compraron a ANTES que c (primera compra de cada uno en la ventana)
+        antes = sp.csr_matrix((n_item, n_item))
+        filas_a, filas_c, acumulados = [], [], 0
+
+        def volcar():
+            nonlocal antes, filas_a, filas_c, acumulados
+            if filas_a:
+                a, c = np.concatenate(filas_a), np.concatenate(filas_c)
+                antes = antes + sp.csr_matrix((np.ones(len(a)), (a, c)), shape=(n_item, n_item))
+            filas_a, filas_c, acumulados = [], [], 0
+
+        for r in range(b.n):                      # por entidad: sus ítems ordenados por fecha
+            a, z = Pr.indptr[r], Pr.indptr[r + 1]
+            if z - a < 2:
+                continue
+            it, dia = Pr.indices[a:z], Pr.data[a:z]
+            ii, cc = np.meshgrid(np.arange(z - a), np.arange(z - a), indexing="ij")
+            m = dia[ii] < dia[cc]
+            filas_a.append(it[ii[m]])
+            filas_c.append(it[cc[m]])
+            acumulados += int(m.sum())
+            if acumulados > 5_000_000:            # memoria acotada
+                volcar()
+        volcar()
+        antes = antes.tocsr()
+        antes.sum_duplicates()
+        antes.sort_indices()
+        filas = np.repeat(np.arange(n_item), np.diff(antes.indptr))
+        ambos = np.asarray((R.T @ R).tocsr()[filas, antes.indices]).ravel()
+        # elegibles: compraron a y NO tenían c de antes (o del mismo día)
+        elegibles = soporte[filas] - (ambos - antes.data)
+        conf = np.where(elegibles > 0, antes.data / np.maximum(elegibles, 1.0), 0.0)
+        pen = soporte / max(b.n, 1)
+        lift = conf / np.where(pen[antes.indices] > 0, pen[antes.indices], 1.0)
+        sirve = (lift > 1.0) & (antes.data >= max(int(self.cfg.min_soporte), 1))
+        # copias: eliminate_zeros compacta los índices EN EL LUGAR y si se comparten con
+        # `antes` la deja desalineada
+        self.C = sp.csr_matrix((np.where(sirve, conf, 0.0), antes.indices.copy(), antes.indptr.copy()),
+                               shape=antes.shape)
+        self.C.eliminate_zeros()
+        self.antes = antes
+        self.elegibles = sp.csr_matrix((elegibles, antes.indices.copy(), antes.indptr.copy()), shape=antes.shape)
+        self.Cc = self.C[:, self.cand].tocsr()
+
+    def limite_filas(self) -> int:
+        return Reglas.limite_filas(self)
+
+    def puntuar(self, filas: np.ndarray) -> np.ndarray:
+        return Reglas.puntuar(self, filas)
+
+    def explicar(self, filas: np.ndarray, items: np.ndarray) -> np.ndarray:
+        return _explicar_por_afinidad(self, self.C, filas, items, "secuencia: después de comprar")
+
+
+class Tendencia(Algoritmo):
+    nombre = "tendencia"
+    descripcion = ("Adopción reciente en el segmento: de las entidades que no compraban el ítem, qué fracción "
+                   "empezó a comprarlo en los últimos dias_tendencia días. Recomienda lo que el segmento está "
+                   "empezando a comprar. No personaliza: es la popularidad de lo nuevo.")
+
+    def ajustar(self, b: Bloque) -> None:
+        super().ajustar(b)
+        self.corte = (float(b.d_ayer) - float(self.cfg.dias_tendencia)) if b.d_ayer is not None else np.inf
+        P = b.P.tocsc()
+        columna = np.repeat(np.arange(b.n_item), np.diff(P.indptr))
+        # primera compra dentro del tramo reciente = no lo había comprado antes en la ventana
+        nuevos = np.bincount(columna[P.data > self.corte], minlength=b.n_item).astype(float)
+        previos = b.soporte - nuevos
+        self.nuevos = nuevos
+        self.elegibles = np.maximum(float(b.n) - previos, 0.0)
+        self.tasa = np.where(self.elegibles > 0, nuevos / np.maximum(self.elegibles, 1.0), 0.0)
+
+    def puntuar(self, filas: np.ndarray) -> np.ndarray:
+        return np.repeat(self.tasa[self.cand][None, :], len(filas), axis=0)
+
+    def explicar(self, filas: np.ndarray, items: np.ndarray) -> np.ndarray:
+        d = int(self.cfg.dias_tendencia)
+        antes = max(int(round(self.b.dias_ventana - d)), 0)
+        return np.array([f"de las {e:.0f} entidades del segmento que no lo compraron en los {antes} días anteriores, "
+                         f"{nv:.0f} empezaron a comprarlo en los últimos {d} ({t:.0%})"
+                         for e, nv, t in zip(self.elegibles[items], self.nuevos[items], self.tasa[items])],
+                        dtype=object)
+
+
 ALGORITMOS: Dict[str, type] = {a.nombre: a for a in
-                               (Popularidad, CosenoItem, CosenoEntidad, Svd, KmeansValor, Reglas)}
+                               (Popularidad, CosenoItem, CosenoEntidad, Svd, KmeansValor, Reglas,
+                                Ease, Secuencia, Tendencia)}
 
 
 # =========================================================================== #
@@ -1111,11 +1341,46 @@ class Fusion(Algoritmo):
                 total += peso * P / np.where(maximo > 0, maximo, 1.0)
         return total
 
+    def _aportes(self, filas: np.ndarray, items: np.ndarray) -> np.ndarray:
+        """Lo que aporta cada algoritmo al puntaje fusionado de cada (fila, ítem)."""
+        posicion = -np.ones(self.b.n_item, dtype=np.int64)
+        posicion[self.cand] = np.arange(len(self.cand))
+        col = posicion[items]
+        aportes = np.zeros((len(filas), len(self.algos)))
+        unicas, donde = np.unique(filas, return_inverse=True)
+        paso = max(1, min(self.cfg.filas_bloque, self.limite_filas()))
+        for ini in range(0, len(unicas), paso):
+            f = unicas[ini:ini + paso]
+            sel = (donde >= ini) & (donde < ini + paso) & (col >= 0)
+            r = donde[sel] - ini
+            for k, a in enumerate(self.algos):
+                peso = float(self.cfg.pesos.get(a.nombre, 1.0))
+                P = a.puntuar(f)
+                if self.modo == "rrf":
+                    posicion_p = np.argsort(np.argsort(-P, axis=1), axis=1)
+                    C = peso / (60.0 + posicion_p + 1.0)
+                else:
+                    maximo = P.max(axis=1, keepdims=True)
+                    C = peso * P / np.where(maximo > 0, maximo, 1.0)
+                aportes[sel, k] = C[r, col[sel]]
+        return aportes
+
     def explicar(self, filas: np.ndarray, items: np.ndarray) -> np.ndarray:
-        for a in self.algos:
-            if isinstance(a, (CosenoItem, Reglas)):
-                return a.explicar(filas, items)
-        return self.algos[0].explicar(filas, items)
+        """Dice qué algoritmo de la batería aportó más a esta recomendación, y su motivo.
+        Antes daba siempre el de coseno_item, aunque no fuera el que la puso arriba."""
+        aportes = self._aportes(filas, items)
+        mejor = np.argmax(aportes, axis=1)
+        salida = np.empty(len(filas), dtype=object)
+        total = aportes.sum(axis=1)
+        for k, a in enumerate(self.algos):
+            sel = np.flatnonzero(mejor == k)
+            if not len(sel):
+                continue
+            textos = a.explicar(filas[sel], items[sel])
+            frac = aportes[sel, k] / np.where(total[sel] > 0, total[sel], 1.0)
+            salida[sel] = [f"fusión {self.modo}; aporta más {a.nombre} ({p:.0%}): {t}"
+                           for p, t in zip(frac, textos)]
+        return salida
 
 
 def _pares_bloque(b: Bloque, matriz: Matriz) -> pd.DataFrame:
@@ -1284,24 +1549,91 @@ def recomendar_reposicion(b: Bloque, matriz: Matriz, cfg: RecConfig, d_ayer: int
         "intervalo_tipico": np.where(np.isfinite(iv_propio[ok]), iv_propio[ok], np.nan),
         "intervalo_esperado": iv,
         "compras_esperadas": esperadas,
-        "motivo": [_motivo_reposicion(c, ip, iv_, s, pr)
-                   for c, ip, iv_, s, pr in zip(compras, iv_propio[ok], iv, sil, prob)]})
+        "motivo": [_motivo_reposicion(c, ip, iv_, ivp, npar, s, pr)
+                   for c, ip, iv_, ivp, npar, s, pr in zip(compras, iv_propio[ok], iv, b.iv_item[item[ok]],
+                                                           b.n_ritmo_item[item[ok]], sil, prob)]})
 
 
-def _motivo_reposicion(compras, iv_propio, iv_est, silencio, prob) -> str:
-    """El texto dice con qué evidencia se armó: la propia, la de los pares, o las dos."""
+def _motivo_reposicion(compras, iv_propio, iv_est, iv_pares, n_pares, silencio, prob) -> str:
+    """El texto dice con qué evidencia se armó: la propia, la de los pares, o las dos, y
+    nombra cada número por lo que es (el propio, el del segmento, o la mezcla)."""
+    pares = (f"en su segmento lo compran cada {iv_pares:.0f} días (mediana de {n_pares:.0f} compradores)"
+             if np.isfinite(iv_pares) else "en su segmento nadie lo compra con ritmo medible")
     if np.isfinite(iv_propio) and compras >= 3:
         base = f"compró {compras:.0f} veces, cada {iv_propio:.0f} días en promedio"
     elif np.isfinite(iv_propio):
-        base = (f"compró {compras:.0f} veces (cada {iv_propio:.0f} días); sus pares lo compran "
-                f"cada {iv_est:.0f}")
+        base = (f"compró {compras:.0f} veces (cada {iv_propio:.0f} días); {pares}: se estima cada "
+                f"{iv_est:.0f}")
     else:
-        base = f"compró {compras:.0f} vez; sus pares lo compran cada {iv_est:.0f} días"
+        base = f"compró {compras:.0f} vez; {pares}"
     return f"{base}, lleva {silencio:.0f} sin comprar (probabilidad de recompra {prob:.0%})"
 
 
+_NOMBRE_ESTADISTICO = {"mediana": "mediana", "agregado": "en conjunto", "media": "promedio simple"}
+
+
+def _candidatos_brecha(b: Bloque, matriz: Matriz, cfg: RecConfig) -> Dict[int, np.ndarray]:
+    """Por ítem, las entidades del bloque que lo compran y tienen compra suficiente para
+    repartir participaciones: entre ellas se buscan los pares comparables."""
+    if getattr(b, "_cand_brecha", None) is None:
+        p = _pares_bloque(b, matriz)
+        valido = b.venta_entidad > 0
+        if cfg.min_base_porcentaje > 0:
+            valido &= b.venta_entidad >= cfg.min_base_porcentaje
+        sub = p[valido[p["f"].to_numpy(np.int64)]]
+        b._cand_brecha = {int(k): g.to_numpy(np.int64) for k, g in sub.groupby("i")["f"]}
+    return b._cand_brecha
+
+
+def pares_comparables(b: Bloque, matriz: Matriz, cfg: RecConfig, f: np.ndarray, i: np.ndarray
+                      ) -> Tuple[np.ndarray, np.ndarray]:
+    """Los `pares_comparables` compradores del ítem, en el segmento, de tamaño más parecido
+    a cada entidad (sin ella misma). Es UNA sola regla: la usa la BRECHA para comparar y la
+    evidencia para listarlos, así que los listados son exactamente los comparados."""
+    cand = _candidatos_brecha(b, matriz, cfg)
+    pos, par, _ = _cercanos(i, f, lambda k: cand.get(int(k), ()), _tamano_log(b),
+                            int(cfg.pares_comparables))
+    return pos, par
+
+
+def _resumen_pares(b: Bloque, cfg: RecConfig, pos: np.ndarray, par: np.ndarray, items: np.ndarray,
+                   n_filas: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Lo que le dedican al ítem los pares comparables de cada fila: (referencia, cuántos,
+    cuartil 1, cuartil 3), según `estadistico_pares`."""
+    ref = np.full(n_filas, np.nan)
+    q1 = np.full(n_filas, np.nan)
+    q3 = np.full(n_filas, np.nan)
+    cuantos = np.bincount(pos, minlength=n_filas).astype(float)
+    if not len(pos):
+        return ref, cuantos, q1, q3
+    it = items[pos]
+    usd = np.asarray(b.V[par, it]).ravel()
+    total = b.venta_entidad[par]
+    share = usd / np.where(total > 0, total, 1.0)
+    t = pd.DataFrame({"pos": pos, "share": share, "usd": usd, "total": total})
+    g = t.groupby("pos")
+    idx = g.size().index.to_numpy()
+    if cfg.estadistico_pares == "mediana":
+        ref[idx] = g["share"].median().to_numpy()
+    elif cfg.estadistico_pares == "agregado":
+        s = g[["usd", "total"]].sum()
+        ref[idx] = (s["usd"] / s["total"].where(s["total"] > 0)).to_numpy()
+    else:
+        ref[idx] = g["share"].mean().to_numpy()
+    q1[idx] = g["share"].quantile(0.25).to_numpy()
+    q3[idx] = g["share"].quantile(0.75).to_numpy()
+    return ref, cuantos, q1, q3
+
+
 def recomendar_brecha(b: Bloque, matriz: Matriz, cfg: RecConfig) -> pd.DataFrame:
-    """Lo que compra, pero mucho menos de lo que le dedican sus pares."""
+    """Lo que compra, pero mucho menos de lo que le dedican sus pares comparables.
+
+    Los pares son los `pares_comparables` compradores del ítem en el segmento de tamaño más
+    parecido, y lo que le dedican se resume con `estadistico_pares` (la mediana, por
+    defecto). Antes se comparaba contra el promedio simple de TODOS los compradores del
+    segmento: no se sabía contra quiénes, y los clientes chicos (a los que un ítem les pesa
+    mucho) lo inflaban.
+    """
     columnas = ["f", "i", "puntaje", "usd_potencial", "usd_si_compra", "prob", "motivo"]
     p = _pares_bloque(b, matriz)
     if p.empty:
@@ -1310,21 +1642,35 @@ def recomendar_brecha(b: Bloque, matriz: Matriz, cfg: RecConfig) -> pd.DataFrame
     i = p["i"].to_numpy(np.int64)
     venta_ent = b.venta_entidad[f]
     share = np.where(venta_ent > 0, p["usd"].to_numpy(float) / np.where(venta_ent > 0, venta_ent, 1.0), 0.0)
-    medio = b.share_medio_comprador[i]
-    ok = b.candidato[i] & (venta_ent > 0) & (medio > 0) & (share < cfg.brecha_ratio * medio)
+    posible = np.flatnonzero(b.candidato[i] & (venta_ent > 0))
+    if not len(posible):
+        return pd.DataFrame(columns=columnas)
+    ref = np.full(len(f), np.nan)
+    cuantos = np.zeros(len(f))
+    q1 = np.full(len(f), np.nan)
+    q3 = np.full(len(f), np.nan)
+    for ini in range(0, len(posible), 50_000):           # por tramos: memoria acotada
+        sel = posible[ini:ini + 50_000]
+        pos, par = pares_comparables(b, matriz, cfg, f[sel], i[sel])
+        r, c, a, z = _resumen_pares(b, cfg, pos, par, i[sel], len(sel))
+        ref[sel], cuantos[sel], q1[sel], q3[sel] = r, c, a, z
+    ok = ((cuantos >= cfg.min_pares_comparables) & np.isfinite(ref) & (ref > 0)
+          & (share < cfg.brecha_ratio * np.nan_to_num(ref)))
     if not ok.any():
         return pd.DataFrame(columns=columnas)
-    sh, me, ve = share[ok], medio[ok], venta_ent[ok]
+    sh, me, ve = share[ok], ref[ok], venta_ent[ok]
     horizonte = float(cfg.horizonte_dias) if cfg.horizonte_dias else b.dias_ventana
     falta = (me - sh) * ve * horizonte / max(b.dias_ventana, 1.0)
+    nombre = _NOMBRE_ESTADISTICO[cfg.estadistico_pares]
     return pd.DataFrame({
         "f": f[ok], "i": i[ok],
         "puntaje": 1.0 - sh / me,
         "usd_potencial": falta,
         "usd_si_compra": falta,
         "prob": np.ones(len(falta)),
-        "motivo": [f"sus pares le dedican {m:.1%} de su compra y esta entidad {s:.1%}"
-                   for m, s in zip(me, sh)]})
+        "pares_ref": cuantos[ok], "ref_valor": me, "ref_q1": q1[ok], "ref_q3": q3[ok],
+        "motivo": [f"sus {n:.0f} pares de tamaño parecido que lo compran le dedican {_pct1(m)} de su compra "
+                   f"({nombre}) y esta entidad {_pct1(s)}" for n, m, s in zip(cuantos[ok], me, sh)]})
 
 
 def armar_recomendaciones(b: Bloque, matriz: Matriz, alg: Algoritmo, cfg: RecConfig,
@@ -1429,7 +1775,8 @@ def armar_recomendaciones(b: Bloque, matriz: Matriz, alg: Algoritmo, cfg: RecCon
 # =========================================================================== #
 #: clases de evidencia, en el orden en que se listan
 EVIDENCIAS = ("CALCULO", "COMPRADOR_SEGMENTO", "VECINO", "MIEMBRO_GRUPO", "ITEM_AFIN", "REGLA",
-              "FACTOR_LATENTE", "CO_COMPRADOR", "PAR_RITMO", "PAR_PARTICIPACION")
+              "FACTOR_LATENTE", "ITEM_EASE", "SECUENCIA", "CO_COMPRADOR", "ADOPTANTE", "ADOPTANTE_RECIENTE",
+              "PAR_RITMO", "PAR_PARTICIPACION")
 
 _COLUMNAS_EVIDENCIA = ["pos", "evidencia", "fuente", "par", "ref", "similitud", "contribucion", "lift",
                        "en_comun", "grupo", "tamano_grupo", "compran_grupo", "detalle"]
@@ -1618,22 +1965,30 @@ def _por_item_propio(b: Bloque, filas: np.ndarray, items: np.ndarray, n: int, ev
 
 
 def _co_compradores(b: Bloque, filas: np.ndarray, items: np.ndarray, principal: np.ndarray,
-                    n: int, fuente: str) -> pd.DataFrame:
+                    n: int, fuente: str, en_orden: bool = False) -> pd.DataFrame:
     """Entidades que compran a la vez el ítem propio principal y el recomendado: son los
-    pares que hacen verificable una afinidad entre ítems."""
+    pares que hacen verificable una afinidad entre ítems. Con `en_orden`, sólo las que
+    compraron primero el principal y DESPUÉS el recomendado (la secuencia)."""
     con = np.flatnonzero(principal >= 0)
     if not len(con):
         return _vacia()
     C = _compradores(b)
     claves = principal[con] * b.n_item + items[con]
 
+    Pc = b.P.tocsc() if en_orden else None
+
     def candidatos(clave):
         j, i = divmod(int(clave), b.n_item)
-        return np.intersect1d(C.indices[C.indptr[j]:C.indptr[j + 1]],
-                              C.indices[C.indptr[i]:C.indptr[i + 1]], assume_unique=True)
+        ambos = np.intersect1d(C.indices[C.indptr[j]:C.indptr[j + 1]],
+                               C.indices[C.indptr[i]:C.indptr[i + 1]], assume_unique=True)
+        if en_orden and len(ambos):
+            dj = np.asarray(Pc[ambos, j].todense()).ravel()
+            di = np.asarray(Pc[ambos, i].todense()).ravel()
+            ambos = ambos[dj < di]
+        return ambos
     pos, par, total = _cercanos(claves, filas[con], candidatos, _tamano_log(b), n)
-    return _evidencia_df(con[pos], "CO_COMPRADOR", fuente, par=par, ref=principal[con][pos],
-                         compran_grupo=total[pos].astype(float))
+    return _evidencia_df(con[pos], "ADOPTANTE" if en_orden else "CO_COMPRADOR", fuente, par=par,
+                         ref=principal[con][pos], compran_grupo=total[pos].astype(float))
 
 
 def _evidencia_algoritmo(alg: Algoritmo, b: Bloque, filas: np.ndarray, items: np.ndarray,
@@ -1693,12 +2048,96 @@ def _evidencia_algoritmo(alg: Algoritmo, b: Bloque, filas: np.ndarray, items: np
             return out
         ev, principal = _por_item_propio(b, filas, items, n, "FACTOR_LATENTE", nombre, aporte, b.R)
         return pd.concat([ev, _co_compradores(b, filas, items, principal, n, nombre)], ignore_index=True)
+    if isinstance(alg, Ease):
+        ev, principal = _por_item_propio(b, filas, items, n, "ITEM_EASE", nombre,
+                                         lambda j, i: alg.pesos[j, i], b.A)
+        return pd.concat([ev, _co_compradores(b, filas, items, principal, n, nombre)], ignore_index=True)
+    if isinstance(alg, Secuencia):
+        ev, principal = _por_item_propio(b, filas, items, n, "SECUENCIA", nombre,
+                                         lambda j, i: alg.C[j, i], b.R)
+        if len(ev):
+            j = ev["ref"].to_numpy(np.int64)
+            i_ev = items[ev["pos"].to_numpy(np.int64)]
+            pen = b.soporte / max(b.n, 1)
+            ev["lift"] = ev["similitud"].to_numpy(float) / np.where(pen[i_ev] > 0, pen[i_ev], 1.0)
+            ev["en_comun"] = np.asarray(alg.antes[j, i_ev]).ravel()          # compraron j y DESPUÉS i
+            ev["tamano_grupo"] = np.asarray(alg.elegibles[j, i_ev]).ravel()  # compraron j sin tener i antes
+            ev["contribucion"] = np.nan                                       # el puntaje es la mejor
+        return pd.concat([ev, _co_compradores(b, filas, items, principal, n, nombre, en_orden=True)],
+                         ignore_index=True)
+    if isinstance(alg, Tendencia):
+        C = _compradores(b)
+        Pc = b.P.tocsc()
+
+        def recientes(i):
+            compran = C.indices[C.indptr[i]:C.indptr[i + 1]]
+            dias = np.asarray(Pc[compran, i].todense()).ravel()
+            return compran[dias > alg.corte]
+        pos, par, total = _cercanos(items.astype(np.int64), filas, recientes, _tamano_log(b), n)
+        return _evidencia_df(pos, "ADOPTANTE_RECIENTE", nombre, par=par,
+                             grupo=f"los que no lo compraban hasta hace {int(alg.cfg.dias_tendencia)} días",
+                             tamano_grupo=alg.elegibles[items[pos]], compran_grupo=alg.nuevos[items[pos]])
     # popularidad (y svd sin factores, que cae a popularidad): los que lo compran en el segmento
     return _por_compradores(b, filas, items, n, "COMPRADOR_SEGMENTO", nombre)
 
 
+def _pct1(p: float) -> str:
+    """Una participación: con un decimal, o dos si es muy chica (0,06% no es 0,1%)."""
+    if p is None or not np.isfinite(p):
+        return "sin dato"
+    return f"{p:.1%}" if abs(p) >= 0.01 else f"{p:.2%}"
+
+
+def _formula_mezcla(propio: float, n: float, pares: float, k: float, final: float, que: str) -> str:
+    """Cómo se mezcló lo propio con lo del segmento, con los números, para poder rehacerlo."""
+    hay_p = np.isfinite(propio) and propio > 0 and n > 0
+    hay_s = np.isfinite(pares) and pares > 0 and k > 0
+    if hay_p and hay_s:
+        return (f"({n:.0f} x {_num(propio)} + {k:g} x {_num(pares)}) / ({n:.0f} + {k:g}) = {_num(final)}: "
+                f"lo suyo pesa {n:.0f} ({que}) y lo del segmento {k:g}")
+    if hay_p:
+        return f"{_num(final)}, el suyo (el segmento no tiene dato)"
+    return f"{_num(final)}, el del segmento (no tiene dato propio)"
+
+
+def _explicar_prob_recompra(sil: float, iv: float, item: int, prob: float, matriz: Matriz,
+                            cfg: RecConfig) -> str:
+    """De dónde sale la probabilidad de recompra: los casos de la curva, con los conteos que
+    quedan en la tabla de la curva de recuperación."""
+    if not cfg.usar_probabilidad:
+        return "usar_probabilidad apagado: no se descuenta probabilidad"
+    h = float(cfg.horizonte_dias) if cfg.horizonte_dias else 90.0
+    rejilla, por_item, global_ = matriz.curva_recuperacion(h, cfg.min_casos_recuperacion)
+    casos, volvieron = getattr(matriz, "curva_conteos", (None, None))
+    atraso_real = sil / iv if iv > 0 else np.nan
+    atraso = float(np.clip(np.nan_to_num(atraso_real, nan=rejilla[0]), rejilla[0], rejilla[-1]))
+    k = int(np.clip(np.searchsorted(rejilla, atraso, side="left"), 1, len(rejilla) - 1))
+    partes = []
+    for j in (k - 1, k):
+        if np.isfinite(por_item[item, j]):
+            partes.append(f"a {rejilla[j]:g} veces, {volvieron[item, j]:.0f} de {casos[item, j]:.0f} casos de "
+                          f"este ítem volvieron ({por_item[item, j]:.0%})")
+        elif np.isfinite(global_[j]) and casos is not None:
+            partes.append(f"a {rejilla[j]:g} veces, el ítem tiene menos de {cfg.min_casos_recuperacion} casos y "
+                          f"se usa todo el panel: {volvieron[:, j].sum():.0f} de {casos[:, j].sum():.0f} volvieron "
+                          f"({global_[j]:.0%})")
+        else:
+            partes.append(f"a {rejilla[j]:g} veces no hay casos suficientes")
+    texto = (f"Lleva {atraso_real:.1f} veces su intervalo sin comprar. De los que llegaron a ese atraso en el "
+             f"pasado, cuántos volvieron a comprar dentro de {h:.0f} días: " + "; ".join(partes)
+             + f". Interpolando entre {rejilla[k - 1]:g} y {rejilla[k]:g} veces: {_pct(prob)}")
+    if cfg.piso_prob and prob <= float(cfg.piso_prob) + 1e-9:
+        texto += f" (con el piso PISO_PROB = {float(cfg.piso_prob):g})"
+    return texto
+
+
 def _filas_calculo(b: Bloque, matriz: Matriz, rec: pd.DataFrame, cfg: RecConfig) -> pd.DataFrame:
-    """Una fila por recomendación con el cálculo del USD en juego, número por número."""
+    """Una fila por recomendación con el cálculo del USD en juego, número por número.
+
+    Cada número dice de quiénes sale: los compradores del segmento (todos sus valores están
+    en la tabla de referencia), los pares comparables (listados en la evidencia), o la
+    curva de recuperación (sus conteos están en su tabla).
+    """
     f = rec["f"].to_numpy(np.int64)
     i = rec["i"].to_numpy(np.int64)
     tipo = rec["tipo"].to_numpy(dtype=object)
@@ -1707,12 +2146,18 @@ def _filas_calculo(b: Bloque, matriz: Matriz, rec: pd.DataFrame, cfg: RecConfig)
     escala = _escala_tamano(b, f, cfg)
     # los mismos números que van a la tabla, redondeados igual, para que el texto los repita
     si_compra = np.round(rec["usd_si_compra"].to_numpy(float), 2)
-    prob = np.round(rec["prob"].to_numpy(float), 4)
+    prob = np.round(rec["prob"].to_numpy(float), 6)
     pot = np.round(rec["usd_potencial"].to_numpy(float), 2)
+
+    def esperados(k) -> str:
+        return f"{_num(si_compra[k])} x {prob[k]:.6f} = {_num(pot[k])} esperados."
     esperadas = pd.to_numeric(rec["compras_esperadas"], errors="coerce").to_numpy(float)
     iv = pd.to_numeric(rec["intervalo_esperado"], errors="coerce").to_numpy(float)
-    techo_rel = (b.venta_entidad[f] * float(cfg.tope_potencial_relativo) * h / ventana
-                 if cfg.tope_potencial_relativo else np.full(len(f), np.inf))
+
+    def col(nombre):
+        return (pd.to_numeric(rec[nombre], errors="coerce").to_numpy(float) if nombre in rec
+                else np.full(len(rec), np.nan))
+    pares_ref, ref_valor, ref_q1, ref_q3 = col("pares_ref"), col("ref_valor"), col("ref_q1"), col("ref_q3")
     origen = (getattr(b, "origen_prob", "") if cfg.usar_probabilidad
               else "usar_probabilidad apagado: no se descuenta")
     p = _pares_bloque(b, matriz).set_index(["f", "i"])
@@ -1720,39 +2165,55 @@ def _filas_calculo(b: Bloque, matriz: Matriz, rec: pd.DataFrame, cfg: RecConfig)
     dias_p = propio["dias"].to_numpy(float)
     usd_p = propio["usd"].to_numpy(float)
     iv_p = pd.to_numeric(propio["intervalo_medio"], errors="coerce").to_numpy(float)
-    con_ritmo_seg = np.bincount(p.index.get_level_values("i")[
-        pd.to_numeric(p["intervalo_medio"], errors="coerce").notna().to_numpy()], minlength=b.n_item)
+    n_int = pd.to_numeric(propio["n_intervalos"], errors="coerce").fillna(0).to_numpy(float)
 
     def tope(crudo, final, techo_hist=np.inf) -> str:
         if final >= np.round(crudo, 2) - 0.005:          # sin tope (a centavos)
             return ""
         if np.isfinite(techo_hist) and abs(final - np.round(techo_hist, 2)) <= 0.005:
-            return (f" Tope: no más de {float(cfg.tope_potencial_por_historico):g} veces lo que él "
-                    f"mismo compra de este ítem en {h:.0f} días, {_num(final)}.")
+            veces = float(cfg.tope_potencial_por_historico)
+            return (f" Tope: no más de {veces:g} {'vez' if veces == 1 else 'veces'} lo que él mismo compra de "
+                    f"este ítem en {h:.0f} días, {_num(final)}.")
         return (f" Tope: no más de {float(cfg.tope_potencial_relativo):.0%} de su compra total en "
                 f"{h:.0f} días, {_num(final)}.")
+
+    def tamano(k) -> str:
+        if not cfg.escalar_potencial or b.venta_media <= 0:
+            return "Sin ajuste por tamaño"
+        razon = b.venta_entidad[f[k]] / b.venta_media
+        texto = (f"Su compra en la ventana ({_num(b.venta_entidad[f[k]])}) es {razon:.2f} veces la de una entidad "
+                 f"media del segmento ({_num(b.venta_media)})")
+        if abs(razon - escala[k]) > 1e-9:
+            texto += (f"; el ajuste va de x{1 / cfg.tope_escala:.2f} a x{cfg.tope_escala:g} (TOPE_ESCALA), "
+                      f"así que queda en x{escala[k]:.2f}")
+        else:
+            texto += f": x{escala[k]:.2f}"
+        return texto
 
     textos = np.empty(len(f), dtype=object)
     for k in range(len(f)):
         fk, ik = f[k], i[k]
-        tam = (f"Su compra es {escala[k]:.2f} veces la del cliente medio del segmento"
-               if cfg.escalar_potencial else "Sin ajuste por tamaño")
+        ticket_seg = (f"{_num(b.ticket_item[ik])} por compra (USD {_num(b.usd_item[ik])} / {b.dias_item[ik]:,.0f} "
+                      f"días de compra de sus {int(b.soporte[ik]):,} compradores en el segmento)")
+        ritmo_seg = (f"cada {b.iv_item[ik]:.0f} días (mediana de {int(b.n_ritmo_item[ik]):,} compradores con ritmo)"
+                     if np.isfinite(b.iv_item[ik]) else "sin ritmo medible en el segmento")
         if tipo[k] == "CRUZADA":
-            ticket, iv_s = b.ticket_item[ik], b.iv_item[ik]
             base = (f"No lo compra. En su segmento ({b.etiqueta}) lo compran {int(b.soporte[ik]):,} de "
                     f"{b.n:,} entidades ({b.penetracion[ik]:.1%}).")
-            if np.isfinite(iv_s) and iv_s > 0:
-                crudo = ticket * escala[k] * esperadas[k]
-                calculo = (f" Un comprador gasta {_num(ticket)} por compra y compra cada {iv_s:.0f} días: en "
-                           f"{h:.0f} días son {esperadas[k]:.1f} compras, {_num(ticket * esperadas[k])}. "
-                           f"{tam}: {_num(np.round(crudo, 2))}.")
+            if np.isfinite(b.iv_item[ik]) and b.iv_item[ik] > 0:
+                crudo = b.ticket_item[ik] * escala[k] * esperadas[k]
+                calculo = (f" Ticket del ítem: {ticket_seg}. Lo compran {ritmo_seg}: en {h:.0f} días son "
+                           f"{esperadas[k]:.1f} compras, {_num(b.ticket_item[ik] * esperadas[k])}. {tamano(k)}: "
+                           f"{_num(np.round(crudo, 2))}.")
             else:
                 crudo = b.usd_medio_comprador[ik] * escala[k] * h / ventana
-                calculo = (f" Un comprador gasta {_num(b.usd_medio_comprador[ik])} en {ventana:.0f} días; en "
-                           f"{h:.0f} días, {_num(b.usd_medio_comprador[ik] * h / ventana)}. {tam}: {_num(np.round(crudo, 2))}.")
+                calculo = (f" Un comprador del segmento gasta en promedio {_num(b.usd_medio_comprador[ik])} en "
+                           f"{ventana:.0f} días (USD {_num(b.usd_item[ik])} / {int(b.soporte[ik]):,} compradores); "
+                           f"en {h:.0f} días, {_num(b.usd_medio_comprador[ik] * h / ventana)}. {tamano(k)}: "
+                           f"{_num(np.round(crudo, 2))}.")
             texto = base + calculo + tope(crudo, si_compra[k])
             texto += (f" Probabilidad de adopción {_pct(prob[k])} ({origen or 'sin backtest: no se descuenta'}): "
-                      f"{_num(pot[k])} esperados.")
+                      + esperados(k))
         elif tipo[k] == "REPOSICION":
             ticket_propio = usd_p[k] / dias_p[k] if dias_p[k] > 0 else np.nan
             ticket_pares = b.ticket_item[ik] * escala[k]
@@ -1763,27 +2224,31 @@ def _filas_calculo(b: Bloque, matriz: Matriz, rec: pd.DataFrame, cfg: RecConfig)
                           if cfg.tope_potencial_por_historico and usd_p[k] > 0 else np.inf)
             sil = float(rec["dias_sin_comprar"].iloc[k])
             ritmo = f", cada {iv_p[k]:.0f} días en promedio" if np.isfinite(iv_p[k]) else ""
-            segmento = (f"En su segmento lo compran cada {b.iv_item[ik]:.0f} días (mediana de "
-                        f"{int(con_ritmo_seg[ik]):,} compradores con ritmo)."
-                        if np.isfinite(b.iv_item[ik]) else "En su segmento nadie lo compra con ritmo medible.")
-            texto = (f"Lo compró {dias_p[k]:.0f} veces{ritmo}. {segmento} "
-                     f"Intervalo estimado para él: {iv[k]:.0f} días. Lleva {sil:.0f} sin comprar "
-                     f"({sil / iv[k]:.1f} veces ese intervalo). Ticket estimado {_num(ticket)} (el suyo "
-                     f"{_num(ticket_propio)}, el de sus pares ajustado a su tamaño {_num(ticket_pares)}). "
-                     f"En {h:.0f} días: {esperadas[k]:.1f} compras, {_num(np.round(crudo, 2))}."
-                     + tope(crudo, si_compra[k], techo_hist)
-                     + f" Probabilidad de recompra {_pct(prob[k])} (de los que llegaron a este atraso, cuántos "
-                       f"volvieron a comprar dentro de {h:.0f} días): {_num(pot[k])} esperados.")
+            texto = (f"Lo compró {dias_p[k]:.0f} veces{ritmo}; lleva {sil:.0f} días sin comprar. En su segmento "
+                     f"lo compran {ritmo_seg}. Intervalo estimado: "
+                     + _formula_mezcla(iv_p[k], n_int[k], b.iv_item[ik], cfg.peso_prior_pares, iv[k],
+                                       "sus intervalos")
+                     + f". Ticket: el suyo {_num(ticket_propio)} (USD {_num(usd_p[k])} / {dias_p[k]:.0f} compras); el del "
+                       f"ítem en el segmento {ticket_seg}, ajustado a su tamaño x{escala[k]:.2f} = {_num(ticket_pares)}. "
+                       f"Ticket estimado: "
+                     + _formula_mezcla(ticket_propio, dias_p[k], ticket_pares, cfg.peso_prior_pares, ticket,
+                                       "sus compras")
+                     + f". En {h:.0f} días: {esperadas[k]:.1f} compras, {_num(np.round(crudo, 2))}."
+                     + tope(crudo, si_compra[k], techo_hist) + " "
+                     + _explicar_prob_recompra(sil, iv[k], ik, prob[k], matriz, cfg)
+                     + ": " + esperados(k))
         else:
             ve = b.venta_entidad[fk]
             sh = usd_p[k] / ve if ve > 0 else 0.0
-            me = b.share_medio_comprador[ik]
+            me = ref_valor[k]
             crudo = (me - sh) * ve * h / ventana
-            texto = (f"Lo compra, pero le dedica {sh:.1%} de su compra; los que lo compran en su segmento le "
-                     f"dedican {me:.1%} en promedio. Su compra en la ventana: {_num(ve)} en {ventana:.0f} días. "
-                     f"Para igualarlos en {h:.0f} días le faltan ({me:.1%} - {sh:.1%}) x {_num(ve)} x "
+            nombre = _NOMBRE_ESTADISTICO[cfg.estadistico_pares]
+            texto = (f"Lo compra, pero le dedica {_pct1(sh)} de su compra ({_num(usd_p[k])} de {_num(ve)}). Sus "
+                     f"{pares_ref[k]:.0f} pares de tamaño parecido que lo compran (todos en la tabla de pares comparables) le "
+                     f"dedican {_pct1(me)} ({nombre}; la mitad de ellos entre {_pct1(ref_q1[k])} y {_pct1(ref_q3[k])}). "
+                     f"Para llegar a eso en {h:.0f} días le faltan ({_pct1(me)} - {_pct1(sh)}) x {_num(ve)} x "
                      f"{h:.0f}/{ventana:.0f} = {_num(np.round(crudo, 2))}." + tope(crudo, si_compra[k])
-                     + f" Ya lo compra: probabilidad {prob[k]:.0%}, {_num(pot[k])} esperados.")
+                     + " Ya lo compra, probabilidad 1: " + esperados(k))
         textos[k] = texto
     return _evidencia_df(np.arange(len(f)), "CALCULO", "",
                          grupo=np.full(len(f), b.etiqueta, dtype=object),
@@ -1791,25 +2256,30 @@ def _filas_calculo(b: Bloque, matriz: Matriz, rec: pd.DataFrame, cfg: RecConfig)
                          detalle=textos)
 
 
-def _detalle_pares(ev: pd.DataFrame, nombres: np.ndarray, item_rec: np.ndarray, unidad: str) -> np.ndarray:
+def _detalle_pares(ev: pd.DataFrame, rec_nombres: np.ndarray, ref_nombres: np.ndarray, unidad: str) -> np.ndarray:
     """El texto de cada fila de evidencia que no es CALCULO."""
     salida = np.empty(len(ev), dtype=object)
     for k, r in enumerate(ev.itertuples(index=False)):
-        rec = nombres[item_rec[k]]
-        ref = nombres[int(r.ref)] if np.isfinite(r.ref) and r.ref >= 0 else ""
+        rec = rec_nombres[k]
+        ref = ref_nombres[k] if ref_nombres[k] is not None and not (isinstance(ref_nombres[k], float)
+                                                                  and np.isnan(ref_nombres[k])) else ""
         compra = (f"compra {rec}: {_num(r.usd_par_item)} en {r.dias_par_item:.0f} compras"
                   if np.isfinite(r.usd_par_item) else f"compra {rec}")
+        desde = (f", la primera el {pd.Timestamp(r.fecha_item_par).date()}"
+                 if r.fecha_item_par is not None and pd.notna(r.fecha_item_par) else "")
         e = r.evidencia
         if e == "COMPRADOR_SEGMENTO":
             t = (f"Par del segmento de tamaño parecido (compra total {_num(r.usd_par_total)}); {compra}. "
                  f"Lo compran {r.compran_grupo:.0f} de {r.tamano_grupo:.0f} entidades del segmento.")
         elif e == "VECINO":
             t = (f"Uno de sus pares más parecidos por lo que compran (coseno {r.similitud:.2f}); {compra}. "
-                 f"De sus {r.tamano_grupo:.0f} pares más parecidos, {r.compran_grupo:.0f} lo compran; "
-                 f"éste aporta {r.contribucion:.0%} del puntaje.")
+                 f"De sus {r.tamano_grupo:.0f} pares más parecidos, {r.compran_grupo:.0f} lo compran (se listan los "
+                 f"de más peso; los {r.tamano_grupo:.0f} están en la tabla de vecindario). Éste aporta "
+                 f"{r.contribucion:.0%} del puntaje.")
         elif e == "MIEMBRO_GRUPO":
             t = (f"Está en su mismo grupo de gasto ({r.grupo}, {r.tamano_grupo:.0f} entidades, "
-                 f"{r.compran_grupo:.0f} lo compran); {compra}.")
+                 f"{r.compran_grupo:.0f} lo compran; el grupo de cada entidad está en la tabla de vecindario); "
+                 f"{compra}.")
         elif e == "ITEM_AFIN":
             t = (f"Ya compra {ref}. De las {r.tamano_grupo:.0f} {unidad} con {ref}, {r.en_comun:.0f} también "
                  f"tienen {rec} (coseno {r.similitud:.2f}). Aporta {r.contribucion:.0%} del puntaje.")
@@ -1820,19 +2290,70 @@ def _detalle_pares(ev: pd.DataFrame, nombres: np.ndarray, item_rec: np.ndarray, 
             t = (f"Ya compra {ref}; en el patrón de consumo del segmento (SVD) {ref} y {rec} van juntos: "
                  f"{r.en_comun:.0f} de las {r.tamano_grupo:.0f} entidades con {ref} compran los dos. "
                  f"Aporta {r.contribucion:.0%} de lo que empuja a favor.")
+        elif e == "ITEM_EASE":
+            t = (f"Ya compra {ref}; en el modelo EASE, {ref} empuja hacia {rec} con peso {r.similitud:.3f}, "
+                 f"descontando lo que explican los demás ítems ({r.en_comun:.0f} de las {r.tamano_grupo:.0f} "
+                 f"{unidad} con {ref} tienen {rec}). Aporta {r.contribucion:.0%} de lo que empuja a favor.")
+        elif e == "SECUENCIA":
+            t = (f"Secuencia {ref} -> {rec}: de las {r.tamano_grupo:.0f} entidades que compraron {ref} sin tener "
+                 f"{rec} de antes, {r.en_comun:.0f} compraron {rec} DESPUÉS ({r.similitud:.0%}, lift {r.lift:.2f}).")
         elif e == "CO_COMPRADOR":
             t = (f"Compra {ref}, como esta entidad, y además {compra}. {r.compran_grupo:.0f} entidades del "
                  f"segmento compran los dos.")
+        elif e == "ADOPTANTE":
+            ref_desde = (f" el {pd.Timestamp(r.fecha_ref_par).date()}"
+                         if r.fecha_ref_par is not None and pd.notna(r.fecha_ref_par) else "")
+            t = (f"Compró {ref}{ref_desde} y después {rec}{desde.replace(', la primera', '')}: {compra}. "
+                 f"{r.compran_grupo:.0f} entidades del segmento hicieron esa secuencia.")
+        elif e == "ADOPTANTE_RECIENTE":
+            t = (f"Empezó a comprar {rec} hace poco{desde}: {compra}. De las {r.tamano_grupo:.0f} entidades del "
+                 f"segmento que no lo compraban, {r.compran_grupo:.0f} empezaron en el mismo tramo.")
         elif e == "PAR_RITMO":
-            t = (f"Par del segmento de tamaño parecido que compra {rec} con ritmo: cada {r.intervalo_par:.0f} "
-                 f"días, {_num(r.ticket_par)} por compra ({r.dias_par_item:.0f} compras).")
+            t = (f"Ejemplo, no el total: uno de los {r.compran_grupo:.0f} compradores del segmento con ritmo, el de "
+                 f"tamaño más parecido. Compra {rec} cada {r.intervalo_par:.0f} días, {_num(r.ticket_par)} por compra "
+                 f"({r.dias_par_item:.0f} compras). El ritmo y el ticket del segmento salen de todos ellos (tabla de "
+                 f"referencia).")
         elif e == "PAR_PARTICIPACION":
-            t = (f"Par del segmento de tamaño parecido: le dedica {r.participacion_par:.1%} de su compra a {rec} "
-                 f"({_num(r.usd_par_item)} de {_num(r.usd_par_total)}).")
+            t = (f"Uno de los {r.compran_grupo:.0f} pares comparables, de los de tamaño más parecido (la lista completa, "
+                 f"con la que se calcula la mediana, está en la tabla de pares comparables): le dedica "
+                 f"{_pct1(r.participacion_par)} de su compra a {rec} ({_num(r.usd_par_item)} de {_num(r.usd_par_total)}).")
         else:
             t = ""
         salida[k] = t
     return salida
+
+
+def completar_detalle(ev: pd.DataFrame, cfg: RecConfig) -> pd.DataFrame:
+    """Escribe BD_DETALLE en las filas de evidencia que no lo tienen (todas menos CALCULO).
+
+    El texto de cada par sale entero de sus columnas, así que no se guarda en memoria para
+    millones de filas: se arma cuando se escribe, de a lotes, o para las filas que se miran.
+    """
+    if ev.empty or "BD_DETALLE" not in ev:
+        return ev
+    falta = ev["BD_DETALLE"].isna().to_numpy()
+    if not falta.any():
+        return ev
+    sub = ev.loc[falta]
+    nombre = (cfg.desc_item() or cfg.claves_item())[0].upper()
+    campos = pd.DataFrame({
+        "evidencia": sub["BD_EVIDENCIA"].astype(object).to_numpy(),
+        "usd_par_item": sub["MT_USD_PAR_ITEM"].to_numpy(float), "dias_par_item": sub["MT_DIAS_PAR_ITEM"].to_numpy(float),
+        "fecha_item_par": sub["FECHA_PRIMERA_ITEM_PAR"].to_numpy(), "fecha_ref_par": sub["FECHA_PRIMERA_REF_PAR"].to_numpy(),
+        "usd_par_total": sub["MT_USD_PAR_TOTAL"].to_numpy(float), "compran_grupo": sub["MT_COMPRAN_EN_GRUPO"].to_numpy(float),
+        "tamano_grupo": sub["MT_TAMANO_GRUPO"].to_numpy(float), "similitud": sub["MT_SIMILITUD"].to_numpy(float),
+        "contribucion": sub["MT_CONTRIBUCION"].to_numpy(float), "lift": sub["MT_LIFT"].to_numpy(float),
+        "en_comun": sub["MT_EN_COMUN"].to_numpy(float), "grupo": sub["BD_GRUPO"].astype(object).to_numpy(),
+        "intervalo_par": sub["MT_INTERVALO_PAR"].to_numpy(float), "ticket_par": sub["MT_TICKET_PAR"].to_numpy(float),
+        "participacion_par": sub["MT_PARTICIPACION_PAR"].to_numpy(float)})
+    unidad = "canastas" if cfg.afinidad == "canasta" else "entidades"
+    textos = _detalle_pares(campos, sub[nombre].astype(object).to_numpy(),
+                            sub["REF_" + nombre].astype(object).to_numpy(), unidad)
+    ev = ev.copy()
+    detalle = np.array(ev["BD_DETALLE"].astype(object).to_numpy(), dtype=object)   # copia escribible
+    detalle[falta] = textos
+    ev["BD_DETALLE"] = detalle
+    return ev
 
 
 def evidencias_bloque(b: Bloque, matriz: Matriz, alg: Algoritmo, rec: pd.DataFrame,
@@ -1873,16 +2394,25 @@ def evidencias_bloque(b: Bloque, matriz: Matriz, alg: Algoritmo, rec: pd.DataFra
                                     grupo=b.etiqueta, tamano_grupo=b.soporte[i[rep][pos]],
                                     compran_grupo=total[pos].astype(float)))
     bre = np.flatnonzero(tipo == "BRECHA")
+    b.comparables = None
     if len(bre):
-        valido = b.venta_entidad > 0
-        if cfg.min_base_porcentaje > 0:
-            valido &= b.venta_entidad >= cfg.min_base_porcentaje
-        con_share = p[valido[p["f"].to_numpy(np.int64)]]
-        por_item = {k: g.to_numpy(np.int64) for k, g in con_share.groupby("i")["f"]}
-        pos, par, total = _cercanos(i[bre], f[bre], lambda k: por_item.get(int(k), ()), _tamano_log(b), n)
-        partes.append(_evidencia_df(bre[pos], "PAR_PARTICIPACION", "regla_brecha", par=par,
-                                    grupo=b.etiqueta, tamano_grupo=b.soporte[i[bre][pos]],
-                                    compran_grupo=total[pos].astype(float)))
+        # TODOS los pares con los que se comparó van a su propia tabla (angosta: son 30 por
+        # brecha); acá quedan los más parecidos como ejemplo
+        pos, par = pares_comparables(b, matriz, cfg, f[bre], i[bre])
+        cuantos = np.bincount(pos, minlength=len(bre)).astype(float)
+        rango = np.arange(len(pos)) - np.searchsorted(pos, pos)      # vienen del más parecido al menos
+        it = i[bre][pos]
+        usd_par = np.asarray(b.V[par, it]).ravel()
+        total_par = b.venta_entidad[par]
+        b.comparables = pd.DataFrame({
+            "entidad": b.filas[f[bre][pos]], "i": it, "par_entidad": b.filas[par], "orden": rango + 1,
+            "usd_par": usd_par, "total_par": total_par,
+            "share_par": usd_par / np.where(total_par > 0, total_par, 1.0),
+            "ranking": rec["ranking"].to_numpy()[bre][pos]})
+        ej = rango < n
+        partes.append(_evidencia_df(bre[pos][ej], "PAR_PARTICIPACION", "regla_brecha", par=par[ej],
+                                    grupo=f"sus {int(cfg.pares_comparables)} pares comparables",
+                                    tamano_grupo=b.soporte[it[ej]], compran_grupo=cuantos[pos][ej]))
 
     ev = pd.concat([x for x in partes if len(x)], ignore_index=True)
     pos = ev["pos"].to_numpy(np.int64)
@@ -1912,6 +2442,21 @@ def evidencias_bloque(b: Bloque, matriz: Matriz, alg: Algoritmo, rec: pd.DataFra
     ev["intervalo_par"] = intervalo
     ev["participacion_par"] = share
     ev["usd_par_total"] = total_par
+    # cuándo compró el par por primera vez (en la ventana) el ítem recomendado y el de referencia
+    fecha_item = np.full(len(ev), np.nan)
+    fecha_ref = np.full(len(ev), np.nan)
+    if con_par.any():
+        fecha_item[con_par] = np.asarray(b.P[pl[con_par], item_rec[con_par]]).ravel()
+        ref = ev["ref"].to_numpy(float)
+        con_ref = con_par & np.isfinite(ref)
+        if con_ref.any():
+            fecha_ref[con_ref] = np.asarray(b.P[pl[con_ref], ref[con_ref].astype(np.int64)]).ravel()
+
+    def a_fecha(d):
+        d = np.where(d > 0, d, np.nan)
+        return pd.to_datetime(d, unit="D", origin=_EPOCA).to_numpy(dtype=object)
+    ev["fecha_item_par"] = a_fecha(fecha_item)
+    ev["fecha_ref_par"] = a_fecha(fecha_ref)
     # en la fila CALCULO, las mismas columnas llevan la referencia del segmento
     calc = (ev["evidencia"] == "CALCULO").to_numpy()
     ic = item_rec[calc]
@@ -1920,15 +2465,17 @@ def evidencias_bloque(b: Bloque, matriz: Matriz, alg: Algoritmo, rec: pd.DataFra
     ev.loc[calc, "intervalo_par"] = b.iv_item[ic]
     ev.loc[calc, "participacion_par"] = b.share_medio_comprador[ic]
     ev.loc[calc, "fuente"] = rec["algoritmo"].to_numpy(dtype=object)[pos[calc]]
-    unidad = "canastas" if cfg.afinidad == "canasta" else "entidades"
-    otros = ~calc
-    if otros.any():
-        ev.loc[otros, "detalle"] = _detalle_pares(ev.loc[otros], b.nombres_item, item_rec[otros], unidad)
+    # el texto de cada par se arma después, desde sus columnas (completar_detalle): son millones
     # una sola numeración por recomendación: CALCULO primero, después en el orden de EVIDENCIAS
     clase = pd.Categorical(ev["evidencia"], categories=list(EVIDENCIAS), ordered=True).codes
     ev["_clase"] = clase
     ev["_orden_original"] = np.arange(len(ev))
-    ev = ev.sort_values(["pos", "_clase", "_orden_original"]).reset_index(drop=True)
+    # dentro de cada clase, la de más peso primero (afinidad, coseno, confianza); los pares sin
+    # peso ya vienen ordenados por cercanía de tamaño
+    ev["_peso"] = -pd.to_numeric(ev["similitud"], errors="coerce").fillna(0.0)
+    # en un empate de peso, primero el ítem de índice mayor: es el que nombra el motivo
+    ev["_desempate"] = -pd.to_numeric(ev["ref"], errors="coerce").fillna(0.0)
+    ev = ev.sort_values(["pos", "_clase", "_peso", "_desempate", "_orden_original"]).reset_index(drop=True)
     ev["orden"] = ev.groupby("pos").cumcount()
     pos = ev["pos"].to_numpy(np.int64)
     ev["entidad"] = b.filas[f[pos]]
@@ -1939,7 +2486,80 @@ def evidencias_bloque(b: Bloque, matriz: Matriz, alg: Algoritmo, rec: pd.DataFra
     par = ev["par"].to_numpy(float)
     ev["par_entidad"] = np.where(np.isfinite(par), b.filas[np.where(np.isfinite(par), par, 0).astype(np.int64)], -1)
     ev["ref_item"] = np.where(np.isfinite(ev["ref"].to_numpy(float)), ev["ref"].to_numpy(float), -1).astype(np.int64)
-    return ev.drop(columns=["_clase", "_orden_original", "pos", "par", "ref"])
+    return ev.drop(columns=["_clase", "_orden_original", "_peso", "_desempate", "pos", "par", "ref"])
+
+
+def referencia_bloque(b: Bloque, cfg: RecConfig) -> pd.DataFrame:
+    """Los valores de cada ítem en el segmento que usan los cálculos, con sus componentes
+    (sumas y conteos), para poder rehacerlos desde la matriz de compras."""
+    i = np.flatnonzero(b.soporte > 0)
+    if not len(i):
+        return pd.DataFrame()
+    return pd.DataFrame({
+        "segmento": b.etiqueta, "nivel_segmento": b.nivel, "i": i,
+        "entidades": float(b.n), "compradores": b.soporte[i], "penetracion": b.penetracion[i],
+        "candidato": b.candidato[i], "usd_item": b.usd_item[i], "dias_item": b.dias_item[i],
+        "ticket": b.ticket_item[i], "usd_medio_comprador": b.usd_medio_comprador[i],
+        "con_ritmo": b.n_ritmo_item[i], "intervalo_mediana": b.iv_item[i], "cv_mediana": b.cv_item[i],
+        "participacion_media": b.share_medio_comprador[i], "margen_pct": b.margen_pct_item[i],
+        "venta_media_entidad": b.venta_media, "prob_adopcion": b.p_adopcion,
+        "origen_prob": getattr(b, "origen_prob", "") or "", "dias_ventana": b.dias_ventana})
+
+
+def vecindario_bloque(b: Bloque, alg: Algoritmo, filas: np.ndarray) -> pd.DataFrame:
+    """Con quién se agrupó a cada entidad: sus k vecinos (coseno_entidad) y su grupo de
+    k-means (kmeans_valor). Con esto se rehacen los "N de sus pares más parecidos" y los
+    "en su grupo lo compran X%" de los motivos."""
+    algos = alg.algos if isinstance(alg, Fusion) else [alg]
+    partes = []
+    for a in algos:
+        if isinstance(a, CosenoEntidad) and len(filas):
+            for ini in range(0, len(filas), 20_000):
+                f = filas[ini:ini + 20_000]
+                W = a._vecinos(f).tocsr()
+                W.sort_indices()
+                r = np.repeat(np.arange(len(f)), np.diff(W.indptr))
+                orden = np.lexsort((-W.data, r))
+                r, j, s = r[orden], W.indices[orden], W.data[orden]
+                rango = np.arange(len(r)) - np.searchsorted(r, r)
+                partes.append(pd.DataFrame({"f": f[r], "algoritmo": a.nombre, "par": j, "similitud": s,
+                                            "orden": rango + 1, "grupo": f"sus {int(a.cfg.k_vecinos)} pares más parecidos",
+                                            "tamano": np.bincount(r, minlength=len(f))[r].astype(float)}))
+        elif isinstance(a, KmeansValor) and a.pen.shape[0] > 1:
+            todas = np.arange(b.n)
+            partes.append(pd.DataFrame({"f": todas, "algoritmo": a.nombre, "par": -1, "similitud": np.nan,
+                                        "orden": 0, "grupo": [f"k-means #{g}" for g in a.etiquetas],
+                                        "tamano": a.tam[a.etiquetas]}))
+    if not partes:
+        return pd.DataFrame()
+    out = pd.concat(partes, ignore_index=True)
+    out["segmento"] = b.etiqueta
+    out["entidad"] = b.filas[out["f"].to_numpy(np.int64)]
+    par = out["par"].to_numpy(np.int64)
+    out["par_entidad"] = np.where(par >= 0, b.filas[np.maximum(par, 0)], -1)
+    return out
+
+
+def tabla_curva(matriz: Matriz, cfg: RecConfig) -> pd.DataFrame:
+    """La curva de recuperación con sus conteos: por ítem y para todo el panel."""
+    h = float(cfg.horizonte_dias) if cfg.horizonte_dias else 90.0
+    rejilla, por_item, global_ = matriz.curva_recuperacion(h, cfg.min_casos_recuperacion)
+    if not hasattr(matriz, "curva_conteos"):
+        return pd.DataFrame()
+    casos, volvieron = matriz.curva_conteos
+    filas = []
+    con_casos = np.flatnonzero(casos.sum(1) > 0)
+    for k, a in enumerate(rejilla):
+        filas.append(pd.DataFrame({"i": con_casos, "atraso": a, "casos": casos[con_casos, k],
+                                   "volvieron": volvieron[con_casos, k], "prob": por_item[con_casos, k],
+                                   "alcance": "ITEM"}))
+        filas.append(pd.DataFrame({"i": [-1], "atraso": [a], "casos": [casos[:, k].sum()],
+                                   "volvieron": [volvieron[:, k].sum()], "prob": [global_[k]],
+                                   "alcance": ["PANEL"]}))
+    out = pd.concat(filas, ignore_index=True)
+    out["horizonte"] = h
+    out["min_casos"] = float(cfg.min_casos_recuperacion)
+    return out
 
 
 # =========================================================================== #
@@ -2104,7 +2724,12 @@ def catalogo_evidencia(cfg: RecConfig) -> List[Tuple[str, str, str]]:
          "(coseno_item). REGLA: una regla de asociación que le aplica (reglas). FACTOR_LATENTE: un ítem que ya "
          "compra y va con el recomendado en el patrón de consumo (svd). CO_COMPRADOR: una entidad que compra a "
          "la vez el ítem de referencia y el recomendado. PAR_RITMO: un par que compra el ítem con ritmo "
-         "(reposición). PAR_PARTICIPACION: un par y lo que le dedica al ítem (brecha)."),
+         "(reposición): es un ejemplo, el ritmo del segmento sale de todos (tabla de referencia). "
+         "PAR_PARTICIPACION: uno de los pares comparables de una BRECHA; se listan TODOS los comparados. "
+         "ITEM_EASE: un ítem que ya compra y su peso en el modelo EASE (ease). SECUENCIA: una regla 'compró A y "
+         "después B' que le aplica (secuencia). ADOPTANTE: una entidad que compró la referencia y DESPUÉS el "
+         "recomendado. ADOPTANTE_RECIENTE: una entidad que empezó a comprar el ítem en los últimos "
+         "dias_tendencia días (tendencia)."),
         ("BD_ALGORITMO_EVIDENCIA", "VARCHAR2(40)", "Algoritmo que aporta esta evidencia. Igual a BD_ALGORITMO, "
                                                    "salvo en una fusión (rrf / ponderado), donde cada algoritmo "
                                                    "de la batería deja la suya."),
@@ -2125,10 +2750,11 @@ def catalogo_evidencia(cfg: RecConfig) -> List[Tuple[str, str, str]]:
         ("MT_CONTRIBUCION", "NUMBER", "Fracción del puntaje que explica esta fila. VECINO e ITEM_AFIN: el "
                                       "puntaje es la suma de esos aportes. FACTOR_LATENTE: fracción de lo que "
                                       "empuja a favor (en svd hay ítems que restan y no se listan)."),
-        ("MT_LIFT", "NUMBER", "Sólo REGLA: cuántas veces más probable es comprar el recomendado teniendo la "
-                              "referencia que en el segmento en general."),
-        ("MT_EN_COMUN", "NUMBER", "ITEM_AFIN, REGLA, FACTOR_LATENTE: entidades (o canastas, si la afinidad es por "
-                                  "canasta) que tienen la referencia y el recomendado."),
+        ("MT_LIFT", "NUMBER", "REGLA y SECUENCIA: cuántas veces más probable es comprar el recomendado "
+                              "teniendo la referencia que en el segmento en general."),
+        ("MT_EN_COMUN", "NUMBER", "ITEM_AFIN, REGLA, FACTOR_LATENTE, ITEM_EASE: entidades (o canastas, si la "
+                                  "afinidad es por canasta) que tienen la referencia y el recomendado. SECUENCIA: "
+                                  "entidades que compraron la referencia y DESPUÉS el recomendado."),
         ("MT_USD_PAR_ITEM", "NUMBER", "USD que el par compró del ítem recomendado en la ventana. En CALCULO: lo "
                                       "que gasta en la ventana un comprador medio del segmento."),
         ("MT_DIAS_PAR_ITEM", "NUMBER", "Días en que el par compró el ítem recomendado en la ventana."),
@@ -2139,6 +2765,9 @@ def catalogo_evidencia(cfg: RecConfig) -> List[Tuple[str, str, str]]:
         ("MT_PARTICIPACION_PAR", "NUMBER", "Fracción de su compra que el par le dedica al ítem. En CALCULO: la "
                                            "media de los compradores del segmento (la base de BRECHA)."),
         ("MT_USD_PAR_TOTAL", "NUMBER", "Compra total del par en la ventana: los pares se eligen de tamaño parecido."),
+        ("FECHA_PRIMERA_ITEM_PAR", "DATE", "Primera compra del ítem recomendado por el par dentro de la ventana."),
+        ("FECHA_PRIMERA_REF_PAR", "DATE", "Primera compra del ítem de referencia por el par dentro de la ventana "
+                                          "(en ADOPTANTE: es anterior a la del recomendado)."),
         ("BD_GRUPO", "VARCHAR2(400)", "Contra qué grupo se comparó: el segmento, el grupo de k-means o los k "
                                       "pares más parecidos."),
         ("MT_TAMANO_GRUPO", "NUMBER", "Entidades de ese grupo (en ITEM_AFIN, REGLA y FACTOR_LATENTE: las que "
@@ -2147,10 +2776,104 @@ def catalogo_evidencia(cfg: RecConfig) -> List[Tuple[str, str, str]]:
         ("MT_COMPRAN_EN_GRUPO", "NUMBER", "De ese grupo, cuántas compran el ítem recomendado (en CO_COMPRADOR: "
                                           "cuántas compran los dos; en PAR_RITMO, cuántas con ritmo medible). "
                                           "Es el total, aunque se listen sólo algunas."),
-        ("BD_DETALLE", "VARCHAR2(1000)", "La fila en palabras, con los números para verificarla."),
+        ("BD_DETALLE", "VARCHAR2(4000)", "La fila en palabras, con los números para verificarla. En CALCULO "
+                                         "lleva cada fórmula con sus valores, por eso es largo."),
         ("FECHA_CORTE", "DATE", "Último día incluido en el cálculo."),
     ]
     return cols
+
+
+def _cols_categoria(cfg: RecConfig, columnas: Sequence[str], prefijo: str, que: str) -> List[Tuple[str, str, str]]:
+    return [(f"{prefijo}{c.upper()}", "VARCHAR2(200)" if str(c).upper().startswith("BD_") else "NUMBER",
+             f"{que} ({c}).") for c in columnas]
+
+
+def catalogo_referencia(cfg: RecConfig) -> List[Tuple[str, str, str]]:
+    """Tabla de referencia: un ítem en un segmento, con todo lo que los cálculos usan de él."""
+    return ([("BD_SEGMENTO", "VARCHAR2(400)", "Segmento."),
+             ("BD_NIVEL_SEGMENTO", "VARCHAR2(100)", "Nivel de segmentación usado, o GLOBAL.")]
+            + _cols_categoria(cfg, cfg.item, "", "Ítem")
+            + [("MT_ENTIDADES_SEGMENTO", "NUMBER", "Entidades del segmento con compras en la ventana."),
+               ("MT_COMPRADORES", "NUMBER", "Entidades del segmento que compran el ítem (soporte)."),
+               ("MT_PENETRACION", "NUMBER", "MT_COMPRADORES / MT_ENTIDADES_SEGMENTO."),
+               ("BD_CANDIDATO", "VARCHAR2(5)", "SI si pasa MIN_SOPORTE y MIN_PENETRACION: sólo entonces se recomienda."),
+               ("MT_USD_ITEM", "NUMBER", "USD del ítem sumando a todos sus compradores del segmento."),
+               ("MT_DIAS_COMPRA_ITEM", "NUMBER", "Días de compra del ítem sumando a todos sus compradores."),
+               ("MT_TICKET", "NUMBER", "MT_USD_ITEM / MT_DIAS_COMPRA_ITEM: el ticket del ítem en el segmento, el "
+                                       "que usan CRUZADA y REPOSICION."),
+               ("MT_USD_MEDIO_COMPRADOR", "NUMBER", "MT_USD_ITEM / MT_COMPRADORES."),
+               ("MT_COMPRADORES_CON_RITMO", "NUMBER", "Compradores con al menos 2 días de compra (con intervalo)."),
+               ("MT_INTERVALO_MEDIANA", "NUMBER", "Mediana del intervalo medio de esos compradores: el ritmo del "
+                                                  "segmento que se le presta a quien tiene poca historia."),
+               ("MT_CV_MEDIANA", "NUMBER", "Mediana de la irregularidad (desvío / promedio de los intervalos)."),
+               ("MT_PARTICIPACION_MEDIA", "NUMBER", "Promedio simple de la participación del ítem en la compra de sus "
+                                                    "compradores. Es informativa: la BRECHA ya no la usa, compara "
+                                                    "contra sus pares comparables."),
+               ("MT_MARGEN_PCT", "NUMBER", "Margen / venta del ítem en el segmento (0 si la venta no llega a "
+                                           "MIN_BASE_PORCENTAJE)."),
+               ("MT_VENTA_MEDIA_ENTIDAD", "NUMBER", "Compra media de una entidad del segmento: la base del ajuste por "
+                                                    "tamaño."),
+               ("MT_PROB_ADOPCION", "NUMBER", "Probabilidad de adopción de una CRUZADA en el segmento."),
+               ("BD_ORIGEN_PROB", "VARCHAR2(400)", "De dónde sale esa probabilidad (backtest del segmento o del panel)."),
+               ("MT_DIAS_VENTANA", "NUMBER", "Días de la ventana de afinidad."),
+               ("FECHA_CORTE", "DATE", "Último día incluido en el cálculo.")])
+
+
+def catalogo_matriz(cfg: RecConfig) -> List[Tuple[str, str, str]]:
+    """La matriz de compras: una fila por entidad e ítem comprado en la ventana."""
+    return (_cols_categoria(cfg, cfg.entidad, "", "Entidad") + _cols_categoria(cfg, cfg.item, "", "Ítem")
+            + [("BD_SEGMENTO", "VARCHAR2(400)", "Segmento de la entidad."),
+               ("MT_USD", "NUMBER", "USD netos del ítem en la ventana (ventas menos devoluciones)."),
+               ("MT_MARGEN", "NUMBER", "Margen USD del ítem en la ventana."),
+               ("MT_DIAS_COMPRA", "NUMBER", "Días distintos en que compró el ítem."),
+               ("FECHA_PRIMERA", "DATE", "Primera compra del ítem dentro de la ventana."),
+               ("FECHA_ULTIMA", "DATE", "Última compra del ítem."),
+               ("MT_INTERVALO_MEDIO", "NUMBER", "Días promedio entre compras (vacío con un solo día de compra)."),
+               ("MT_INTERVALO_DESVIO", "NUMBER", "Desvío de esos intervalos."),
+               ("MT_USD_ENTIDAD", "NUMBER", "Compra total de la entidad en la ventana."),
+               ("MT_PARTICIPACION", "NUMBER", "MT_USD / MT_USD_ENTIDAD: lo que le dedica al ítem."),
+               ("FECHA_CORTE", "DATE", "Último día incluido en el cálculo.")])
+
+
+def catalogo_curva(cfg: RecConfig) -> List[Tuple[str, str, str]]:
+    """La curva de recuperación con sus conteos."""
+    return (_cols_categoria(cfg, cfg.item, "", "Ítem (vacío en las filas del panel entero)")
+            + [("BD_ALCANCE", "VARCHAR2(10)", "ITEM: casos de ese ítem. PANEL: todos los ítems juntos (se usa cuando "
+                                              "el ítem no llega a MT_MIN_CASOS)."),
+               ("MT_ATRASO", "NUMBER", "Veces su intervalo que llevaba sin comprar."),
+               ("MT_CASOS", "NUMBER", "Casos que llegaron a ese atraso (huecos pasados y silencios ya observados)."),
+               ("MT_VOLVIERON", "NUMBER", "De esos, cuántos volvieron a comprar dentro del horizonte."),
+               ("MT_PROB", "NUMBER", "MT_VOLVIERON / MT_CASOS, si hay casos suficientes."),
+               ("MT_HORIZONTE_DIAS", "NUMBER", "El horizonte de la recompra."),
+               ("MT_MIN_CASOS", "NUMBER", "Casos mínimos para creerle a la curva del ítem."),
+               ("FECHA_CORTE", "DATE", "Último día incluido en el cálculo.")])
+
+
+def catalogo_pares_comparables(cfg: RecConfig) -> List[Tuple[str, str, str]]:
+    """Todos los pares con los que se comparó cada BRECHA."""
+    return (_cols_categoria(cfg, cfg.entidad, "", "Entidad de la BRECHA")
+            + _cols_categoria(cfg, cfg.item, "", "Ítem de la BRECHA")
+            + _cols_categoria(cfg, cfg.entidad, "PAR_", "Par comparable")
+            + [("MT_RANKING", "NUMBER", "Ranking de la BRECHA en la tabla de recomendaciones."),
+               ("MT_ORDEN", "NUMBER", "1 = el par de tamaño más parecido."),
+               ("MT_USD_PAR_ITEM", "NUMBER", "USD que el par compró del ítem en la ventana."),
+               ("MT_USD_PAR_TOTAL", "NUMBER", "Compra total del par en la ventana."),
+               ("MT_PARTICIPACION_PAR", "NUMBER", "MT_USD_PAR_ITEM / MT_USD_PAR_TOTAL. La mediana (o lo que diga "
+                                                  "ESTADISTICO_PARES) de estas filas es el número del motivo."),
+               ("FECHA_CORTE", "DATE", "Último día incluido en el cálculo.")])
+
+
+def catalogo_vecindario(cfg: RecConfig) -> List[Tuple[str, str, str]]:
+    """Con quién se agrupó a cada entidad."""
+    return ([("BD_SEGMENTO", "VARCHAR2(400)", "Segmento."),
+             ("BD_ALGORITMO", "VARCHAR2(40)", "coseno_entidad (sus vecinos) o kmeans_valor (su grupo).")]
+            + _cols_categoria(cfg, cfg.entidad, "", "Entidad")
+            + _cols_categoria(cfg, cfg.entidad, "PAR_", "Vecino (sólo coseno_entidad)")
+            + [("BD_GRUPO", "VARCHAR2(200)", "El grupo: 'k-means #3' o 'sus 50 pares más parecidos'."),
+               ("MT_ORDEN", "NUMBER", "Lugar del vecino, 1 el más parecido (0 en kmeans_valor)."),
+               ("MT_SIMILITUD", "NUMBER", "Coseno entre la entidad y el vecino, por lo que compran."),
+               ("MT_TAMANO_GRUPO", "NUMBER", "Entidades del grupo, o vecinos de la entidad."),
+               ("FECHA_CORTE", "DATE", "Último día incluido en el cálculo.")])
 
 
 class RecEngine:
@@ -2160,6 +2883,8 @@ class RecEngine:
         self.fechas = Fechas.desde(config.fecha_ejecucion)
         self.diagnostico = pd.DataFrame()
         self.evidencia = pd.DataFrame()
+        self.referencia = self.matriz_compras = self.curva = self.vecindario = pd.DataFrame()
+        self.pares_comparables = pd.DataFrame()
         self.tiempos_: Dict[str, float] = {}
         LOGGER.setLevel(logging.INFO if config.verbose else logging.WARNING)
 
@@ -2206,7 +2931,7 @@ class RecEngine:
         # una corrida nueva está vacío, y todas las cruzadas salían con probabilidad 100%.
         p_adopcion, p_global = self._probabilidad_adopcion()
 
-        salidas, evidencias = [], []
+        salidas, evidencias, referencias, vecindarios, comparables = [], [], [], [], []
         codigos, etiquetas = pd.factorize(seg["segmento"])
         t0 = time.time()
         for k, etiqueta in enumerate(etiquetas):
@@ -2226,13 +2951,23 @@ class RecEngine:
             if len(parte):
                 salidas.append(parte)
                 if cfg.guardar_evidencia:
-                    evidencias.append(evidencias_bloque(b, matriz, alg, parte, cfg))
+                    ev_b = evidencias_bloque(b, matriz, alg, parte, cfg)
+                    if len(ev_b):
+                        evidencias.append(self._ensamblar_evidencia(ev_b, panel))
+                    if getattr(b, "comparables", None) is not None and len(b.comparables):
+                        comparables.append(b.comparables)
+            if cfg.guardar_referencia:
+                referencias.append(referencia_bloque(b, cfg))
+            if cfg.guardar_vecindario:
+                con_reco = np.unique(parte["f"].to_numpy(np.int64)) if len(parte) else np.zeros(0, np.int64)
+                vecindarios.append(vecindario_bloque(b, alg, con_reco))
             LOGGER.info("segmento [%s] nivel %s: %s entidades, %s ítems candidatos, algoritmo %s -> %s recomendaciones",
                         etiqueta, nivel, f"{b.n:,}", f"{int(b.candidato.sum()):,}", nombre_alg,
                         f"{len(parte):,}")
         self.tiempos_["recomendar"] = time.time() - t0
 
         self.evidencia = pd.DataFrame(columns=[c for c, _, _ in catalogo_evidencia(cfg)])
+        self._tablas_soporte(panel, matriz, seg, referencias, vecindarios, comparables)
         if not salidas:
             LOGGER.warning("no salió ninguna recomendación")
             return pd.DataFrame(columns=[c for c, _, _ in catalogo(cfg)])
@@ -2240,7 +2975,11 @@ class RecEngine:
         out = self._ensamblar(rec, panel)
         evidencias = [e for e in evidencias if len(e)]
         if evidencias:
-            self.evidencia = self._ensamblar_evidencia(pd.concat(evidencias, ignore_index=True), panel)
+            self.evidencia = pd.concat(evidencias, ignore_index=True)
+            del evidencias
+            for c in self.evidencia.columns:       # textos repetidos: categorías, no millones de objetos
+                if self.evidencia[c].dtype == object and c != "BD_DETALLE":
+                    self.evidencia[c] = self.evidencia[c].astype("category")
             LOGGER.info("evidencia: %s filas para %s recomendaciones (%s)", f"{len(self.evidencia):,}",
                         f"{self.evidencia.loc[self.evidencia['BD_EVIDENCIA'] == 'CALCULO'].shape[0]:,}",
                         self.evidencia["BD_EVIDENCIA"].value_counts().to_dict())
@@ -2264,7 +3003,7 @@ class RecEngine:
             "BD_TIPO": rec["tipo"].to_numpy(dtype=object),
             "MT_USD_POTENCIAL": np.round(rec["usd_potencial"].to_numpy(float), 2),
             "MT_USD_SI_COMPRA": np.round(rec["usd_si_compra"].to_numpy(float), 2),
-            "MT_PROB": np.round(rec["prob"].to_numpy(float), 4),
+            "MT_PROB": np.round(rec["prob"].to_numpy(float), 6),
             "MT_INTERVALO_ESPERADO": np.round(rec["intervalo_esperado"].to_numpy(float), 1),
             "MT_COMPRAS_ESPERADAS": np.round(rec["compras_esperadas"].to_numpy(float), 2),
             "MT_MARGEN_POTENCIAL": np.round(rec["margen_potencial"].to_numpy(float), 2),
@@ -2286,6 +3025,120 @@ class RecEngine:
         out = pd.DataFrame(salida)
         claves = [c.upper() for c in cfg.claves_entidad()]
         return out.sort_values(claves + ["MT_RANKING"]).reset_index(drop=True)
+
+    def _tablas_soporte(self, panel: Panel, matriz: Matriz, seg: pd.DataFrame,
+                        referencias: List[pd.DataFrame], vecindarios: List[pd.DataFrame],
+                        comparables: List[pd.DataFrame]) -> None:
+        """Las tablas con las que se comprueba cualquier número de un motivo o de un cálculo."""
+        cfg, ayer = self.cfg, self.fechas.ayer
+        ent_cols = {c.upper(): panel.entidades[c].to_numpy() for c in cfg.entidad}
+        item_cols = {c.upper(): panel.items[c].to_numpy() for c in cfg.item}
+
+        def claves(ent=None, item=None, par=None):
+            out = {}
+            if ent is not None:
+                out.update({c: v[ent] for c, v in ent_cols.items()})
+            if item is not None:
+                out.update({c: (v[item] if (item >= 0).all() else
+                                np.where(item >= 0, v.astype(object)[np.maximum(item, 0)], None))
+                            for c, v in item_cols.items()})
+            if par is not None:
+                out.update({"PAR_" + c: (v[par] if (par >= 0).all() else
+                                         np.where(par >= 0, v.astype(object)[np.maximum(par, 0)], None))
+                            for c, v in ent_cols.items()})
+            return out
+
+        def vacia(catalogo_fn):
+            return pd.DataFrame(columns=[c for c, _, _ in catalogo_fn(cfg)])
+
+        def fecha(d):
+            return pd.to_datetime(np.asarray(d, float), unit="D", origin=_EPOCA).to_numpy()
+
+        self.referencia, self.matriz_compras = vacia(catalogo_referencia), vacia(catalogo_matriz)
+        self.curva, self.vecindario = vacia(catalogo_curva), vacia(catalogo_vecindario)
+        self.pares_comparables = vacia(catalogo_pares_comparables)
+        if comparables:
+            c = pd.concat(comparables, ignore_index=True)
+            self.pares_comparables = pd.DataFrame({
+                **claves(ent=c["entidad"].to_numpy(np.int64), item=c["i"].to_numpy(np.int64),
+                         par=c["par_entidad"].to_numpy(np.int64)),
+                "MT_RANKING": c["ranking"].to_numpy(int),
+                "MT_ORDEN": c["orden"].to_numpy(int),
+                "MT_USD_PAR_ITEM": np.round(c["usd_par"].to_numpy(float), 2),
+                "MT_USD_PAR_TOTAL": np.round(c["total_par"].to_numpy(float), 2),
+                "MT_PARTICIPACION_PAR": np.round(c["share_par"].to_numpy(float), 6),
+                "FECHA_CORTE": np.full(len(c), ayer)})
+        dec = cfg.decimales
+        refs = [r for r in referencias if len(r)]
+        if refs:
+            r = pd.concat(refs, ignore_index=True)
+            self.referencia = pd.DataFrame({
+                "BD_SEGMENTO": r["segmento"].to_numpy(dtype=object),
+                "BD_NIVEL_SEGMENTO": r["nivel_segmento"].to_numpy(dtype=object),
+                **claves(item=r["i"].to_numpy(np.int64)),
+                "MT_ENTIDADES_SEGMENTO": r["entidades"].to_numpy(float),
+                "MT_COMPRADORES": r["compradores"].to_numpy(float),
+                "MT_PENETRACION": np.round(r["penetracion"].to_numpy(float), dec),
+                "BD_CANDIDATO": np.where(r["candidato"].to_numpy(bool), "SI", "NO"),
+                "MT_USD_ITEM": np.round(r["usd_item"].to_numpy(float), 2),
+                "MT_DIAS_COMPRA_ITEM": r["dias_item"].to_numpy(float),
+                "MT_TICKET": np.round(r["ticket"].to_numpy(float), 2),
+                "MT_USD_MEDIO_COMPRADOR": np.round(r["usd_medio_comprador"].to_numpy(float), 2),
+                "MT_COMPRADORES_CON_RITMO": r["con_ritmo"].to_numpy(float),
+                "MT_INTERVALO_MEDIANA": np.round(r["intervalo_mediana"].to_numpy(float), 2),
+                "MT_CV_MEDIANA": np.round(r["cv_mediana"].to_numpy(float), dec),
+                "MT_PARTICIPACION_MEDIA": np.round(r["participacion_media"].to_numpy(float), dec),
+                "MT_MARGEN_PCT": np.round(r["margen_pct"].to_numpy(float), dec),
+                "MT_VENTA_MEDIA_ENTIDAD": np.round(r["venta_media_entidad"].to_numpy(float), 2),
+                "MT_PROB_ADOPCION": np.round(r["prob_adopcion"].to_numpy(float), 6),
+                "BD_ORIGEN_PROB": r["origen_prob"].to_numpy(dtype=object),
+                "MT_DIAS_VENTANA": r["dias_ventana"].to_numpy(float),
+                "FECHA_CORTE": np.full(len(r), ayer)})
+        if cfg.guardar_matriz and len(matriz.tab):
+            t = matriz.tab
+            e = t["e"].to_numpy(np.int64)
+            venta = matriz.venta_entidad[e]
+            usd = t["usd"].to_numpy(float)
+            self.matriz_compras = pd.DataFrame({
+                **claves(ent=e, item=t["i"].to_numpy(np.int64)),
+                "BD_SEGMENTO": seg["segmento"].to_numpy(dtype=object)[e],
+                "MT_USD": np.round(usd, 2),
+                "MT_MARGEN": np.round(t["margen"].to_numpy(float), 2),
+                "MT_DIAS_COMPRA": t["dias"].to_numpy(float),
+                "FECHA_PRIMERA": fecha(t["primero"]), "FECHA_ULTIMA": fecha(t["ultimo"]),
+                "MT_INTERVALO_MEDIO": np.round(pd.to_numeric(t["intervalo_medio"], errors="coerce").to_numpy(float), 4),
+                "MT_INTERVALO_DESVIO": np.round(pd.to_numeric(t["intervalo_desvio"], errors="coerce").to_numpy(float), 4),
+                "MT_USD_ENTIDAD": np.round(venta, 2),
+                "MT_PARTICIPACION": np.round(np.where(venta > 0, usd / np.where(venta > 0, venta, 1.0), np.nan), 6),
+                "FECHA_CORTE": np.full(len(t), ayer)})
+        if cfg.guardar_curva:
+            c = tabla_curva(matriz, cfg)
+            if len(c):
+                self.curva = pd.DataFrame({
+                    **claves(item=c["i"].to_numpy(np.int64)),
+                    "BD_ALCANCE": c["alcance"].to_numpy(dtype=object),
+                    "MT_ATRASO": c["atraso"].to_numpy(float),
+                    "MT_CASOS": c["casos"].to_numpy(float),
+                    "MT_VOLVIERON": c["volvieron"].to_numpy(float),
+                    "MT_PROB": np.round(c["prob"].to_numpy(float), 4),
+                    "MT_HORIZONTE_DIAS": c["horizonte"].to_numpy(float),
+                    "MT_MIN_CASOS": c["min_casos"].to_numpy(float),
+                    "FECHA_CORTE": np.full(len(c), ayer)})
+        vec = [v for v in vecindarios if len(v)]
+        if vec:
+            v = pd.concat(vec, ignore_index=True)
+            self.vecindario = pd.DataFrame({
+                "BD_SEGMENTO": v["segmento"].to_numpy(dtype=object),
+                "BD_ALGORITMO": v["algoritmo"].to_numpy(dtype=object),
+                **claves(ent=v["entidad"].to_numpy(np.int64), par=v["par_entidad"].to_numpy(np.int64)),
+                "BD_GRUPO": v["grupo"].to_numpy(dtype=object),
+                "MT_ORDEN": v["orden"].to_numpy(float),
+                "MT_SIMILITUD": np.round(v["similitud"].to_numpy(float), dec),
+                "MT_TAMANO_GRUPO": v["tamano"].to_numpy(float),
+                "FECHA_CORTE": np.full(len(v), ayer)})
+        LOGGER.info("tablas para comprobar: referencia %s, matriz %s, curva %s, vecindario %s, pares "
+                    "comparables %s filas", f"{len(self.referencia):,}", f"{len(self.matriz_compras):,}",
+                    f"{len(self.curva):,}", f"{len(self.vecindario):,}", f"{len(self.pares_comparables):,}")
 
     def _probabilidad_adopcion(self) -> Tuple[Dict[str, Tuple[float, str]], Optional[Tuple[float, str]]]:
         """P(adopta) de una CRUZADA en el horizonte, por segmento, leída del backtest.
@@ -2357,6 +3210,8 @@ class RecEngine:
             "MT_INTERVALO_PAR": np.round(ev["intervalo_par"].to_numpy(float), 1),
             "MT_PARTICIPACION_PAR": np.round(ev["participacion_par"].to_numpy(float), dec),
             "MT_USD_PAR_TOTAL": np.round(ev["usd_par_total"].to_numpy(float), 2),
+            "FECHA_PRIMERA_ITEM_PAR": pd.to_datetime(ev["fecha_item_par"]).to_numpy(),
+            "FECHA_PRIMERA_REF_PAR": pd.to_datetime(ev["fecha_ref_par"]).to_numpy(),
             "BD_GRUPO": ev["grupo"].to_numpy(dtype=object),
             "MT_TAMANO_GRUPO": ev["tamano_grupo"].to_numpy(float),
             "MT_COMPRAN_EN_GRUPO": ev["compran_grupo"].to_numpy(float),
@@ -2365,7 +3220,7 @@ class RecEngine:
         })
         out = pd.DataFrame(salida)
         claves = [c.upper() for c in cfg.claves_entidad()]
-        return out.sort_values(claves + ["MT_RANKING", "MT_ORDEN"]).reset_index(drop=True)
+        return out          # ya viene por entidad, ranking y orden dentro de cada segmento
 
     def tiempos(self, top: int = 10) -> pd.Series:
         return pd.Series(self.tiempos_).sort_values(ascending=False).head(top)
@@ -2480,5 +3335,6 @@ def bloque_config(fila: pd.Series, cfg_base: RecConfig) -> str:
 
 
 __all__ = ["RecConfig", "RecEngine", "Fechas", "Panel", "Bloque", "Matriz", "ALGORITMOS",
-           "catalogo", "catalogo_evidencia", "backtest", "preparar", "asignar_segmentos",
+           "catalogo", "catalogo_evidencia", "catalogo_referencia", "catalogo_matriz", "catalogo_curva",
+           "catalogo_vecindario", "catalogo_pares_comparables", "completar_detalle", "backtest", "preparar", "asignar_segmentos",
            "construir_algoritmo", "TIPOS", "EVIDENCIAS", "explorar", "bloque_config", "agregar_tamano"]

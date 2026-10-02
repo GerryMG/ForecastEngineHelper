@@ -48,6 +48,7 @@ Variables de entorno: `ST_MODO`, `ST_RELEER_MESES`, `ST_RELEER_DESDE`, `ST_FECHA
 | `SQL_FUENTE` | la consulta, con `:desde` y `:hasta` |
 | `TABLA_DESTINO`, `TABLA_DIAGNOSTICO`, `GUARDAR_DIAGNOSTICO` | dónde escribe |
 | `TABLA_EVIDENCIA`, `GUARDAR_EVIDENCIA` | con quién se comparó cada recomendación (ver abajo) |
+| `TABLA_REFERENCIA`, `TABLA_MATRIZ`, `TABLA_CURVA`, `TABLA_VECINDARIO` y sus `GUARDAR_...` | las tablas para comprobar cualquier número (ver abajo) |
 
 ### Cómo se mide la afinidad
 
@@ -79,12 +80,17 @@ Variables de entorno: `ST_MODO`, `ST_RELEER_MESES`, `ST_RELEER_DESDE`, `ST_FECHA
 | `MIN_ENTIDADES_SEGMENTO` | menos que esto y el segmento sube de nivel | 200 |
 | `MIN_SOPORTE`, `MIN_PENETRACION` | cuántas entidades del segmento tienen que comprar el ítem | 5 / 2% |
 | `MAX_ITEMS_RECO` | recomendaciones por entidad | 10 |
-| `ALGORITMOS` | la batería que se mide | los 6 |
+| `ALGORITMOS` | la batería que se mide | los 9 |
 | `SELECCION` | `backtest` (gana el mejor por segmento), `rrf`, `ponderado`, o el nombre de uno | `backtest` |
 | `METRICA_SELECCION` | `precision`, `usd` o `recall` | `precision` |
 | `TIPOS_RECOMENDACION` | CRUZADA, REPOSICION, BRECHA | las tres |
 | `FACTOR_REPOSICION` | silencio mayor a esto × su intervalo típico = atrasado | 1,5 |
-| `BRECHA_RATIO` | compra menos de esta fracción de lo que le dedican sus pares | 0,5 |
+| `BRECHA_RATIO` | compra menos de esta fracción de lo que le dedican sus pares comparables | 0,5 |
+| `PARES_COMPARABLES` | con cuántos se compara una BRECHA: los compradores del ítem de tamaño más parecido, todos listados en la evidencia | 30 |
+| `MIN_PARES_COMPARABLES` | con menos no hay BRECHA | 5 |
+| `ESTADISTICO_PARES` | `mediana` (no la mueven los extremos), `agregado` (USD del ítem / USD total de todos ellos) o `media` (la inflan los chicos) | mediana |
+| `LAMBDA_EASE`, `MAX_ITEMS_EASE` | regularización y tope de ítems de `ease` | 0,5 / 4.000 |
+| `DIAS_TENDENCIA` | qué tan reciente es una adopción para `tendencia` | 90 |
 
 ### Cómo se estima el valor
 
@@ -125,18 +131,27 @@ que mejor lo explica.
 | Perilla | Qué hace | Default |
 |---|---|---|
 | `GUARDAR_EVIDENCIA` | escribe `TABLA_EVIDENCIA`. `False` = ni se la pide ni se la toca | True |
-| `TABLA_EVIDENCIA` | la tabla nueva (las otras dos no cambian) | `REC_EVIDENCIA` |
-| `MAX_EVIDENCIAS` | pares (o ítems) listados por recomendación y por clase de evidencia. Los totales van siempre completos | 5 |
+| `TABLA_EVIDENCIA` | una fila por cosa que sostiene cada recomendación | `REC_EVIDENCIA` |
+| `MAX_EVIDENCIAS` | ejemplos (pares o ítems) por recomendación y por clase. Los totales van siempre completos, y las listas completas en las tablas de abajo | 3 |
 | `EVIDENCIA_HASTA_RANKING` | evidencia sólo para las primeras N de cada entidad. 0 = todas | 0 |
 
 `BD_MOTIVO` dice "12 de sus pares más parecidos lo compran"; la evidencia dice **cuáles**. Se une
 con `TABLA_DESTINO` por entidad + ítem, y cada recomendación trae:
 
-- **`CALCULO`** (`MT_ORDEN = 0`): el USD en juego desarmado. Por ejemplo: *"No lo compra. En su
-  segmento lo compran 215 de 375 entidades (57,3%). Un comprador gasta 185 por compra y compra cada
-  32 días: en 90 días son 2,8 compras, 514. Su compra es 0,87 veces la del cliente medio: 447.
-  Probabilidad de adopción 5,5% (lo que acertó coseno_entidad en el backtest del segmento): 24,6
-  esperados."* Si se aplicó un tope, lo dice.
+- **`CALCULO`** (`MT_ORDEN = 0`): el USD en juego desarmado, cada número con de quiénes sale. Un
+  ejemplo real de REPOSICION:
+
+  > Lo compró 8 veces, cada 33 días en promedio; lleva 92 días sin comprar. En su segmento lo compran
+  > cada 46 días (mediana de 78 compradores con ritmo). Intervalo estimado: (7 x 33.00 + 3 x 45.92) /
+  > (7 + 3) = 36.88: lo suyo pesa 7 (sus intervalos) y lo del segmento 3. Ticket: el suyo 24.14 (USD
+  > 193 / 8 compras); el del ítem en el segmento 133 por compra (USD 75,698 / 570 días de compra de sus
+  > 85 compradores en el segmento), ajustado a su tamaño x0.33 = 44.27. Ticket estimado: (8 x 24.14 +
+  > 3 x 44.27) / (8 + 3) = 29.63. En 90 días: 2.4 compras, 72.31. Tope: no más de 1 vez lo que él mismo
+  > compra de este ítem en 90 días, 47.61. Lleva 2.5 veces su intervalo sin comprar. De los que llegaron
+  > a ese atraso, cuántos volvieron a comprar dentro de 90 días: a 2 veces, 204 de 218 casos de este
+  > ítem (94%); a 3 veces, 57 de 67 (85%). Interpolando entre 2 y 3 veces: 89%: 47.61 x 0.893695 =
+  > 42.55 esperados.
+
 - La evidencia de su tipo:
 
 | Quién la produjo | `BD_EVIDENCIA` | Qué lista |
@@ -147,13 +162,15 @@ con `TABLA_DESTINO` por entidad + ítem, y cada recomendación trae:
 | `coseno_item` | `ITEM_AFIN` + `CO_COMPRADOR` | lo que ya compra y se compra con el recomendado, y quiénes compran los dos |
 | `reglas` | `REGLA` + `CO_COMPRADOR` | las reglas que le aplican (confianza, lift) y quiénes las cumplen |
 | `svd` | `FACTOR_LATENTE` + `CO_COMPRADOR` | lo que ya compra y va con el recomendado en el patrón de consumo |
-| `rrf` / `ponderado` | la de cada uno | cada algoritmo de la batería deja la suya |
-| REPOSICION | `PAR_RITMO` | pares que lo compran con ritmo: cada cuántos días y por cuánto |
-| BRECHA | `PAR_PARTICIPACION` | pares de tamaño parecido y qué parte de su compra le dedican |
+| `ease` | `ITEM_EASE` + `CO_COMPRADOR` | lo que ya compra y su peso en el modelo EASE |
+| `secuencia` | `SECUENCIA` + `ADOPTANTE` | las reglas "compró A y después B" y quiénes la hicieron, con las dos fechas |
+| `tendencia` | `ADOPTANTE_RECIENTE` | quiénes empezaron a comprarlo hace poco, con la fecha |
+| `rrf` / `ponderado` | la de cada uno | cada algoritmo deja la suya; el motivo dice cuál aportó más |
+| REPOSICION | `PAR_RITMO` | **ejemplos** de compradores con ritmo; el ritmo del segmento sale de todos (`REC_REFERENCIA`) |
+| BRECHA | `PAR_PARTICIPACION` | los 3 pares comparables más parecidos; **todos** (30) están en `REC_PARES_COMPARABLES` |
 
-Cada par trae lo que compró del ítem en la ventana (`MT_USD_PAR_ITEM`, `MT_DIAS_PAR_ITEM`), así se
-comprueba contra la fuente. Los totales (`MT_TAMANO_GRUPO`, `MT_COMPRAN_EN_GRUPO`) son los de todo el
-grupo aunque se listen 5. Para explicar una recomendación:
+Cada par trae lo que compró del ítem en la ventana (`MT_USD_PAR_ITEM`, `MT_DIAS_PAR_ITEM`,
+`FECHA_PRIMERA_ITEM_PAR`). Para explicar una recomendación:
 
 ```sql
 SELECT MT_ORDEN, BD_EVIDENCIA, PAR_SK_CLIENTE, REF_BK_SUBMARCA, BD_DETALLE
@@ -162,11 +179,58 @@ SELECT MT_ORDEN, BD_EVIDENCIA, PAR_SK_CLIENTE, REF_BK_SUBMARCA, BD_DETALLE
  ORDER BY MT_ORDEN;
 ```
 
-La evidencia lee las recomendaciones, no las cambia: con y sin ella el motor da exactamente lo mismo.
-Volumen: unas 7 filas por recomendación (11 en `coseno_item`, `reglas` y `svd`, que suman los
-co-compradores). Medido con 60.000 clientes y 600.000 recomendaciones: de 4 a 6,4 millones de filas,
-entre 50 y 65 segundos más, y de 3,5 a 5,5 GB más de memoria durante la corrida. Si el pod queda
-justo, `EVIDENCIA_HASTA_RANKING = 3` la deja en menos de un tercio.
+### Cada número, comprobable
+
+Todo número que dice un motivo o un cálculo nombra de quiénes sale, y esos datos están en una tabla:
+
+| Tabla | Qué tiene | Perilla |
+|---|---|---|
+| `REC_REFERENCIA` | cada ítem en cada segmento: compradores, USD y días sumados, ticket, ritmo (mediana y de cuántos), probabilidad de adopción y de dónde sale | `GUARDAR_REFERENCIA` |
+| `REC_MATRIZ` | lo que compró cada entidad de cada ítem en la ventana: USD, días, primera y última compra, intervalo, participación | `GUARDAR_MATRIZ` |
+| `REC_CURVA_RECUPERACION` | por ítem y para todo el panel: de los que llegaron a 1, 1,5, 2… veces su intervalo, cuántos volvieron | `GUARDAR_CURVA` |
+| `REC_VECINDARIO` | los vecinos de cada entidad (coseno_entidad) y su grupo de k-means | `GUARDAR_VECINDARIO` |
+| `REC_PARES_COMPARABLES` | los 30 pares de cada BRECHA, con lo que compró cada uno: su mediana es el número del motivo (requiere `GUARDAR_EVIDENCIA`) | `GUARDAR_PARES_COMPARABLES` |
+
+| El texto dice | Se comprueba con |
+|---|---|
+| "sus 30 pares de tamaño parecido le dedican 5,4% (mediana)" | sus 30 filas en `REC_PARES_COMPARABLES` |
+| "N de sus pares más parecidos lo compran" | `REC_VECINDARIO` + `REC_MATRIZ` |
+| "en su grupo de gasto (k-means #3, 120 pares) lo compran 40%" | `REC_VECINDARIO` + `REC_MATRIZ` |
+| "ticket 165 (USD … / … días de compra de sus 142 compradores)" | `REC_REFERENCIA`, que es la suma de `REC_MATRIZ` |
+| "cada 37 días (mediana de 133 compradores con ritmo)" | mediana de `MT_INTERVALO_MEDIO` en `REC_MATRIZ` |
+| "de los que llegaron a 2 veces, 61 de 100 volvieron" | `REC_CURVA_RECUPERACION` |
+| "probabilidad de adopción 5,2%" | `REC_DIAGNOSTICO` y `REC_REFERENCIA` |
+
+Una prueba recalcula desde la fuente, sin usar el motor, cada número de los motivos y cálculos de los
+9 algoritmos y los 3 tipos: todos coinciden.
+
+**La BRECHA cambió.** Antes comparaba contra el promedio simple de la participación de *todos* los
+compradores del segmento: no se sabía contra quiénes y los clientes chicos (a los que un ítem les pesa
+mucho) lo inflaban. En un caso de prueba el motivo decía 11,3% cuando sus pares reales le dedicaban
+5,4%. Ahora compara contra los `PARES_COMPARABLES` compradores de tamaño más parecido, con la mediana.
+
+### Algoritmos nuevos
+
+| Algoritmo | Qué hace | Cuándo gana |
+|---|---|---|
+| `ease` | modelo lineal ítem a ítem (Steck, 2019): cuánto empuja cada ítem propio al candidato, descontando lo que explican los demás | compite con los mejores casi siempre; en la prueba de gustos mezclados quedó 3º a 0,3 puntos del mejor |
+| `secuencia` | de los que compraron A, cuántos compraron B **después** (fechas de primera compra) | cuando hay un orden: equipo y repuesto, básico y premium. En la prueba: 46,8% de precisión contra 7,1% del resto |
+| `tendencia` | de los que no lo compraban, cuántos empezaron en los últimos `DIAS_TENDENCIA` días | lanzamientos. En la prueba ganó igual `secuencia`; queda en la batería y el backtest decide |
+
+### Volumen
+
+Medido con 60.000 clientes, 1.500 ítems y 600.000 recomendaciones (memoria del proceso, por encima
+de lo que ya usa el motor):
+
+| Configuración | Tiempo | Pico de memoria | Filas |
+|---|---|---|---|
+| sin evidencia ni tablas | 58 s | 1,7 GB | — |
+| todo, para las 10 de cada cliente | 118 s | 6,0 GB | evidencia 5,4 M, pares comparables 6,8 M, matriz 1,1 M, vecindario 0,4 M |
+| todo, `EVIDENCIA_HASTA_RANKING = 3` | 80 s | 2,8 GB | evidencia 1,6 M |
+
+El texto de cada par (`BD_DETALLE`) no se guarda en memoria: se arma al escribir, de a lotes. Si el
+pod queda justo, `EVIDENCIA_HASTA_RANKING = 3` es lo primero; después, apagar `GUARDAR_MATRIZ` (los
+números se pueden rehacer igual desde la fuente con SQL).
 
 Variables de entorno: `RC_FECHA_EJECUCION`, `RC_SELECCION`, `RC_DRY_RUN`.
 Para calibrar: `RC_NIVELES` y `RC_REJILLA` (JSON) en `calibrar_recomendaciones.ipynb`.

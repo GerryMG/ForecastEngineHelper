@@ -31,7 +31,8 @@ import pandas as pd
 import oracledb
 
 import rec_engine
-from rec_engine import RecConfig, RecEngine, Fechas, catalogo, catalogo_evidencia
+from rec_engine import (RecConfig, RecEngine, Fechas, catalogo, catalogo_evidencia, catalogo_referencia,
+                        catalogo_matriz, catalogo_curva, catalogo_vecindario, catalogo_pares_comparables)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  1. CONEXIONES  (origen y destino son distintos)
@@ -97,10 +98,28 @@ GUARDAR_EVIDENCIA = True
 # Pares (o ítems) que se listan por recomendación y por clase de evidencia. Los totales
 # (de cuántos, cuántos lo compran) van siempre completos. Con 5, son unas 6 a 11 filas por
 # recomendación.
-MAX_EVIDENCIAS = 5
+MAX_EVIDENCIAS = 3
 # Evidencia sólo para las primeras N de cada entidad (0 = todas). Con 3, la tabla queda en
 # menos de un tercio.
 EVIDENCIA_HASTA_RANKING = 0
+
+# ── Tablas para comprobar cualquier número ─────────────────────────────────
+# Con estas, todo lo que dice un motivo o un cálculo se rehace en SQL:
+#   REFERENCIA : un ítem en un segmento (compradores, ticket, ritmo, probabilidad de adopción...)
+#   MATRIZ     : lo que compró cada entidad de cada ítem en la ventana (USD, días, fechas,
+#                intervalo, participación). Es la más grande: una fila por par comprado.
+#   CURVA      : la curva de recuperación con sus casos y vueltas (la probabilidad de recompra)
+#   VECINDARIO : los vecinos de cada entidad (coseno_entidad) y su grupo de k-means
+TABLA_REFERENCIA = "REC_REFERENCIA"
+TABLA_MATRIZ = "REC_MATRIZ"
+TABLA_CURVA = "REC_CURVA_RECUPERACION"
+TABLA_VECINDARIO = "REC_VECINDARIO"
+TABLA_PARES_COMPARABLES = "REC_PARES_COMPARABLES"   # todos los pares de cada BRECHA (30 por brecha)
+GUARDAR_REFERENCIA = True
+GUARDAR_MATRIZ = True
+GUARDAR_CURVA = True
+GUARDAR_VECINDARIO = True
+GUARDAR_PARES_COMPARABLES = True
 
 # "delete"   : DELETE + INSERT en una transacción. Si algo falla, la tabla queda como estaba.
 # "truncate" : TRUNCATE + INSERT. Más rápido, pero si el INSERT falla la tabla queda VACÍA.
@@ -172,7 +191,8 @@ MAX_DECIMALES = 6       # hasta cuántos decimales busca esa escala; más allá,
 TOLERANCIA_CERO = 1e-9
 
 # La batería. Se miden todas con backtest y gana la mejor en cada segmento.
-ALGORITMOS = ("popularidad", "coseno_item", "coseno_entidad", "svd", "kmeans_valor", "reglas")
+ALGORITMOS = ("popularidad", "coseno_item", "coseno_entidad", "svd", "kmeans_valor", "reglas",
+              "ease", "secuencia", "tendencia")
 SELECCION = "backtest"         # backtest | rrf | ponderado | el nombre de un algoritmo
 METRICA_SELECCION = "precision"     # precision | usd | recall
 PESOS: dict = {}               # sólo para seleccion="ponderado", por ejemplo {"coseno_item": 2}
@@ -180,6 +200,18 @@ PESOS: dict = {}               # sólo para seleccion="ponderado", por ejemplo {
 TIPOS_RECOMENDACION = ("CRUZADA", "REPOSICION", "BRECHA")
 FACTOR_REPOSICION = 1.5        # silencio mayor a esto x su intervalo típico = atrasado
 BRECHA_RATIO = 0.5             # compra menos de la mitad de lo que le dedican sus pares
+# Con quién se compara una BRECHA: los N compradores del ítem en el segmento de tamaño más
+# parecido. Se listan TODOS en la evidencia: el número del motivo se rehace con ellos.
+PARES_COMPARABLES = 30
+MIN_PARES_COMPARABLES = 5      # con menos no hay con qué comparar y no se recomienda
+# Cómo se resume lo que le dedican: "mediana" (no la mueven los extremos), "agregado" (USD del
+# ítem / USD total de todos ellos) o "media" (promedio simple: la inflan los clientes chicos).
+ESTADISTICO_PARES = "mediana"
+
+# ── Algoritmos nuevos ──────────────────────────────────────────────────────
+LAMBDA_EASE = 0.5              # regularización de EASE (más alto = más parecido a la popularidad)
+MAX_ITEMS_EASE = 4000          # EASE invierte una matriz ítem x ítem: tope de ítems activos
+DIAS_TENDENCIA = 90            # "tendencia": qué tan reciente es una adopción
 
 # ── Cómo se estima el valor ────────────────────────────────────────────────
 # Los tres tipos se miden igual: USD esperados en los próximos HORIZONTE_DIAS. Así el
@@ -253,6 +285,12 @@ def build_config(fecha_ejecucion: str | None = None, seleccion: str | None = Non
         incluir_tipos=TIPOS_RECOMENDACION,
         factor_reposicion=FACTOR_REPOSICION,
         brecha_ratio=BRECHA_RATIO,
+        pares_comparables=PARES_COMPARABLES,
+        min_pares_comparables=MIN_PARES_COMPARABLES,
+        estadistico_pares=ESTADISTICO_PARES,
+        lambda_ease=LAMBDA_EASE,
+        max_items_ease=MAX_ITEMS_EASE,
+        dias_tendencia=DIAS_TENDENCIA,
         min_compras_reposicion=MIN_COMPRAS_REPOSICION,
         max_cv_intervalo=MAX_CV_INTERVALO,
         min_dias_compra_entidad=MIN_DIAS_COMPRA_ENTIDAD,
@@ -267,6 +305,10 @@ def build_config(fecha_ejecucion: str | None = None, seleccion: str | None = Non
         tope_potencial_relativo=TOPE_POTENCIAL_RELATIVO,
 
         guardar_evidencia=GUARDAR_EVIDENCIA,
+        guardar_referencia=GUARDAR_REFERENCIA,
+        guardar_matriz=GUARDAR_MATRIZ,
+        guardar_curva=GUARDAR_CURVA,
+        guardar_vecindario=GUARDAR_VECINDARIO,
         max_evidencias=MAX_EVIDENCIAS,
         evidencia_hasta_ranking=EVIDENCIA_HASTA_RANKING,
     )
@@ -397,17 +439,46 @@ def columnas_destino(cfg: RecConfig) -> List[Tuple[str, str, str]]:
     return salida + COLUMNAS_CONTROL
 
 
-def columnas_evidencia(cfg: RecConfig) -> List[Tuple[str, str, str]]:
-    """Columnas de TABLA_EVIDENCIA. Las del par (PAR_) y del ítem de referencia (REF_)
-    tienen el mismo tipo que la columna de la que salen."""
+def _con_tipos(cfg: RecConfig, cols: List[Tuple[str, str, str]]) -> List[Tuple[str, str, str]]:
+    """Las columnas de entidad e ítem (y las del par, PAR_, y la referencia, REF_) llevan el
+    tipo de la columna de la que salen; se agregan las de control."""
     propias = {c.upper(): c for c in list(cfg.entidad) + list(cfg.item)}
     salida = []
-    for c, t, d in catalogo_evidencia(cfg):
+    for c, t, d in cols:
         base = c[4:] if c.startswith(("PAR_", "REF_")) and c[4:] in propias else c
         if base in propias:
             t = tipo_categoria(base)
         salida.append((c, t, d))
     return salida + COLUMNAS_CONTROL
+
+
+def columnas_evidencia(cfg: RecConfig) -> List[Tuple[str, str, str]]:
+    return _con_tipos(cfg, catalogo_evidencia(cfg))
+
+
+#: tabla -> (de dónde sale en el motor, catálogo, se guarda, comentario)
+def _soporte(cfg: RecConfig) -> List[Tuple[str, str, List[Tuple[str, str, str]], bool, str]]:
+    return [
+        (TABLA_EVIDENCIA, "evidencia", columnas_evidencia(cfg), GUARDAR_EVIDENCIA,
+         f"Evidencia de cada recomendación de {TABLA_DESTINO}: con qué pares, grupos, ítems o reglas se la "
+         f"comparó y cómo se calculó el USD en juego. Se une por entidad e ítem. Se reemplaza completa."),
+        (TABLA_REFERENCIA, "referencia", _con_tipos(cfg, catalogo_referencia(cfg)), GUARDAR_REFERENCIA,
+         "Cada ítem en cada segmento: compradores, ticket, ritmo, participación y probabilidad de adopción "
+         "que usan los cálculos, con sus componentes. Se reemplaza completa."),
+        (TABLA_MATRIZ, "matriz_compras", _con_tipos(cfg, catalogo_matriz(cfg)), GUARDAR_MATRIZ,
+         "Lo que compró cada entidad de cada ítem en la ventana de afinidad: con ella se rehace en SQL "
+         "cualquier número de un segmento. Se reemplaza completa."),
+        (TABLA_CURVA, "curva", _con_tipos(cfg, catalogo_curva(cfg)), GUARDAR_CURVA,
+         "Curva de recuperación: de los que llegaron a cada nivel de atraso, cuántos volvieron a comprar. "
+         "De acá sale la probabilidad de recompra. Se reemplaza completa."),
+        (TABLA_PARES_COMPARABLES, "pares_comparables", _con_tipos(cfg, catalogo_pares_comparables(cfg)),
+         GUARDAR_PARES_COMPARABLES,
+         "Todos los pares con los que se comparó cada BRECHA: la mediana de su participación es el número del "
+         "motivo. Se une con las recomendaciones por entidad e ítem. Se reemplaza completa."),
+        (TABLA_VECINDARIO, "vecindario", _con_tipos(cfg, catalogo_vecindario(cfg)), GUARDAR_VECINDARIO,
+         "Con quién se agrupó a cada entidad: sus vecinos (coseno_entidad) y su grupo (kmeans_valor). "
+         "Se reemplaza completa."),
+    ]
 
 
 def _tablas(cfg: RecConfig) -> List[Tuple[str, List[Tuple[str, str, str]], str]]:
@@ -417,11 +488,7 @@ def _tablas(cfg: RecConfig) -> List[Tuple[str, List[Tuple[str, str, str]], str]]
     if GUARDAR_DIAGNOSTICO:
         out.append((TABLA_DIAGNOSTICO, COLUMNAS_DIAGNOSTICO,
                     "Backtest: qué algoritmo acertó más en cada segmento. Se reemplaza completa."))
-    if GUARDAR_EVIDENCIA:
-        out.append((TABLA_EVIDENCIA, columnas_evidencia(cfg),
-                    f"Evidencia de cada recomendación de {TABLA_DESTINO}: con qué pares, grupos, ítems o "
-                    f"reglas se la comparó y cómo se calculó el USD en juego. Se une por entidad e ítem. "
-                    f"Se reemplaza completa."))
+    out += [(tabla, cols, comentario) for tabla, _, cols, guardar_, comentario in _soporte(cfg) if guardar_]
     return out
 
 
@@ -544,7 +611,8 @@ def _a_python(arr: np.ndarray, tipo_completo: str) -> list:
         o[~np.isfinite(a)] = None
         return o.tolist()
     if tipo == "DATE":
-        return list(pd.DatetimeIndex(arr).to_pydatetime())
+        fechas = pd.DatetimeIndex(arr)
+        return [None if pd.isna(x) else x for x in fechas.to_pydatetime()]
     return [None if (x is None or (isinstance(x, float) and np.isnan(x))) else str(x) for x in arr]
 
 
@@ -557,7 +625,11 @@ def _tipo_bind(tipo_completo: str):
     return oracledb.DB_TYPE_VARCHAR
 
 
-def _escribir(conn, tabla: str, df: pd.DataFrame, cols: List[Tuple[str, str, str]]) -> int:
+def _escribir(conn, tabla: str, df: pd.DataFrame, cols: List[Tuple[str, str, str]],
+              preparar_lote=None) -> int:
+    """DELETE (o TRUNCATE) + INSERT de a lotes. Cada lote se convierte recién cuando se manda,
+    así una tabla de millones de filas no se duplica en memoria; `preparar_lote` completa lo
+    que se arma al vuelo (el texto de la evidencia)."""
     nombres = [c for c, _, _ in cols if c != "FECHA_CARGA"]
     tipos = [t for c, t, _ in cols if c != "FECHA_CARGA"]
     faltan = [c for c in nombres if c not in df.columns]
@@ -565,7 +637,6 @@ def _escribir(conn, tabla: str, df: pd.DataFrame, cols: List[Tuple[str, str, str
         raise KeyError(f"El resultado no tiene las columnas {faltan} para {tabla}")
     sql = (f"INSERT INTO {tabla} ({', '.join(nombres)}, FECHA_CARGA)\n"
            f"VALUES ({', '.join(f':{i + 1}' for i in range(len(nombres)))}, SYSDATE)")
-    datos = [df[c].to_numpy() for c in nombres]
     with conn.cursor() as cur:
         if MODO_CARGA == "truncate":
             cur.execute(f"TRUNCATE TABLE {tabla}")
@@ -576,9 +647,19 @@ def _escribir(conn, tabla: str, df: pd.DataFrame, cols: List[Tuple[str, str, str
     with conn.cursor() as cur:
         cur.setinputsizes(*[_tipo_bind(t) for t in tipos])
         for i in range(0, len(df), BATCH_ROWS):
-            lote = [_a_python(a[i:i + BATCH_ROWS], t) for a, t in zip(datos, tipos)]
+            parte = df.iloc[i:i + BATCH_ROWS]
+            if preparar_lote is not None:
+                parte = preparar_lote(parte)
+            lote = [_a_python(_valores(parte[c]), t) for c, t in zip(nombres, tipos)]
             cur.executemany(sql, list(zip(*lote)))
     return len(df)
+
+
+def _valores(serie: pd.Series) -> np.ndarray:
+    """Los valores de una columna como los entiende _a_python (las categorías, como objetos)."""
+    if isinstance(serie.dtype, pd.CategoricalDtype):
+        return serie.astype(object).to_numpy()
+    return serie.to_numpy()
 
 
 def anotar(df: pd.DataFrame, cfg: RecConfig) -> pd.DataFrame:
@@ -613,15 +694,23 @@ def preparar_diagnostico(diag: pd.DataFrame, cfg: RecConfig) -> pd.DataFrame:
     })
 
 
-def preparar_evidencia(evidencia: Optional[pd.DataFrame], cfg: RecConfig) -> pd.DataFrame:
-    """La evidencia del motor, con la huella de la configuración."""
-    if evidencia is None or evidencia.empty:
-        return pd.DataFrame(columns=[c for c, _, _ in columnas_evidencia(cfg) if c != "FECHA_CARGA"])
-    return anotar(evidencia, cfg)
+def preparar_soporte(motor: RecEngine, cfg: RecConfig) -> dict:
+    """Las tablas de evidencia y para comprobar, listas para escribir: {tabla: DataFrame}."""
+    out = {}
+    for tabla, atributo, cols, guardar_, _ in _soporte(cfg):
+        if not guardar_:
+            continue
+        t = getattr(motor, atributo, None)
+        if t is None or t.empty:
+            t = pd.DataFrame(columns=[c for c, _, _ in cols if c != "FECHA_CARGA"])
+        # sin copiar: la evidencia puede tener millones de filas
+        t["HUELLA_CONFIG"] = pd.Categorical([huella_config(cfg)] * len(t)) if len(t) else []
+        out[tabla] = t
+    return out
 
 
 def guardar(conn, df: pd.DataFrame, cfg: RecConfig, diagnostico: Optional[pd.DataFrame] = None,
-            evidencia: Optional[pd.DataFrame] = None) -> int:
+            soporte: Optional[dict] = None) -> int:
     """Reemplaza las tablas en una sola transacción: si algo falla, quedan como estaban."""
     _exigir(conn, "destino", f"guardar() en {TABLA_DESTINO}")
     if df.empty:
@@ -632,11 +721,14 @@ def guardar(conn, df: pd.DataFrame, cfg: RecConfig, diagnostico: Optional[pd.Dat
         n = _escribir(conn, TABLA_DESTINO, df, columnas_destino(cfg))
         if GUARDAR_DIAGNOSTICO and diagnostico is not None and len(diagnostico):
             _escribir(conn, TABLA_DIAGNOSTICO, diagnostico, COLUMNAS_DIAGNOSTICO)
-        if GUARDAR_EVIDENCIA and evidencia is not None:
-            # se escribe aunque venga vacía: la evidencia vieja no puede quedar colgada
-            # de recomendaciones que ya no existen
-            n_ev = _escribir(conn, TABLA_EVIDENCIA, evidencia, columnas_evidencia(cfg))
-            log.info("insertadas %s filas en %s", f"{n_ev:,}", TABLA_EVIDENCIA)
+        for tabla, _, cols, guardar_, _ in _soporte(cfg):
+            # se escriben aunque vengan vacías: lo viejo no puede quedar colgado de
+            # recomendaciones que ya no existen
+            if guardar_ and soporte is not None and tabla in soporte:
+                completar = ((lambda lote: rec_engine.completar_detalle(lote, cfg))
+                             if tabla == TABLA_EVIDENCIA else None)
+                n_t = _escribir(conn, tabla, soporte[tabla], cols, completar)
+                log.info("insertadas %s filas en %s", f"{n_t:,}", tabla)
         conn.commit()
     except Exception:
         conn.rollback()
