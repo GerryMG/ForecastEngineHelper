@@ -83,6 +83,9 @@ Variables de entorno: `ST_MODO`, `ST_RELEER_MESES`, `ST_RELEER_DESDE`, `ST_FECHA
 | `ALGORITMOS` | la batería que se mide | los 9 |
 | `SELECCION` | `backtest` (gana el mejor por segmento), `rrf`, `ponderado`, o el nombre de uno | `backtest` |
 | `METRICA_SELECCION` | `precision`, `usd` o `recall` | `precision` |
+| `K_VECINOS`, `K_FACTORES`, `K_CLUSTERS` | vecinos de `coseno_entidad`, factores de `svd`, grupos de `kmeans_valor` | 50 / 32 / 8 |
+| `MIN_ADOPCIONES_BACKTEST` | menos adopciones que esto y el segmento usa el ganador del panel | 30 |
+| `SEMILLA`, `FILAS_BLOQUE`, `DECIMALES` | azar fijo de svd y kmeans; entidades por bloque; decimales en las tablas | 0 / 2048 / 4 |
 | `TIPOS_RECOMENDACION` | CRUZADA, REPOSICION, BRECHA | las tres |
 | `FACTOR_REPOSICION` | silencio mayor a esto × su intervalo típico = atrasado | 1,5 |
 | `BRECHA_RATIO` | compra menos de esta fracción de lo que le dedican sus pares comparables | 0,5 |
@@ -116,6 +119,7 @@ Los tres tipos se miden igual: **USD esperados en los próximos `HORIZONTE_DIAS`
 | `MIN_DIAS_COMPRA_ENTIDAD` | días de compra de la entidad para recomendarle algo | 3 |
 | `TOPE_POTENCIAL_POR_HISTORICO` | veces el propio ritmo de compra del ítem. `0` = sin tope | 1,5 |
 | `TOPE_POTENCIAL_RELATIVO` | veces su compra total en el mismo lapso. `0` = sin tope | 1,0 |
+| `ESCALAR_POTENCIAL`, `TOPE_ESCALA` | ajustar el USD por el tamaño del cliente frente al segmento, y entre qué veces | True / 3,0 |
 | `MIN_BASE_PORCENTAJE` | base mínima para calcular un porcentaje (ver abajo) | 1,0 |
 | `SUMA_EXACTA`, `MAX_DECIMALES`, `TOLERANCIA_CERO` | cómo se suma el dinero (ver abajo) | True / 6 / 1e-9 |
 
@@ -133,7 +137,7 @@ que mejor lo explica.
 | `GUARDAR_EVIDENCIA` | escribe `TABLA_EVIDENCIA`. `False` = ni se la pide ni se la toca | True |
 | `TABLA_EVIDENCIA` | una fila por cosa que sostiene cada recomendación | `REC_EVIDENCIA` |
 | `MAX_EVIDENCIAS` | ejemplos (pares o ítems) por recomendación y por clase. Los totales van siempre completos, y las listas completas en las tablas de abajo | 3 |
-| `EVIDENCIA_HASTA_RANKING` | evidencia sólo para las primeras N de cada entidad. 0 = todas | 0 |
+| `EVIDENCIA_HASTA_RANKING` | evidencia (y pares comparables) sólo para las primeras N de cada entidad. 0 = todas | 0 |
 
 `BD_MOTIVO` dice "12 de sus pares más parecidos lo compran"; la evidencia dice **cuáles**. Se une
 con `TABLA_DESTINO` por entidad + ítem, y cada recomendación trae:
@@ -233,7 +237,10 @@ pod queda justo, `EVIDENCIA_HASTA_RANKING = 3` es lo primero; después, apagar `
 números se pueden rehacer igual desde la fuente con SQL).
 
 Variables de entorno: `RC_FECHA_EJECUCION`, `RC_SELECCION`, `RC_DRY_RUN`.
-Para calibrar: `RC_NIVELES` y `RC_REJILLA` (JSON) en `calibrar_recomendaciones.ipynb`.
+Para calibrar: `RC_NIVELES` y `RC_REJILLA` (JSON) en `calibrar_recomendaciones.ipynb`. El bloque para pegar trae
+todo lo que se barrió en la rejilla y nada más, y el notebook avisa si algún parámetro no tendría efecto
+en `rec_oracle.py`. El backtest mide las CRUZADAS: las perillas de REPOSICION y BRECHA no cambian su
+resultado. Si calibraste antes de los algoritmos nuevos, volvé a calibrar.
 
 ---
 

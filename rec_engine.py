@@ -388,9 +388,12 @@ def _codificar(df: pd.DataFrame, columnas: Sequence[str]) -> Tuple[np.ndarray, p
     if len(columnas) == 1:
         codigos, valores = pd.factorize(df[columnas[0]], sort=True)
         return codigos.astype(np.int64), pd.DataFrame({columnas[0]: valores})
-    idx = pd.MultiIndex.from_frame(df[columnas])
-    codigos, valores = pd.factorize(idx, sort=True)
-    return codigos.astype(np.int64), valores.to_frame(index=False)[columnas]
+    # por grupos y no factorizando un MultiIndex: en pandas 3 eso pierde los nombres de las
+    # columnas y una clave de dos columnas (empresa + cliente) no corría
+    grupos = df.groupby(columnas, sort=True, dropna=False)
+    codigos = grupos.ngroup().to_numpy(np.int64)
+    valores = grupos.size().reset_index()[columnas]
+    return codigos, valores
 
 
 def _ultimo_valor(df: pd.DataFrame, codigos: np.ndarray, n: int,
@@ -1244,13 +1247,15 @@ class Secuencia(Algoritmo):
         pen = soporte / max(b.n, 1)
         lift = conf / np.where(pen[antes.indices] > 0, pen[antes.indices], 1.0)
         sirve = (lift > 1.0) & (antes.data >= max(int(self.cfg.min_soporte), 1))
-        # copias: eliminate_zeros compacta los índices EN EL LUGAR y si se comparten con
-        # `antes` la deja desalineada
-        self.C = sp.csr_matrix((np.where(sirve, conf, 0.0), antes.indices.copy(), antes.indptr.copy()),
-                               shape=antes.shape)
+        # copias de `antes` con otros valores: misma estructura y mismos tipos de índice (armarlas
+        # a mano mezclaba int32 e int64 y scipy no lo acepta), y eliminate_zeros, que compacta EN
+        # EL LUGAR, no toca a `antes`
+        self.C = antes.copy()
+        self.C.data = np.where(sirve, conf, 0.0).astype(np.float64)
         self.C.eliminate_zeros()
         self.antes = antes
-        self.elegibles = sp.csr_matrix((elegibles, antes.indices.copy(), antes.indptr.copy()), shape=antes.shape)
+        self.elegibles = antes.copy()
+        self.elegibles.data = np.asarray(elegibles, dtype=np.float64)
         self.Cc = self.C[:, self.cand].tocsr()
 
     def limite_filas(self) -> int:
@@ -3066,7 +3071,7 @@ class RecEngine:
                 "MT_ORDEN": c["orden"].to_numpy(int),
                 "MT_USD_PAR_ITEM": np.round(c["usd_par"].to_numpy(float), 2),
                 "MT_USD_PAR_TOTAL": np.round(c["total_par"].to_numpy(float), 2),
-                "MT_PARTICIPACION_PAR": np.round(c["share_par"].to_numpy(float), 6),
+                "MT_PARTICIPACION_PAR": c["share_par"].to_numpy(float),     # sin redondear: es la base de la mediana
                 "FECHA_CORTE": np.full(len(c), ayer)})
         dec = cfg.decimales
         refs = [r for r in referencias if len(r)]
@@ -3109,7 +3114,7 @@ class RecEngine:
                 "MT_INTERVALO_MEDIO": np.round(pd.to_numeric(t["intervalo_medio"], errors="coerce").to_numpy(float), 4),
                 "MT_INTERVALO_DESVIO": np.round(pd.to_numeric(t["intervalo_desvio"], errors="coerce").to_numpy(float), 4),
                 "MT_USD_ENTIDAD": np.round(venta, 2),
-                "MT_PARTICIPACION": np.round(np.where(venta > 0, usd / np.where(venta > 0, venta, 1.0), np.nan), 6),
+                "MT_PARTICIPACION": np.where(venta > 0, usd / np.where(venta > 0, venta, 1.0), np.nan),
                 "FECHA_CORTE": np.full(len(t), ayer)})
         if cfg.guardar_curva:
             c = tabla_curva(matriz, cfg)
@@ -3208,7 +3213,7 @@ class RecEngine:
             "MT_DIAS_PAR_ITEM": ev["dias_par_item"].to_numpy(float),
             "MT_TICKET_PAR": np.round(ev["ticket_par"].to_numpy(float), 2),
             "MT_INTERVALO_PAR": np.round(ev["intervalo_par"].to_numpy(float), 1),
-            "MT_PARTICIPACION_PAR": np.round(ev["participacion_par"].to_numpy(float), dec),
+            "MT_PARTICIPACION_PAR": ev["participacion_par"].to_numpy(float),
             "MT_USD_PAR_TOTAL": np.round(ev["usd_par_total"].to_numpy(float), 2),
             "FECHA_PRIMERA_ITEM_PAR": pd.to_datetime(ev["fecha_item_par"]).to_numpy(),
             "FECHA_PRIMERA_REF_PAR": pd.to_datetime(ev["fecha_ref_par"]).to_numpy(),
@@ -3287,7 +3292,8 @@ def explorar(df: pd.DataFrame, cfg_base: RecConfig,
                         if float(pop["recomendados"].sum()) else 0.0)
             ganadores = d[d["elegido"]]
             elegido = ganadores.groupby("algoritmo").size().sort_values(ascending=False)
-            fila = {"nivel_item": " + ".join(nivel), "items": panel.n_item, "entidades": panel.n_ent,
+            fila = {"nivel_item": " + ".join(nivel), "rejilla": ",".join(combo),
+                    "items": panel.n_item, "entidades": panel.n_ent,
                     "densidad": round(float(densidad), 5), "items_por_entidad": round(items_medios, 2),
                     **combo,
                     "segmentos": int(d["segmento"].nunique()),
@@ -3310,6 +3316,16 @@ def explorar(df: pd.DataFrame, cfg_base: RecConfig,
     return out.sort_values(["precision", "usd_acertado"], ascending=False).reset_index(drop=True)
 
 
+def parametros_barridos(fila: pd.Series) -> List[str]:
+    """Los parámetros que se barrieron en la rejilla de esa fila de explorar(). Sólo esos: la
+    tabla también tiene columnas de resultado (`segmentos`, `items`...) que se llaman igual que
+    un parámetro y no lo son."""
+    if "rejilla" in fila.index and isinstance(fila["rejilla"], str):
+        return [k for k in fila["rejilla"].split(",") if k]
+    return [k for k in fila.index if k in RecConfig.__dataclass_fields__
+            and k not in ("item", "segmentos")]
+
+
 def bloque_config(fila: pd.Series, cfg_base: RecConfig) -> str:
     """El texto para pegar en rec_oracle.py con la configuración ganadora."""
     def limpio(x):
@@ -3321,10 +3337,11 @@ def bloque_config(fila: pd.Series, cfg_base: RecConfig) -> str:
 
     nivel = [str(c) for c in str(fila["nivel_item"]).split(" + ")]
     lineas = [f"ITEM = {nivel!r}", ""]
-    for k in ("min_soporte", "min_penetracion", "min_entidades_segmento", "max_items_reco",
-              "k_vecinos", "k_factores", "k_clusters", "dias_afinidad", "dias_backtest"):
-        if k in fila.index:
-            lineas.append(f"{k.upper()} = {limpio(fila[k])!r}")
+    # TODO lo que se barrió en la rejilla, no una lista fija: antes AFINIDAD (que el notebook
+    # barre por defecto) no salía, y había que adivinar cuál había ganado
+    for k in parametros_barridos(fila):
+        v = limpio(fila[k])
+        lineas.append(f"{k.upper()} = {list(v) if isinstance(v, tuple) else v!r}")
     lineas += ["", f"# backtest sobre datos propios: precisión {fila['precision']:.4f} contra "
                    f"{fila['precision_popularidad']:.4f} de popularidad",
                f"# algoritmos que ganaron por segmento: "
@@ -3337,4 +3354,5 @@ def bloque_config(fila: pd.Series, cfg_base: RecConfig) -> str:
 __all__ = ["RecConfig", "RecEngine", "Fechas", "Panel", "Bloque", "Matriz", "ALGORITMOS",
            "catalogo", "catalogo_evidencia", "catalogo_referencia", "catalogo_matriz", "catalogo_curva",
            "catalogo_vecindario", "catalogo_pares_comparables", "completar_detalle", "backtest", "preparar", "asignar_segmentos",
-           "construir_algoritmo", "TIPOS", "EVIDENCIAS", "explorar", "bloque_config", "agregar_tamano"]
+           "construir_algoritmo", "TIPOS", "EVIDENCIAS", "explorar", "bloque_config", "parametros_barridos",
+           "agregar_tamano"]

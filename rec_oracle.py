@@ -196,6 +196,14 @@ ALGORITMOS = ("popularidad", "coseno_item", "coseno_entidad", "svd", "kmeans_val
 SELECCION = "backtest"         # backtest | rrf | ponderado | el nombre de un algoritmo
 METRICA_SELECCION = "precision"     # precision | usd | recall
 PESOS: dict = {}               # sólo para seleccion="ponderado", por ejemplo {"coseno_item": 2}
+K_VECINOS = 50                 # coseno_entidad: cuántos pares más parecidos mira
+K_FACTORES = 32                # svd: factores latentes
+K_CLUSTERS = 8                 # kmeans_valor: grupos de gasto por segmento
+SEMILLA = 0                    # azar de svd y kmeans: fija = misma corrida, mismo resultado
+# Un segmento con menos adopciones que esto en el backtest no se mide solo: usa el ganador del panel
+MIN_ADOPCIONES_BACKTEST = 30
+FILAS_BLOQUE = 2048            # entidades por bloque al puntuar (más = más rápido y más memoria)
+DECIMALES = 4                  # decimales de puntajes y porcentajes en las tablas
 
 TIPOS_RECOMENDACION = ("CRUZADA", "REPOSICION", "BRECHA")
 FACTOR_REPOSICION = 1.5        # silencio mayor a esto x su intervalo típico = atrasado
@@ -242,6 +250,8 @@ MAX_CV_INTERVALO = 1.0         # qué tan irregular puede ser el ritmo PROPIO. N
 MIN_DIAS_COMPRA_ENTIDAD = 3    # días de compra de la entidad para recomendarle algo
 TOPE_POTENCIAL_POR_HISTORICO = 1.5   # veces el propio ritmo de compra del ítem. 0 = sin tope
 TOPE_POTENCIAL_RELATIVO = 1.0        # veces su compra total en el mismo lapso. 0 = sin tope
+ESCALAR_POTENCIAL = True             # ajustar el USD por el tamaño del cliente frente al segmento
+TOPE_ESCALA = 3.0                    # ese ajuste va de 1/3 a 3 veces
 
 
 def build_config(fecha_ejecucion: str | None = None, seleccion: str | None = None) -> RecConfig:
@@ -281,6 +291,13 @@ def build_config(fecha_ejecucion: str | None = None, seleccion: str | None = Non
         seleccion=seleccion or SELECCION,
         metrica_seleccion=METRICA_SELECCION,
         pesos=PESOS,
+        k_vecinos=K_VECINOS,
+        k_factores=K_FACTORES,
+        k_clusters=K_CLUSTERS,
+        semilla=SEMILLA,
+        min_adopciones_backtest=MIN_ADOPCIONES_BACKTEST,
+        filas_bloque=FILAS_BLOQUE,
+        decimales=DECIMALES,
 
         incluir_tipos=TIPOS_RECOMENDACION,
         factor_reposicion=FACTOR_REPOSICION,
@@ -303,6 +320,8 @@ def build_config(fecha_ejecucion: str | None = None, seleccion: str | None = Non
         min_casos_recuperacion=MIN_CASOS_RECUPERACION,
         tope_potencial_por_historico=TOPE_POTENCIAL_POR_HISTORICO,
         tope_potencial_relativo=TOPE_POTENCIAL_RELATIVO,
+        escalar_potencial=ESCALAR_POTENCIAL,
+        tope_escala=TOPE_ESCALA,
 
         guardar_evidencia=GUARDAR_EVIDENCIA,
         guardar_referencia=GUARDAR_REFERENCIA,
@@ -604,6 +623,13 @@ def _a_python(arr: np.ndarray, tipo_completo: str) -> list:
     if tipo == "NUMBER":
         if arr.dtype.kind in "iu":
             return arr.astype(object).tolist()
+        if arr.dtype == object:
+            # claves enteras con vacíos (el par, el ítem de referencia): enteras y exactas, sin
+            # pasar por float, que a partir de 16 dígitos redondea
+            vacio = pd.isna(arr)
+            llenos = arr[~vacio]
+            if len(llenos) and all(isinstance(x, (int, np.integer)) and not isinstance(x, bool) for x in llenos):
+                return [None if v else int(x) for x, v in zip(arr, vacio)]
         a = pd.to_numeric(pd.Series(arr), errors="coerce").to_numpy(float)
         with np.errstate(invalid="ignore"):
             a = _rango_oracle(a)
@@ -737,6 +763,31 @@ def guardar(conn, df: pd.DataFrame, cfg: RecConfig, diagnostico: Optional[pd.Dat
         raise
     log.info("insertadas %s filas en %s (%.1fs)", f"{n:,}", TABLA_DESTINO, time.time() - t0)
     return n
+
+
+# ─── calibración ────────────────────────────────────────────────────────────
+def perillas_sin_efecto(fila: pd.Series) -> List[str]:
+    """Parámetros de una fila de explorar() que, pegados en este archivo, NO cambiarían nada:
+    la variable no existe o build_config() no la pasa al motor. Vacía = se puede pegar."""
+    from rec_engine import parametros_barridos
+    modulo = sys.modules[__name__]
+    malos = []
+    for k in parametros_barridos(fila):
+        nombre = k.upper()
+        if not hasattr(modulo, nombre):
+            malos.append(f"{nombre} (no existe en rec_oracle.py)")
+            continue
+        antes = getattr(modulo, nombre)
+        valor = fila[k]
+        valor = valor.item() if hasattr(valor, "item") else valor
+        try:
+            setattr(modulo, nombre, valor)
+            llega = build_config()
+            if getattr(llega, k) != valor and list(np.atleast_1d(getattr(llega, k))) != list(np.atleast_1d(valor)):
+                malos.append(f"{nombre} (build_config no la pasa al motor)")
+        finally:
+            setattr(modulo, nombre, antes)
+    return malos
 
 
 # ─── control ────────────────────────────────────────────────────────────────
