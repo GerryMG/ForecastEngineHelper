@@ -204,6 +204,11 @@ Todo número que dice un motivo o un cálculo nombra de quiénes sale, y esos da
 | "cada 37 días (mediana de 133 compradores con ritmo)" | mediana de `MT_INTERVALO_MEDIO` en `REC_MATRIZ` |
 | "de los que llegaron a 2 veces, 61 de 100 volvieron" | `REC_CURVA_RECUPERACION` |
 | "probabilidad de adopción 5,2%" | `REC_DIAGNOSTICO` y `REC_REFERENCIA` |
+| "de las 58 entidades del segmento que no lo compraron en los 275 días anteriores, 20 empezaron a comprarlo en los últimos 90" | `REC_MATRIZ` del mismo `BD_SEGMENTO`: 58 = clientes del segmento menos los que tienen el ítem con `FECHA_PRIMERA` hasta `FECHA_CORTE - 90`; 20 = los que tienen `FECHA_PRIMERA` después |
+
+El segmento son los clientes con alguna compra en la ventana de afinidad (los que están en
+`REC_MATRIZ`). El motor lee 90 días más para el backtest; los que sólo compraron en ese tramo viejo
+no cuentan.
 
 Una prueba recalcula desde la fuente, sin usar el motor, cada número de los motivos y cálculos de los
 9 algoritmos y los 3 tipos: todos coinciden.

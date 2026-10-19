@@ -2593,8 +2593,11 @@ def backtest(panel: Panel, cfg: RecConfig) -> pd.DataFrame:
 
     filas = []
     codigos, etiquetas = pd.factorize(seg["segmento"])
+    activa = entrena.items_entidad > 0          # el segmento son los que compraron en la ventana
     for k, etiqueta in enumerate(etiquetas):
-        idx = np.flatnonzero(codigos == k)
+        idx = np.flatnonzero((codigos == k) & activa)
+        if not len(idx):
+            continue
         b = Bloque(cfg, entrena, idx, str(etiqueta), str(seg["nivel_segmento"].iloc[idx[0]]),
                    canastas=canastas, d_ayer=corte)
         b.dias_ventana = float(corte - inicio + 1)
@@ -2938,9 +2941,16 @@ class RecEngine:
 
         salidas, evidencias, referencias, vecindarios, comparables = [], [], [], [], []
         codigos, etiquetas = pd.factorize(seg["segmento"])
+        # El segmento son las entidades que compraron algo en la ventana de afinidad. Se lee más
+        # historia (la del backtest) y antes entraban también las que sólo compraron en ese tramo
+        # viejo: inflaban "de las N entidades del segmento", bajaban la penetración y no estaban en
+        # la matriz de compras, así que esos números no se podían rehacer.
+        activa = matriz.items_entidad > 0
         t0 = time.time()
         for k, etiqueta in enumerate(etiquetas):
-            idx = np.flatnonzero(codigos == k)
+            idx = np.flatnonzero((codigos == k) & activa)
+            if not len(idx):
+                continue
             nivel = str(seg["nivel_segmento"].iloc[idx[0]])
             b = Bloque(cfg, matriz, idx, str(etiqueta), nivel, canastas=canastas, d_ayer=f.d_ayer)
             b.dias_ventana = dias_ventana
