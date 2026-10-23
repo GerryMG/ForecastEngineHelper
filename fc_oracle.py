@@ -47,9 +47,9 @@ CÓMO SE ESCRIBE
 DELETE de un rango + INSERT, todo en una transacción. El rango lo decide
 `reescribir_desde`:
 
-    "auto"        desde el corte (el mes que acaba de cerrar). Es lo normal en la
-                  corrida mensual: se borran las 12 proyecciones viejas y se
-                  insertan las 12 nuevas. Los meses anteriores no se tocan.
+    "auto"        desde el corte (el período que acaba de cerrar). Es lo normal en la
+                  corrida periódica: se borran las proyecciones viejas y se
+                  insertan las nuevas. Los períodos anteriores no se tocan.
     "todo"        borra todo (con FILTRO_DESTINO si lo definiste) y reinserta.
                   Es lo que usa la corrida inicial y lo que querés si cambiaste
                   de modelos y necesitás rehacer la historia.
@@ -96,12 +96,26 @@ COL_FECHA = "AT_FECHA"
 COL_METRICA = "VENTA"
 
 TABLA_SALIDA = "FORECAST_VENTA"            # podés calificarla: "ESQUEMA.FORECAST_VENTA"
-MESES_HISTORIA = 60                        # cuánta historia leer de la fuente
-MESES_PREVIOS = 36                         # cuánta salida anterior releer en la corrida mensual
+
+# ── Frecuencia ─────────────────────────────────────────────────────────────
+# Cada cuánto es un período: el motor sirve para cualquiera. Todo lo que sigue que se
+# cuenta en "períodos" (historia, horizonte, backtest) está en esta unidad.
+#   "MS"    mensual (primero de mes)          "QS"    trimestral
+#   "W-SUN" semanal, de lunes a domingo       "YS"    anual
+#   "D"     diaria
+# La corrida "mensual" (run_mensual.ipynb) es en realidad la de cada período: con "W-SUN"
+# se corre cada semana.
+FRECUENCIA = "MS"
+# Cómo agrupa Oracle la fecha en el SQL de la fuente. None = el que corresponde a
+# FRECUENCIA ("MM", "IW", "DD", "Q", "YYYY"). El motor vuelve a agrupar por FRECUENCIA, así
+# que alcanza con que no mezcle dos períodos en uno (con dudas: "DD", agrupa por día).
+TRUNC_ORACLE = None
+PERIODOS_HISTORIA = 60                     # cuánta historia leer de la fuente
+PERIODOS_PREVIOS = 36                      # cuánta salida anterior releer en la corrida periódica
 
 # El DELETE nunca va más atrás que la fila más vieja que esta corrida va a
 # insertar. Es la red de seguridad para que un "todo" no te borre historia que
-# la corrida ya no tiene en memoria (todo lo anterior a MESES_PREVIOS).
+# la corrida ya no tiene en memoria (todo lo anterior a PERIODOS_PREVIOS).
 # Ponelo en False sólo si querés un borrado real de toda la tabla.
 PROTEGER_HISTORIA = True
 
@@ -109,14 +123,25 @@ PROTEGER_HISTORIA = True
 # comparten varios procesos (ej. "PAIS = 'AR'"). Vacío = toda la tabla.
 FILTRO_DESTINO = ""
 
+_TRUNC_POR_BASE = {"M": "MM", "W-SUN": "IW", "D": "DD", "Q": "Q", "Y": "YYYY"}
+
+
+def _trunc_oracle() -> str:
+    """El TRUNC de Oracle para FRECUENCIA. Las semanas que no van de lunes a domingo, por
+    día: TRUNC(.., 'IW') agrupa de lunes a domingo y mezclaría dos semanas."""
+    return TRUNC_ORACLE or _TRUNC_POR_BASE.get(forecast_engine._period_alias(FRECUENCIA), "DD")
+
+
+# :desde y :hasta los completa la corrida: desde el primer período de PERIODOS_HISTORIA hasta
+# el primero que todavía no cerró (sin incluirlo). Si tu SQL no los usa, corre tal cual.
 SQL_FUENTE = f"""
     SELECT v.SK_CLIENTE,
-           TRUNC(v.AT_FECHA, 'MM')  AS {COL_FECHA},
+           TRUNC(v.AT_FECHA, '{_trunc_oracle()}')  AS {COL_FECHA},
            SUM(v.VENTA)             AS {COL_METRICA}
       FROM VENTAS_HIST v
-     WHERE v.AT_FECHA >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -{MESES_HISTORIA})
-       AND v.AT_FECHA <  TRUNC(SYSDATE, 'MM')
-     GROUP BY v.SK_CLIENTE, TRUNC(v.AT_FECHA, 'MM')
+     WHERE v.AT_FECHA >= :desde
+       AND v.AT_FECHA <  :hasta
+     GROUP BY v.SK_CLIENTE, TRUNC(v.AT_FECHA, '{_trunc_oracle()}')
 """
 
 # ── Una columna por modelo ──────────────────────────────────────────────────
@@ -140,6 +165,45 @@ COLUMNAS_MODELO = {
     "combo_median": "F_COMBO",
 }
 
+# ── Machine learning y redes neuronales (apagados por defecto) ───────────────
+# Para probarlos: poné sus nombres en MODELOS_EXTRA, hacé el ALTER TABLE que imprime el
+# notebook (una columna NUMBER por modelo) y corré. La primera corrida rehace el backtest
+# completo, porque no tienen historia previa con la que compararse; después sigue normal.
+# Compiten en el mismo backtest que los demás: si no ganan, no se eligen.
+#   random_forest : bosque de árboles sobre rezagos          (scikit-learn, ya instalado)
+#   lightgbm      : boosting de árboles sobre rezagos        (pip install lightgbm)
+#   catboost      : boosting de árboles simétricos           (pip install catboost)
+#   mlp           : red neuronal densa sobre rezagos         (scikit-learn, ya instalado)
+#   esn           : red neuronal recurrente de reservorio    (sin dependencias)
+#   combo_top3    : promedio de los 3 modelos con mejor score en cada serie (sin dependencias).
+#                   En el backtest elige sus 3 sólo con los errores que se conocían cuando se hizo
+#                   cada proyección, así compite en igualdad con los demás.
+# Si la librería no está en el entorno, el modelo se desactiva solo y lo avisa en el log.
+MODELOS_EXTRA: list = []
+COLUMNAS_EXTRA = {
+    "random_forest": "F_RANDOM_FOREST",
+    "lightgbm":      "F_LIGHTGBM",
+    "catboost":      "F_CATBOOST",
+    "mlp":           "F_MLP",
+    "esn":           "F_ESN",
+    "combo_top3":    "F_COMBO_TOP3",
+}
+for _modelo in MODELOS_EXTRA:      # antes de F_COMBO, para que las columnas queden en orden
+    _combo = COLUMNAS_MODELO.pop("combo_median")
+    COLUMNAS_MODELO[_modelo] = COLUMNAS_EXTRA[_modelo]
+    COLUMNAS_MODELO["combo_median"] = _combo
+# Modelos que no entran a la mediana del comité (F_COMBO). Si no querés que los nuevos
+# muevan el comité mientras los probás, agregalos acá.
+COMBO_EXCLUIR = ["naive", "drift"]
+# Parámetros de cada modelo, por ejemplo {"lightgbm": {"n_estimators": 400}, "esn": {"unidades": 80}}.
+PARAMETROS_MODELOS: dict = {}
+# Una proyección que pase N veces el máximo histórico de la serie se descarta como falla de ese
+# modelo (no compite ni entra al comité). SARIMA, en algunas series, proyectaba 1e128. 0 = sin control.
+TOPE_PROYECCION = 10.0
+# combo_top3: cuántos de los mejores modelos combina y cómo ("media" o "mediana").
+COMBO_TOP_N = 3
+COMBO_TOP_ESTADISTICO = "media"
+
 # ── El resto de las columnas ────────────────────────────────────────────────
 # Poné None en las que no quieras guardar.
 COLUMNAS_FIJAS = {
@@ -147,50 +211,94 @@ COLUMNAS_FIJAS = {
     "ganador":        "YHAT",         # valor del modelo elegido
     "modelo_ganador": "BEST_MODEL",   # nombre del modelo elegido
     "score":          "BEST_SCORE",   # su error en la ventana de validación
-    "futuro":         "IS_FUTURE",    # 0 = mes validado, 1 = proyección
-    "corte":          "CUTOFF_DATE",  # último mes cerrado de la corrida
+    "futuro":         "IS_FUTURE",    # 0 = período validado, 1 = proyección
+    "corte":          "CUTOFF_DATE",  # último período cerrado de la corrida
     "run":            "RUN_ID",       # id de la corrida, para auditar
     "actualizado":    "UPDATED_AT",   # se completa con SYSDATE
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  3. PARÁMETROS DEL FORECAST
+#  3. PARÁMETROS DEL FORECAST  (todos en PERÍODOS de FRECUENCIA)
 # ═══════════════════════════════════════════════════════════════════════════
+HORIZONTE = 12             # períodos a proyectar
+BACKTEST_PERIODOS = 12     # períodos que se validan hacia atrás para elegir el modelo
+# Cada cuántos períodos se reentrena en el backtest. 1 = todos (cada error es a 1 período,
+# como lo que acumula la corrida periódica; tarda unas 2,5 veces más). 3 = cada 3 (los errores
+# son a 1, 2 y 3 períodos: la selección mira un poco más lejos).
+REFIT_STEP = 3
+# Ventana MÓVIL con la que se elige el modelo: los últimos N períodos cerrados. Cada período
+# entra el que cerró y sale el más viejo (de la evaluación, no de la tabla). None = BACKTEST_PERIODOS.
+VENTANA_SCORE = 12
+TEMPORADA = None           # períodos por ciclo. None = por FRECUENCIA (12 mensual, 52 semanal, 7 diaria, 4 trimestral)
+ESTACIONAL = True          # modelar la estacionalidad (necesita MIN_CICLOS ciclos de historia)
+MIN_CICLOS = 2.0           # ciclos completos de historia para modelar la estacionalidad
+AGREGACION = "sum"         # cómo se juntan varias filas del mismo período: sum, mean, max, min, median, last, first
+RELLENO = 0.0              # valor de un período sin movimiento
+RECORTAR_CEROS_INICIALES = True   # la serie empieza en su primer movimiento, no en ceros previos
+INCLUIR_PERIODO_ABIERTO = False   # True = el período en curso cuenta como cerrado
+METRICA = "wmape"          # wmape | mae | rmse | smape | mase
+PESO_SESGO = 0.25          # castigo al sesgo acumulado (0 = sin castigo)
+VIDA_MEDIA = "auto"        # recencia del score: "auto" (= TEMPORADA), None (todo igual) o N períodos
+MIN_PUNTOS_EVALUACION = 3  # puntos del backtest para confiar en un modelo
+MIN_COBERTURA = 0.6        # fracción de la ventana que un modelo tiene que cubrir para competir
+MIN_HISTORIA = 4           # períodos mínimos para los modelos pesados
+MODELO_RESPALDO = "snaive" # el que se usa cuando ninguno se puede evaluar
+NO_NEGATIVOS = True        # recorta las proyecciones a 0
+DECIMALES = 2              # redondeo de la salida
+N_JOBS = -1                # -1 todos los cores, -2 todos menos uno
+MEMORIA_POR_WORKER_GB = 0.9
+FRACCION_MEMORIA = 0.75
+RESERVA_MEMORIA_GB = 2.0
+
+
 def build_config(cutoff: str | None = None) -> ForecastConfig:
     """Config de la corrida. `cutoff` (YYYY-MM-DD) fuerza el último período cerrado;
-    si es None se toma el mes anterior al actual."""
+    si es None se toma el último período cerrado de FRECUENCIA."""
     return ForecastConfig(
         category_cols=CATEGORIAS,
         date_col=COL_FECHA,
         target_col=COL_METRICA,
 
-        freq="MS",                   # mensual, primero de mes
-        agg="sum",
-        fill_value=0.0,              # meses sin movimiento -> 0
-        cutoff=cutoff,               # None = último mes cerrado
+        freq=FRECUENCIA,
+        agg=AGREGACION,
+        fill_value=RELLENO,
+        cutoff=cutoff,
+        include_open_period=INCLUIR_PERIODO_ABIERTO,
+        drop_leading_zeros=RECORTAR_CEROS_INICIALES,
 
-        horizon=12,                  # meses a proyectar
-        backtest_horizon=12,         # meses a validar hacia atrás
-        refit_step=3,                # reentrena cada 3 meses en el backtest
-
-        # Ventana MÓVIL con la que se elige el modelo: siempre los últimos 12
-        # meses cerrados. Cada primero de mes entra el que cerró y sale el más
-        # viejo — de la evaluación, no de la tabla: la fila queda guardada.
-        score_window=12,
+        horizon=HORIZONTE,
+        backtest_horizon=BACKTEST_PERIODOS,
+        refit_step=REFIT_STEP,
+        score_window=VENTANA_SCORE,
 
         # tienen que ser los mismos que están en COLUMNAS_MODELO
         models=[m for m in COLUMNAS_MODELO if m != "combo_median"],
-        seasonal=True, season_length=12,
+        combo_exclude=COMBO_EXCLUIR,
+        tope_proyeccion=TOPE_PROYECCION,
+        combo_top_n=COMBO_TOP_N,
+        combo_top_estadistico=COMBO_TOP_ESTADISTICO,
+        model_params=PARAMETROS_MODELOS,
+        seasonal=ESTACIONAL, season_length=TEMPORADA,
+        min_seasonal_cycles=MIN_CICLOS, min_history=MIN_HISTORIA,
 
-        metric="wmape", bias_weight=0.25, recency_half_life="auto",
+        metric=METRICA, bias_weight=PESO_SESGO, recency_half_life=VIDA_MEDIA,
+        min_eval_points=MIN_PUNTOS_EVALUACION, min_coverage=MIN_COBERTURA,
+        fallback_model=MODELO_RESPALDO,
 
-        n_jobs=-1,                   # -1 todos los cores, -2 todos menos uno
-        worker_memory_gb=0.9,
-        memory_fraction=0.75,
-        reserve_memory_gb=2.0,
+        n_jobs=N_JOBS,
+        worker_memory_gb=MEMORIA_POR_WORKER_GB,
+        memory_fraction=FRACCION_MEMORIA,
+        reserve_memory_gb=RESERVA_MEMORIA_GB,
 
-        non_negative=True, round_to=2, verbose=1,
+        non_negative=NO_NEGATIVOS, round_to=DECIMALES, verbose=1,
     )
+
+
+def ventana_lectura(cfg: ForecastConfig, periodos: int) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """(desde, hasta) en fechas de calendario: el primer día de los últimos `periodos`
+    períodos hasta el corte, y el primer día del período siguiente al corte (excluido)."""
+    corte = pd.Period(cfg.resolved_cutoff(), freq=forecast_engine._period_alias(cfg.freq))
+    return (corte - (int(periodos) - 1)).start_time, (corte + 1).start_time
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -391,7 +499,14 @@ def leer_fuente(conn, cfg: ForecastConfig) -> pd.DataFrame:
     """Trae la métrica real desde la tabla de origen."""
     _exigir(conn, "origen", "leer_fuente()")
     t0 = time.time()
-    df = _fetch_df(conn, SQL_FUENTE)
+    params = {}
+    if ":desde" in SQL_FUENTE or ":hasta" in SQL_FUENTE:
+        desde, hasta = ventana_lectura(cfg, PERIODOS_HISTORIA)
+        params = {k: v.to_pydatetime() for k, v in (("desde", desde), ("hasta", hasta))
+                  if f":{k}" in SQL_FUENTE}
+        log.info("fuente: %s a %s (%d períodos de %s)", desde.date(), hasta.date(),
+                 PERIODOS_HISTORIA, cfg.freq)
+    df = _fetch_df(conn, SQL_FUENTE, params)
     if df.empty:
         return df
     df[cfg.date_col] = pd.to_datetime(df[cfg.date_col])
@@ -429,20 +544,21 @@ def leer_tabla_destino(conn, cfg: ForecastConfig, meses: int | None = None,
                        filtro: str | None = None) -> pd.DataFrame:
     """Lee la tabla de salida tal cual está, con los nombres de Oracle. Para análisis.
 
-    `meses` limita hacia atrás desde el mes en curso; `filtro` es un predicado
-    SQL extra (ej. "SK_CLIENTE IN (900001, 900002)").
+    `meses` limita hacia atrás: son PERÍODOS de FRECUENCIA (meses en mensual), contando el
+    corte; `filtro` es un predicado SQL extra (ej. "SK_CLIENTE IN (900001, 900002)").
     """
     _exigir(conn, "destino", "leer_tabla_destino()")
     cols = ([c.upper() for c in cfg.category_cols] + [FECHA_DB]
             + [c for c in _renombres(cfg)]
             + ([COLUMNAS_FIJAS["actualizado"]] if COLUMNAS_FIJAS.get("actualizado") else []))
     where = [c for c in (
-        f"{FECHA_DB} >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -{int(meses)})" if meses else None,
+        f"{FECHA_DB} >= :desde" if meses else None,
         f"({FILTRO_DESTINO})" if FILTRO_DESTINO else None,
         f"({filtro})" if filtro else None) if c]
     sql = (f"SELECT {', '.join(cols)}\n  FROM {TABLA_SALIDA}"
            + (f"\n WHERE {' AND '.join(where)}" if where else ""))
-    df = _fetch_df(conn, sql)
+    params = {"desde": ventana_lectura(cfg, int(meses))[0].to_pydatetime()} if meses else None
+    df = _fetch_df(conn, sql, params)
     if df.empty:
         return df
     df[FECHA_DB] = pd.to_datetime(df[FECHA_DB])
@@ -469,9 +585,10 @@ def leer_salida_anterior(conn, cfg: ForecastConfig) -> pd.DataFrame | None:
     renombres = _renombres(cfg)
     cols = [c.upper() for c in cfg.category_cols] + [FECHA_DB] + list(renombres)
     sql = (f"SELECT {', '.join(cols)}\n  FROM {TABLA_SALIDA}\n"
-           f" WHERE {FECHA_DB} >= ADD_MONTHS(TRUNC(SYSDATE, 'MM'), -{MESES_PREVIOS})"
+           f" WHERE {FECHA_DB} >= :desde"
            + (f"\n   AND ({FILTRO_DESTINO})" if FILTRO_DESTINO else ""))
-    df = _fetch_df(conn, sql)
+    desde = ventana_lectura(cfg, PERIODOS_PREVIOS)[0]
+    df = _fetch_df(conn, sql, {"desde": desde.to_pydatetime()})
     if df.empty:
         return None
     df = df.rename(columns=renombres)

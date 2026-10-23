@@ -36,6 +36,60 @@ Variables de entorno: `ST_MODO`, `ST_RELEER_MESES`, `ST_RELEER_DESDE`, `ST_FECHA
 
 ---
 
+## `fc_oracle.py` — Pronóstico
+
+### Frecuencia y períodos
+
+El motor sirve para cualquier frecuencia. Todo lo que se cuenta en "períodos" está en la unidad
+de `FRECUENCIA`, y `run_mensual.ipynb` es en realidad la corrida de cada período.
+
+| Perilla | Qué hace | Default |
+|---|---|---|
+| `FRECUENCIA` | `MS` mensual, `W-SUN` semanal (lunes a domingo, la fecha es el domingo), `D` diaria, `QS` trimestral, `YS` anual | `MS` |
+| `TRUNC_ORACLE` | cómo agrupa Oracle la fecha en el SQL. `None` = el de la frecuencia (`MM`, `IW`, `DD`, `Q`, `YYYY`); con otra semana, por día | `None` |
+| `PERIODOS_HISTORIA` | historia que se lee de la fuente. Para modelar la temporada hacen falta `MIN_CICLOS` ciclos: en semanal, al menos 104 | 60 |
+| `PERIODOS_PREVIOS` | salida anterior que relee la corrida periódica | 36 |
+| `HORIZONTE` | períodos a proyectar | 12 |
+| `BACKTEST_PERIODOS` | períodos que se validan para elegir el modelo | 12 |
+| `REFIT_STEP` | cada cuántos períodos se reentrena en el backtest. 1 = todos (errores a 1 período, como lo que acumula la corrida periódica; tarda unas 2,5 veces más) | 3 |
+| `VENTANA_SCORE` | ventana móvil con que se elige el modelo | 12 |
+| `TEMPORADA` | períodos por ciclo. `None` = por frecuencia (12, 52, 7, 4) | `None` |
+| `ESTACIONAL`, `MIN_CICLOS` | modelar la temporada, y con cuántos ciclos de historia | True / 2 |
+| `AGREGACION`, `RELLENO` | cómo se juntan filas del mismo período, y el valor de un período sin movimiento | sum / 0 |
+| `RECORTAR_CEROS_INICIALES`, `INCLUIR_PERIODO_ABIERTO` | la serie empieza en su primer movimiento; el período en curso cuenta como cerrado | True / False |
+| `METRICA`, `PESO_SESGO`, `VIDA_MEDIA` | el score del backtest | wmape / 0,25 / auto |
+| `MIN_PUNTOS_EVALUACION`, `MIN_COBERTURA`, `MIN_HISTORIA` | cuánto backtest necesita un modelo para competir | 3 / 0,6 / 4 |
+| `MODELO_RESPALDO` | el que se usa cuando ninguno se puede evaluar | snaive |
+| `NO_NEGATIVOS`, `DECIMALES` | recorte a 0 y redondeo de la salida | True / 2 |
+| `N_JOBS`, `MEMORIA_POR_WORKER_GB`, `FRACCION_MEMORIA`, `RESERVA_MEMORIA_GB` | recursos | -1 / 0,9 / 0,75 / 2 |
+
+El SQL de la fuente filtra con `:desde` y `:hasta`, que la corrida calcula según la frecuencia
+y el corte (en mensual dan lo mismo que el `ADD_MONTHS` de antes). Si tu SQL no los usa, corre
+tal cual. Al cambiar de frecuencia, la tabla de salida es otra serie de tiempo: usá otra tabla
+(`TABLA_SALIDA`) o corré `run_inicial` con `FC_REESCRIBIR_DESDE=todo`.
+
+### Modelos
+
+| Perilla | Qué hace | Default |
+|---|---|---|
+| `MODELOS_EXTRA` | modelos a sumar a la batería: `random_forest`, `lightgbm`, `catboost`, `mlp`, `esn` y `combo_top3`. Cada uno necesita su columna (`COLUMNAS_EXTRA`) en la tabla | `[]` |
+| `COMBO_TOP_N`, `COMBO_TOP_ESTADISTICO` | `combo_top3`: cuántos de los mejores modelos de la serie combina, y con `media` o `mediana` | 3 / media |
+| `COMBO_EXCLUIR` | modelos que no entran a la mediana del comité (`F_COMBO`) | `naive`, `drift` |
+| `PARAMETROS_MODELOS` | parámetros por modelo, por ejemplo `{"lightgbm": {"n_estimators": 400}}` | `{}` |
+| `TOPE_PROYECCION` | una proyección que pase N veces el máximo histórico de la serie se descarta como falla del modelo. 0 = sin control | 10 |
+
+**SARIMA** exige ahora coeficientes estacionarios e invertibles (`maxiter=500`). Antes no los exigía y en algunas series proyectaba valores como 1e128: en una prueba con 120 series, 19 tenían proyecciones absurdas y una de ellas lo tenía como ganador. Con la restricción no hubo ninguna, el error en las series sanas bajó de 29% a 19% y corrió más rápido. Se puede volver atrás con `PARAMETROS_MODELOS = {"sarima": {"enforce_stationarity": False, "enforce_invertibility": False, "maxiter": 80}}`.
+
+**`combo_top3`** promedia los 3 modelos con mejor score en cada serie. En el backtest elige sus 3 sólo con los errores que se conocían cuando se hizo cada proyección (el primer tramo queda vacío porque todavía no hay errores); a futuro, con toda la ventana. Así compite en igualdad: si eligiera con la ventana entera también en el backtest, su error se vería mucho mejor de lo que es (en la prueba, 15,8% contra 19,6% real).
+
+Al prender un modelo extra, la primera corrida rehace el backtest completo (no tiene historia con
+qué compararse). `lightgbm` y `catboost` hay que instalarlos (`pip install lightgbm catboost`); si
+no están, se desactivan solos y lo avisan. En una prueba con 120 series de cinco formas distintas,
+el error del backtest (WMAPE) fue: ETS 17,2%, ESN 18,2%, comité 19,0%, random forest 19,3%,
+CatBoost 19,3%, LightGBM 20,7% y MLP 27,6%; los cinco juntos sumaron un 34% al tiempo de la corrida.
+
+---
+
 ## `rec_oracle.py` — Recomendación
 
 ### Qué se recomienda
