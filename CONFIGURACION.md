@@ -23,7 +23,8 @@ Variables de entorno comunes: `ORA_USER`, `ORA_PASSWORD`, `ORA_DSN` para el orig
 |---|---|---|
 | `CATEGORIAS` | claves y descripciones que definen cada fila | siempre |
 | `SQL_FUENTE` | la consulta; **tiene que** filtrar por `:desde` y `:hasta` | siempre |
-| `TABLA_DESTINO`, `MODO_CARGA` | dónde escribe y cómo (`delete` o `truncate`) | siempre |
+| `TABLA_DESTINO`, `MODO_CARGA` | dónde escribe y cómo vacía la tabla antes: `delete`, `truncate`, `procedimiento` o `delete_paralelo` (ver abajo) | siempre |
+| `PROCEDIMIENTO_VACIAR`, `PARALELO_DELETE` | el procedimiento que trunca (modo `procedimiento`) y los procesos del `DELETE` paralelo | según el modo |
 | `SEGMENTOS_ACTIVIDAD` | un modelo de actividad por cada valor de estas categorías | si querés P(activo) por canal, región, etc. |
 | `MIN_CLIENTES_SEGMENTO` | segmento más chico que esto usa los parámetros del panel | si te quedan muchos segmentos en GLOBAL |
 | `MODO_CORRIDA`, `RELEER_MESES` | incremental o completa, y cuánto se relee | si corregís datos viejos seguido |
@@ -31,6 +32,57 @@ Variables de entorno comunes: `ORA_USER`, `ORA_PASSWORD`, `ORA_DSN` para el orig
 | `FECHA_INICIO_FUENTE` | desde dónde lee la corrida completa | rara vez |
 | `MIN_BASE_PORCENTAJE` | venta mínima para calcular un margen % (ver abajo) | si tenés ventas microscópicas |
 | `SUMA_EXACTA`, `MAX_DECIMALES`, `TOLERANCIA_CERO` | cómo se suma el dinero (ver abajo) | casi nunca |
+| `COL_GALONES`, `COL_VENTA_PROMO` | alias de galones y de venta de promociones en `SQL_FUENTE`. Cada uno se usa sólo si la consulta lo devuelve; si no, sus columnas no salen | si cambian los alias |
+| `VENTANAS_VENTA` | ventanas de `MT_VENTA_*` y de `MT_VENTA_PROMO_*`, cada una con su año pasado (`_AP`) | para sumar o quitar ventanas |
+| `VENTANAS_MARGEN`, `VENTANAS_GALONES` | ventanas de `MT_MARGENBRUTO_*` y de `MT_GALONES_*` | ídem |
+| `DIAS_VENTANA`, `MESES_VENTANA`, `VARIANTES` | cuántos días / meses es cada `Rn`, y las variantes de frecuencia, ticket e IDD | rara vez |
+| `DECIMALES_GALONES` | decimales de los galones en `BD_HISTORIAL` (la incremental los relee de ahí) | si los galones traen más de 3 |
+
+Una ventana se escribe `YTD`, `YTD_MC`, `Rn` (los últimos `DIAS_VENTANA[Rn]` días hasta ayer) o
+`Rn_MC` (los últimos `MESES_VENTANA[Rn]` meses cerrados). Para una ventana nueva, por ejemplo
+`R48`, se agrega a `DIAS_VENTANA` y `MESES_VENTANA` y después a la lista que corresponda.
+
+**Venta de promociones**: es la parte de la venta que vino de promociones, y tiene las mismas
+columnas que la venta por ventana (`MT_VENTA_PROMO_YTD` … `MT_VENTA_PROMO_R36_MC_AP`) más
+`MT_VOLUMENCOMPRA_PROMO`. Si en la fuente no viene en su propia columna sino marcada por fila,
+en `SQL_FUENTE` va `SUM(CASE WHEN v.ES_PROMO = 1 THEN v.VENTA ELSE 0 END) AS MT_VENTA_PROMO`.
+
+**Galones**: se suman en su propia escala decimal (exacta, como el dinero), así que un galón
+devuelto anula al vendido sin residuo.
+
+**Cómo se vacía la tabla (`MODO_CARGA`)**. El `DELETE` de toda la tabla es lento: genera undo y
+redo por cada fila, y el `BD_HISTORIAL` (CLOB) es lo que más pesa. Si el usuario de destino no
+puede hacer `TRUNCATE` (no es dueño de la tabla, o no se permite DDL desde el pipeline):
+
+| Modo | Velocidad | Qué necesita | Si falla el INSERT |
+|---|---|---|---|
+| `delete` | lenta | nada | la tabla queda como estaba |
+| `procedimiento` | como `TRUNCATE` | que el dueño cree una vez `PROCEDIMIENTO_VACIAR` (el notebook imprime el `CREATE PROCEDURE` y el `GRANT EXECUTE`) | la tabla queda vacía |
+| `delete_paralelo` | depende de los CPUs de la base | nada | la tabla queda vacía |
+| `delete_lotes` | un recorrido para leer los `ROWID` + borrado por `ROWID` de a `LOTE_DELETE` filas, con `COMMIT` en cada lote | nada | vacía o a medio borrar; la próxima corrida es completa |
+
+`delete_lotes` es para tablas grandes donde un solo `DELETE` se queda sin undo. No usa
+`WHERE ROWNUM <= N` repetido, porque cada vuelta recorre de nuevo todo lo ya borrado. Lee una vez
+los `ROWID` (9 millones ocupan unos 160 MB en memoria) y borra cada lote yendo directo a sus
+filas. Antes de empezar marca la última fila a borrar con `HUELLA_CONFIG = 'VACIANDO'`: si el
+borrado se corta, esa fila queda y la próxima corrida sabe que la tabla está incompleta.
+
+El procedimiento es `AUTHID DEFINER`: trunca con los permisos del dueño y sólo esa tabla, y el
+pipeline no hace DDL. Con `delete_paralelo` el borrado se confirma antes de insertar, porque
+Oracle no deja tocar la tabla en la misma transacción después de un DML paralelo. En los dos
+casos, si el INSERT falla, lo insertado se deshace: la tabla queda vacía (nunca a medias) y la
+próxima corrida se da cuenta y hace una completa. Mientras dura el INSERT, quien consulte la
+tabla la ve vacía. El log de `guardar` separa el tiempo de vaciar, insertar y confirmar.
+
+**Para actualizar un `st_oracle.py` anterior** sin tocar su configuración: se reemplaza desde
+`3. PARÁMETROS DEL CÁLCULO` hasta el final por lo del archivo nuevo, y se dejan las secciones 1 y
+2 como están. Para sumar galones y promo, al `SQL_FUENTE` se le agregan
+`SUM(v.GALONES) AS MT_GALONES` y `SUM(v.VENTA_PROMO) AS MT_VENTA_PROMO`, con el alias escrito
+tal cual.
+
+Al sumar columnas, el notebook corta en la validación de la tabla e imprime el `ALTER TABLE ... ADD`
+con el `COMMENT` de cada columna nueva. Como cambia `SQL_FUENTE`, la primera corrida después es
+completa sola (la huella no coincide); de ahí en adelante vuelve a ser incremental.
 
 Variables de entorno: `ST_MODO`, `ST_RELEER_MESES`, `ST_RELEER_DESDE`, `ST_FECHA_EJECUCION`, `ST_DRY_RUN`.
 

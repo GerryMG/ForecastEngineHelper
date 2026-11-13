@@ -6,6 +6,7 @@ Motor de estadísticas descriptivas por cliente (o por cualquier combinación de
 categorías), misma filosofía que ``forecast_engine``.
 
 Entrada  : tabla larga -> [categorías..., FECHA, MT_VENTA, MT_MARGEN]
+           (+ MT_GALONES y MT_VENTA_PROMO si están configuradas)
            a cualquier granularidad; el motor la lleva a grano diario.
 Salida   : una fila por combinación de claves con todas las métricas del
            catálogo (ver ``catalogo()``) más BD_HISTORIAL y FECHA_CORTE.
@@ -137,6 +138,11 @@ class StatsConfig:
     col_fecha: str = "FECHA"
     col_venta: str = "MT_VENTA"
     col_margen: str = "MT_MARGEN"
+    #: galones (volumen físico). None = la fuente no los trae y sus columnas no salen.
+    col_galones: Optional[str] = None
+    #: venta que viene sólo de promociones, en USD (una parte de col_venta).
+    #: None = la fuente no la trae y sus columnas no salen.
+    col_venta_promo: Optional[str] = None
 
     #: "hoy". Ayer = hoy - 1 es el último día incluido; el mes en curso es el de hoy.
     fecha_ejecucion: Optional[Any] = None
@@ -149,6 +155,14 @@ class StatsConfig:
         "R6": 6, "R12": 12, "R24": 24, "R36": 36})
     #: variantes de frecuencia, ticket e IDD (además del histórico)
     variantes: Tuple[str, ...] = ("R12", "R24", "R36")
+    #: ventanas de MT_VENTA_* y MT_VENTA_PROMO_*, cada una con su año pasado (_AP).
+    #: YTD, YTD_MC, Rn (días hasta ayer) o Rn_MC (meses cerrados)
+    ventanas_venta: Tuple[str, ...] = ("YTD", "YTD_MC", "R12", "R12_MC", "R6", "R6_MC",
+                                       "R24", "R24_MC", "R36", "R36_MC")
+    #: ventanas de MT_MARGENBRUTO_* (además del histórico)
+    ventanas_margen: Tuple[str, ...] = ("R12", "R24", "R36")
+    #: ventanas de MT_GALONES_*
+    ventanas_galones: Tuple[str, ...] = ("R12", "R24", "R36")
 
     ddof: int = 1                      #: desvío muestral (como STDEV.S de Excel)
     idd_unidad: str = "gon"            #: gon (0..100) | grados | radianes
@@ -184,6 +198,7 @@ class StatsConfig:
     min_clientes_segmento: int = 1_000
     incluir_historial: bool = True     #: armar BD_HISTORIAL
     decimales_historial: int = 2
+    decimales_galones: int = 3         #: galones en BD_HISTORIAL
     verbose: int = 1
 
     # -- derivados ---------------------------------------------------------- #
@@ -192,6 +207,19 @@ class StatsConfig:
 
     def descripciones(self) -> List[str]:
         return [c for c in self.categorias if str(c).upper().startswith("BD_")]
+
+    def medidas(self) -> Dict[str, str]:
+        """Medida interna -> columna de la entrada, sólo las configuradas."""
+        m = {"venta": self.col_venta, "margen": self.col_margen,
+             "promo": self.col_venta_promo, "galones": self.col_galones}
+        return {k: v for k, v in m.items() if v}
+
+    def ventana_valida(self, v: str) -> bool:
+        if v in ("YTD", "YTD_MC"):
+            return True
+        if v.endswith("_MC"):
+            return v[:-3] in self.meses_ventana
+        return v in self.dias_ventana
 
     def validate(self) -> None:
         if not self.claves():
@@ -212,6 +240,12 @@ class StatsConfig:
         faltan =[v for v in self.variantes if v not in self.dias_ventana or v not in self.meses_ventana]
         if faltan:
             raise ValueError(f"Variantes sin ventana definida: {faltan}")
+        malas = [v for v in (*self.ventanas_venta, *self.ventanas_margen, *self.ventanas_galones)
+                 if not self.ventana_valida(v)]
+        if malas:
+            raise ValueError(f"Ventanas sin definir en dias_ventana / meses_ventana: {malas}")
+        if len(set(self.medidas().values())) != len(self.medidas()):
+            raise ValueError(f"Dos medidas usan la misma columna: {self.medidas()}")
 
 
 # --------------------------------------------------------------------------- #
@@ -259,29 +293,41 @@ class Contexto:
     """
 
     def __init__(self, cfg: StatsConfig, fechas: Fechas, gid: np.ndarray, dia: np.ndarray,
-                 venta: np.ndarray, margen: np.ndarray, n_grupos: int):
+                 venta: np.ndarray, margen: np.ndarray, n_grupos: int,
+                 promo: Optional[np.ndarray] = None, galones: Optional[np.ndarray] = None):
         self.cfg = cfg
         self.f = fechas
         self.gid = gid
         self.dia = dia
         self.venta = venta
         self.margen = margen
+        self.promo = promo       # venta de promociones (None si no está configurada)
+        self.galones = galones   # galones (None si no están configurados)
         self.G = n_grupos
         self.hash_grupo: Optional[np.ndarray] = None    # identifica al grupo entre corridas
         self.segmento: Optional[np.ndarray] = None      # segmento de actividad de cada grupo
         self.escala = 0.0        # escala decimal del dinero (100 = centavos); 0 = sin escala
+        self.escala_galones = 0.0   # lo mismo para los galones, que traen sus propios decimales
         self.bases_chicas = 0    # porcentajes que salieron nulos por base despreciable
         self.residuos = 0        # sumas de dinero que quedaron en cero por cancelación
 
     # -- helpers vectorizados ------------------------------------------------ #
+    def medida(self, nombre: str) -> np.ndarray:
+        """Array por grupo-día de una medida: venta, margen, promo o galones."""
+        valores = getattr(self, nombre)
+        if valores is None:
+            raise ValueError(f"La medida {nombre!r} no está configurada en StatsConfig")
+        return valores
+
     def suma(self, grupos: np.ndarray, valores: np.ndarray, mascara=None,
-             neta: bool = False) -> np.ndarray:
+             neta: bool = False, escala: Optional[float] = None) -> np.ndarray:
         """Suma por grupo. neta=True es para el dinero, que puede sumar cero de verdad:
-        se suma en la escala decimal (exacto) o, si no hay, se limpia el residuo."""
+        se suma en la escala decimal (exacto) o, si no hay, se limpia el residuo.
+        `escala` reemplaza a la del dinero (los galones traen la suya)."""
         w = valores if mascara is None else np.where(mascara, valores, 0.0)
-        if neta and self.escala:          # centavos: enteros, sin error posible
-            return np.bincount(grupos, weights=np.round(w * self.escala),
-                               minlength=self.G) / self.escala
+        e = self.escala if escala is None else escala
+        if neta and e:                    # centavos: enteros, sin error posible
+            return np.bincount(grupos, weights=np.round(w * e), minlength=self.G) / e
         s = np.bincount(grupos, weights=w, minlength=self.G).astype(float)
         if not neta or not self.cfg.tolerancia_cero:
             return s
@@ -539,9 +585,17 @@ def rango_ventana(f: Fechas, cfg: StatsConfig, ventana: str, ap: bool = False) -
 # =========================================================================== #
 
 # ── A. Venta por ventana ────────────────────────────────────────────────────
-def venta_ventana(ctx: Contexto, ventana: str, ap: bool = False) -> np.ndarray:
+def venta_ventana(ctx: Contexto, ventana: str, ap: bool = False, medida: str = "venta") -> np.ndarray:
+    """Suma de la medida en la ventana. medida="promo" es la venta de promociones."""
     ini, fin = rango_ventana(ctx.f, ctx.cfg, ventana, ap)
-    return ctx.suma(ctx.gid, ctx.venta, (ctx.dia >= ini) & (ctx.dia <= fin), neta=True)
+    return ctx.suma(ctx.gid, ctx.medida(medida), (ctx.dia >= ini) & (ctx.dia <= fin), neta=True)
+
+
+def galones_ventana(ctx: Contexto, ventana: str) -> np.ndarray:
+    """Galones en la ventana, sumados en su propia escala decimal (exacta)."""
+    ini, fin = rango_ventana(ctx.f, ctx.cfg, ventana)
+    return ctx.suma(ctx.gid, ctx.medida("galones"), (ctx.dia >= ini) & (ctx.dia <= fin), neta=True,
+                    escala=ctx.escala_galones)
 
 
 # ── B. Comportamiento por día de compra ─────────────────────────────────────
@@ -577,8 +631,8 @@ def dias_comprados(ctx: Contexto) -> np.ndarray:
     return ctx.dias_compra
 
 
-def volumen_compra(ctx: Contexto) -> np.ndarray:
-    return ctx.suma(ctx.gid, ctx.venta, neta=True)
+def volumen_compra(ctx: Contexto, medida: str = "venta") -> np.ndarray:
+    return ctx.suma(ctx.gid, ctx.medida(medida), neta=True)
 
 
 def _intervalos_en_ventana(ctx: Contexto, ventana: Optional[str]):
@@ -966,7 +1020,8 @@ def prob_activo(params, x, tx, T, modelo: str = "pareto", hilos: Optional[int] =
 
 # ── H. Historial ────────────────────────────────────────────────────────────
 def historial_json(ctx: Contexto) -> np.ndarray:
-    """JSON por grupo: {"f0": primera compra, "d": días desde f0, "v": venta, "m": margen}.
+    """JSON por grupo: {"f0": primera compra, "d": días desde f0, "v": venta, "m": margen},
+    más "p": venta de promociones y "g": galones si están configurados.
 
     Se arma en bloque: cada array se pasa a texto una sola vez, se concatena con
     "|" como separador entre grupos y se corta. Evita un loop de miles de joins.
@@ -984,8 +1039,16 @@ def historial_json(ctx: Contexto) -> np.ndarray:
     v = bloque(np.round(np.nan_to_num(ctx.venta), dec).astype(str))
     m = bloque(np.round(np.nan_to_num(ctx.margen), dec).astype(str))
     f0 = np.datetime_as_string(ctx.primera.astype("datetime64[D]"))
-    return np.array([f'{{"f0":"{a}","d":[{b}],"v":[{c}],"m":[{e}]}}'
-                     for a, b, c, e in zip(f0, d, v, m)], dtype=object)
+    textos = [f'{{"f0":"{a}","d":[{b}],"v":[{c}],"m":[{e}]' for a, b, c, e in zip(f0, d, v, m)]
+    extras = []
+    if ctx.promo is not None:
+        extras.append(("p", bloque(np.round(np.nan_to_num(ctx.promo), dec).astype(str))))
+    if ctx.galones is not None:
+        extras.append(("g", bloque(np.round(np.nan_to_num(ctx.galones),
+                                            ctx.cfg.decimales_galones).astype(str))))
+    for clave, valores in extras:
+        textos = [f'{t},"{clave}":[{x}]' for t, x in zip(textos, valores)]
+    return np.array([t + "}" for t in textos], dtype=object)
 
 
 def historial_a_filas(estado: pd.DataFrame, cfg: StatsConfig) -> pd.DataFrame:
@@ -999,20 +1062,27 @@ def historial_a_filas(estado: pd.DataFrame, cfg: StatsConfig) -> pd.DataFrame:
     n = np.zeros(len(textos), dtype=np.int64)
     f0 = np.zeros(len(textos), dtype="datetime64[D]")
     d: List[int] = []
-    v: List[float] = []
-    m: List[float] = []
+    # clave del JSON -> columna de la entrada
+    claves = {"v": cfg.col_venta, "m": cfg.col_margen}
+    if cfg.col_venta_promo:
+        claves["p"] = cfg.col_venta_promo
+    if cfg.col_galones:
+        claves["g"] = cfg.col_galones
+    valores: Dict[str, List[float]] = {k: [] for k in claves}
     for i, texto in enumerate(textos):
         h = json.loads(texto)
         n[i] = len(h["d"])
         f0[i] = np.datetime64(h["f0"], "D")
         d.extend(h["d"])
-        v.extend(h["v"])
-        m.extend(h["m"])
+        for k, lista in valores.items():
+            if k not in h:     # historial de antes de configurar la medida
+                raise ValueError(f"BD_HISTORIAL no trae '{k}' ({claves[k]}): hace falta una corrida completa")
+            lista.extend(h[k])
     fila = np.repeat(np.arange(len(textos)), n)
     salida = {c: estado[c].to_numpy()[fila] for c in cats}
     salida[cfg.col_fecha] = (np.repeat(f0, n) + np.asarray(d, dtype="timedelta64[D]")).astype("datetime64[ns]")
-    salida[cfg.col_venta] = np.asarray(v, dtype=float)
-    salida[cfg.col_margen] = np.asarray(m, dtype=float)
+    for k, col in claves.items():
+        salida[col] = np.asarray(valores[k], dtype=float)
     return pd.DataFrame(salida)
 
 
@@ -1048,19 +1118,37 @@ def catalogo(cfg: Optional[StatsConfig] = None) -> List[Metrica]:
             add(f"{base}_{v}", desc_var(v), fn, ventana=v)
 
     d = cfg.dias_ventana
+
+    def periodo(v: str) -> str:
+        if v == "YTD":
+            return "del año en curso, desde el 1 de enero hasta ayer"
+        if v == "YTD_MC":
+            return ("del año en curso a mes cerrado, desde el 1 de enero hasta el fin del último mes "
+                    "cerrado (en enero es 0)")
+        if v.endswith("_MC"):
+            return f"de los últimos {cfg.meses_ventana[v[:-3]]} meses cerrados completos"
+        return f"de los últimos {d[v]} días hasta ayer"
+
     # A. Venta por ventana
-    ventanas = [
-        ("YTD", "del año en curso, desde el 1 de enero hasta ayer"),
-        ("YTD_MC", "del año en curso a mes cerrado, desde el 1 de enero hasta el fin del último mes cerrado (en enero es 0)"),
-        ("R12", f"de los últimos {d['R12']} días hasta ayer"),
-        ("R12_MC", "de los últimos 12 meses cerrados completos"),
-        ("R6", f"de los últimos {d['R6']} días hasta ayer"),
-        ("R6_MC", "de los últimos 6 meses cerrados completos"),
-    ]
-    for v, desc in ventanas:
-        add(f"MT_VENTA_{v}", f"Venta {desc}. USD.", venta_ventana, ventana=v)
+    for v in cfg.ventanas_venta:
+        add(f"MT_VENTA_{v}", f"Venta {periodo(v)}. USD.", venta_ventana, ventana=v)
         add(f"MT_VENTA_{v}_AP", f"Año pasado de MT_VENTA_{v}: la misma ventana corrida un año atrás. USD.",
             venta_ventana, ventana=v, ap=True)
+
+    # A. Venta de promociones por ventana: las mismas ventanas que la venta
+    if cfg.col_venta_promo:
+        for v in cfg.ventanas_venta:
+            add(f"MT_VENTA_PROMO_{v}", f"Venta que vino de promociones {periodo(v)}. USD.",
+                venta_ventana, ventana=v, medida="promo")
+            add(f"MT_VENTA_PROMO_{v}_AP",
+                f"Año pasado de MT_VENTA_PROMO_{v}: la misma ventana corrida un año atrás. USD.",
+                venta_ventana, ventana=v, ap=True, medida="promo")
+
+    # A. Galones por ventana
+    if cfg.col_galones:
+        for v in cfg.ventanas_galones:
+            add(f"MT_GALONES_{v}", f"Galones comprados {periodo(v)} (neto de devoluciones).",
+                galones_ventana, ventana=v)
 
     # B. Comportamiento
     add("MT_MAXMONEY", "Máxima venta en un día de compra (suma del día). USD.", max_money)
@@ -1082,13 +1170,17 @@ def catalogo(cfg: Optional[StatsConfig] = None) -> List[Metrica]:
             f"base así no significa nada." if cfg.min_base_porcentaje else "")
     add("MT_MARGENBRUTO", "Margen bruto histórico en %: suma del margen / suma de la venta." + base,
         margen_bruto)
-    add("MT_MARGENBRUTO_R12",
-        f"Margen bruto en % de los últimos {d['R12']} días: suma del margen / suma de la venta." + base,
-        margen_bruto, ventana="R12")
+    for v in cfg.ventanas_margen:
+        add(f"MT_MARGENBRUTO_{v}",
+            f"Margen bruto en % {periodo(v).replace(' hasta ayer', '')}: suma del margen / suma de la venta." + base,
+            margen_bruto, ventana=v)
 
     # B (cont.)
     add("MT_DIASCOMPRADOS", "Cantidad de días distintos con compra, incluidos días con devolución.", dias_comprados)
     add("MT_VOLUMENCOMPRA", "Venta total de toda la historia. USD.", volumen_compra)
+    if cfg.col_venta_promo:
+        add("MT_VOLUMENCOMPRA_PROMO", "Venta total de toda la historia que vino de promociones. USD.",
+            volumen_compra, medida="promo")
 
     variantes("MT_FRECUENCIACOMPRA",
               "Cada cuántos días compra en promedio: promedio de días entre días de compra consecutivos (compra diaria = 1). Histórico.",
@@ -1155,7 +1247,9 @@ def catalogo(cfg: Optional[StatsConfig] = None) -> List[Metrica]:
     add("MT_PROB_INACTIVO", f"Probabilidad de que el cliente esté inactivo: 1 - MT_PROB_ACTIVO ({modelo}).", prob_inactivo_col)
 
     # H. Historial
-    add("BD_HISTORIAL", 'JSON con la historia diaria: f0 = fecha de primera compra, d = días desde f0, v = venta USD, m = margen USD.',
+    extra = ((", p = venta de promociones USD" if cfg.col_venta_promo else "")
+             + (", g = galones" if cfg.col_galones else ""))
+    add("BD_HISTORIAL", f'JSON con la historia diaria: f0 = fecha de primera compra, d = días desde f0, v = venta USD, m = margen USD{extra}.',
         historial_json, tipo="CLOB")
     return M
 
@@ -1183,7 +1277,7 @@ class StatsEngine:
     def preparar(self, df: pd.DataFrame) -> Tuple[Contexto, pd.DataFrame]:
         """Lleva la entrada a grano (grupo, día), ordenada, y arma las categorías."""
         cfg = self.cfg
-        faltan = [c for c in list(cfg.categorias) + [cfg.col_fecha, cfg.col_venta, cfg.col_margen]
+        faltan = [c for c in list(cfg.categorias) + [cfg.col_fecha, *cfg.medidas().values()]
                   if c not in df.columns]
         if faltan:
             raise KeyError(f"Faltan columnas en la entrada: {faltan}")
@@ -1200,8 +1294,8 @@ class StatsEngine:
 
         claves = cfg.claves()
         gid = base.groupby(claves, sort=True, dropna=False).ngroup().to_numpy()
-        venta = pd.to_numeric(base[cfg.col_venta], errors="coerce").fillna(0.0).to_numpy(float)
-        margen = pd.to_numeric(base[cfg.col_margen], errors="coerce").fillna(0.0).to_numpy(float)
+        crudo = {k: pd.to_numeric(base[c], errors="coerce").fillna(0.0).to_numpy(float)
+                 for k, c in cfg.medidas().items()}
 
         orden = np.lexsort((dia, gid))
         g, d = gid[orden], dia[orden]
@@ -1215,24 +1309,35 @@ class StatsEngine:
 
         # un registro por grupo-día
         nuevo = np.flatnonzero(cambio_grupo | np.r_[True, d[1:] != d[:-1]])
-        vo, mo = venta[orden], margen[orden]
-        # el día que se anula con su devolución tiene que valer 0, no 1e-12
-        escala = escala_decimal((vo, mo), cfg.max_decimales) if cfg.suma_exacta else 0.0
+        ordenado = {k: a[orden] for k, a in crudo.items()}
+        # el día que se anula con su devolución tiene que valer 0, no 1e-12.
+        # El dinero (venta, margen, promo) comparte escala; los galones tienen la suya.
+        dinero = [k for k in ("venta", "margen", "promo") if k in ordenado]
+        escala = (escala_decimal([ordenado[k] for k in dinero], cfg.max_decimales)
+                  if cfg.suma_exacta else 0.0)
+        escala_gal = (escala_decimal([ordenado["galones"]], cfg.max_decimales)
+                      if cfg.suma_exacta and "galones" in ordenado else 0.0)
+
+        def por_dia(a: np.ndarray, e: float) -> np.ndarray:
+            if e:
+                return np.add.reduceat(np.round(a * e), nuevo) / e
+            s = np.add.reduceat(a, nuevo)
+            if not cfg.tolerancia_cero:
+                return s
+            b = np.add.reduceat(np.abs(a), nuevo)
+            return sin_residuo(s, b, cfg.tolerancia_cero, escala_tipica(b))
+
+        dias = {k: por_dia(a, escala_gal if k == "galones" else escala) for k, a in ordenado.items()}
         if escala:
-            v_dia = np.add.reduceat(np.round(vo * escala), nuevo) / escala
-            mg_dia = np.add.reduceat(np.round(mo * escala), nuevo) / escala
             LOGGER.info("dinero en escala de %d decimales: las sumas son exactas",
                         int(round(np.log10(escala))))
-        else:
-            v_dia, mg_dia = np.add.reduceat(vo, nuevo), np.add.reduceat(mo, nuevo)
-            if cfg.tolerancia_cero:
-                bv, bm = np.add.reduceat(np.abs(vo), nuevo), np.add.reduceat(np.abs(mo), nuevo)
-                v_dia = sin_residuo(v_dia, bv, cfg.tolerancia_cero, escala_tipica(bv))
-                mg_dia = sin_residuo(mg_dia, bm, cfg.tolerancia_cero, escala_tipica(bm))
-                LOGGER.info("sin escala decimal usable: los ceros se deciden con "
-                            "tolerancia_cero=%g", cfg.tolerancia_cero)
-        ctx = Contexto(cfg, self.fechas, g[nuevo], d[nuevo], v_dia, mg_dia, int(g.max()) + 1)
+        elif cfg.tolerancia_cero:
+            LOGGER.info("sin escala decimal usable: los ceros se deciden con "
+                        "tolerancia_cero=%g", cfg.tolerancia_cero)
+        ctx = Contexto(cfg, self.fechas, g[nuevo], d[nuevo], dias["venta"], dias["margen"], int(g.max()) + 1,
+                       promo=dias.get("promo"), galones=dias.get("galones"))
         ctx.escala = escala
+        ctx.escala_galones = escala_gal
         ctx.hash_grupo = pd.util.hash_pandas_object(cats[claves], index=False).to_numpy(np.uint64)
         if cfg.segmentos_actividad:
             etiqueta = None

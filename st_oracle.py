@@ -119,19 +119,44 @@ TOLERANCIA_CERO = 1e-9
 
 TABLA_DESTINO = "EST_CLIENTE"     # podés calificarla: "ESQUEMA.EST_CLIENTE"
 
-# "delete"   : DELETE + INSERT en una transacción. Si algo falla, la tabla queda como estaba.
-# "truncate" : TRUNCATE + INSERT. Más rápido con tablas grandes, pero TRUNCATE hace
-#              commit implícito: si el INSERT falla, la tabla queda VACÍA.
+# Cómo se vacía la tabla antes de insertar:
+# "delete"          : DELETE + INSERT en una transacción. Si algo falla, la tabla queda como
+#                     estaba. Es el más lento: genera undo y redo por cada fila, y el CLOB pesa.
+# "truncate"        : TRUNCATE + INSERT. Rápido, pero hace falta ser dueño de la tabla (o
+#                     DROP ANY TABLE), y es DDL.
+# "procedimiento"   : llama a PROCEDIMIENTO_VACIAR, que el dueño de la tabla crea una vez y
+#                     trunca la tabla (el notebook imprime cómo crearlo). Igual de rápido que
+#                     truncate; el pipeline no hace DDL ni necesita permisos sobre la tabla
+#                     más que INSERT y EXECUTE sobre el procedimiento.
+# "delete_paralelo" : DELETE con PARALELO_DELETE procesos, sin permisos extra. Oracle no deja
+#                     insertar en la misma transacción después de un DML paralelo, así que el
+#                     borrado se confirma antes de insertar.
+# "delete_lotes"    : lee una vez los ROWID de toda la tabla y borra por ROWID de a LOTE_DELETE
+#                     filas, con COMMIT en cada lote. Sin permisos extra y sin un undo gigante.
+#                     Cada lote va directo a sus filas (no recorre la tabla como un
+#                     "WHERE ROWNUM <= N" repetido, que vuelve a leer todo lo ya borrado).
+# Salvo "delete", si algo falla la tabla puede quedar vacía o, con "delete_lotes", a medio
+# borrar. Nunca a medio insertar: lo insertado se deshace. La próxima corrida lo detecta y
+# hace una completa sola.
 MODO_CARGA = "delete"
+PROCEDIMIENTO_VACIAR = "VACIAR_EST_CLIENTE"   # podés calificarlo: "ESQUEMA.VACIAR_EST_CLIENTE"
+PARALELO_DELETE = 8                           # procesos del DELETE paralelo
+LOTE_DELETE = 50_000                          # filas por COMMIT en "delete_lotes"
 
 # Grano diario ya agregado en la base. :desde y :hasta los completa el pipeline
 # según el modo de corrida: NO los quites (la incremental depende de ellos).
+# Galones y venta de promociones son opcionales: se usan si la consulta los devuelve con
+# el alias de COL_GALONES / COL_VENTA_PROMO (sección 3); sin esa línea, sus columnas no salen.
+# Si la venta de promociones no viene en su propia columna sino marcada por fila, usá
+#     SUM(CASE WHEN v.ES_PROMO = 1 THEN v.VENTA ELSE 0 END) AS MT_VENTA_PROMO
 SQL_FUENTE = f"""
     SELECT v.SK_CLIENTE,
            v.BD_CLIENTE,
-           TRUNC(v.FECHA)   AS {COL_FECHA},
-           SUM(v.VENTA)     AS {COL_VENTA},
-           SUM(v.MARGEN)    AS {COL_MARGEN}
+           TRUNC(v.FECHA)      AS {COL_FECHA},
+           SUM(v.VENTA)        AS {COL_VENTA},
+           SUM(v.MARGEN)       AS {COL_MARGEN},
+           SUM(v.GALONES)      AS MT_GALONES,
+           SUM(v.VENTA_PROMO)  AS MT_VENTA_PROMO
       FROM VENTAS v
      WHERE v.FECHA >= :desde
        AND v.FECHA <  :hasta
@@ -147,17 +172,49 @@ FECHA_INICIO_FUENTE = "1900-01-01"   # desde dónde lee la corrida completa
 # ═══════════════════════════════════════════════════════════════════════════
 #  3. PARÁMETROS DEL CÁLCULO
 # ═══════════════════════════════════════════════════════════════════════════
+# Desde acá hasta el final se puede pegar sobre un st_oracle.py anterior: sólo usa lo de
+# arriba, que queda como estaba (agregando, si querés, galones y promo al SQL_FUENTE).
+
+# Alias de galones y de venta de promociones en SQL_FUENTE. Cada uno se usa sólo si la
+# consulta lo devuelve; si no, sus columnas (MT_GALONES_*, MT_VENTA_PROMO_*) no salen.
+COL_GALONES = "MT_GALONES"
+COL_VENTA_PROMO = "MT_VENTA_PROMO"
+
+# Ventanas de cada familia de columnas: YTD, YTD_MC, Rn (días hasta ayer) o Rn_MC (meses
+# cerrados), con n en DIAS_VENTANA / MESES_VENTANA. La venta de promociones usa las de la venta.
+DIAS_VENTANA = {"R6": 183, "R12": 365, "R24": 730, "R36": 1095}     # "hasta ayer"
+MESES_VENTANA = {"R6": 6, "R12": 12, "R24": 24, "R36": 36}          # "a mes cerrado"
+VENTANAS_VENTA = ["YTD", "YTD_MC", "R12", "R12_MC", "R6", "R6_MC", "R24", "R24_MC", "R36", "R36_MC"]
+VENTANAS_MARGEN = ["R12", "R24", "R36"]      # MT_MARGENBRUTO_*, además del histórico
+VENTANAS_GALONES = ["R12", "R24", "R36"]     # MT_GALONES_*
+VARIANTES = ["R12", "R24", "R36"]            # frecuencia, ticket e IDD, además del histórico
+DECIMALES_GALONES = 3                        # con cuántos decimales se guardan en BD_HISTORIAL
+
+
+def en_fuente(col: Optional[str]) -> Optional[str]:
+    """La columna si SQL_FUENTE la devuelve (busca el alias), None si no."""
+    import re          # acá y no arriba: esta sección se pega sobre archivos que no lo importan
+    if col and re.search(rf"\b{re.escape(col)}\b", SQL_FUENTE, flags=re.IGNORECASE):
+        return col
+    return None
+
+
 def build_config(fecha_ejecucion: str | None = None) -> StatsConfig:
     return StatsConfig(
         categorias=CATEGORIAS,
         col_fecha=COL_FECHA,
         col_venta=COL_VENTA,
         col_margen=COL_MARGEN,
+        col_galones=en_fuente(COL_GALONES),          # None si SQL_FUENTE no los trae
+        col_venta_promo=en_fuente(COL_VENTA_PROMO),
         fecha_ejecucion=fecha_ejecucion,     # None = hoy
 
-        dias_ventana={"R6": 183, "R12": 365, "R24": 730, "R36": 1095},   # "hasta ayer"
-        meses_ventana={"R6": 6, "R12": 12, "R24": 24, "R36": 36},        # "a mes cerrado"
-        variantes=("R12", "R24", "R36"),
+        dias_ventana=dict(DIAS_VENTANA),
+        meses_ventana=dict(MESES_VENTANA),
+        variantes=tuple(VARIANTES),
+        ventanas_venta=tuple(VENTANAS_VENTA),
+        ventanas_margen=tuple(VENTANAS_MARGEN),
+        ventanas_galones=tuple(VENTANAS_GALONES),
 
         ddof=1,                   # desvío muestral
         idd_unidad="gon",         # 0 plano, 100 creciente, -100 decreciente
@@ -175,6 +232,7 @@ def build_config(fecha_ejecucion: str | None = None) -> StatsConfig:
 
         incluir_historial=True,   # la incremental lo necesita
         decimales_historial=2,
+        decimales_galones=DECIMALES_GALONES,
     )
 
 
@@ -254,10 +312,14 @@ def tipo_categoria(col: str) -> str:
 def huella_config(cfg: StatsConfig) -> str:
     """Resume lo que define el contenido del historial. Si cambia, la incremental
     no puede reutilizar lo guardado y se hace una corrida completa."""
-    base = json.dumps({"categorias": [c.upper() for c in cfg.categorias], "fecha": cfg.col_fecha,
-                       "venta": cfg.col_venta, "margen": cfg.col_margen,
-                       "decimales": cfg.decimales_historial, "sql": " ".join(SQL_FUENTE.split())},
-                      sort_keys=True)
+    huella = {"categorias": [c.upper() for c in cfg.categorias], "fecha": cfg.col_fecha,
+              "venta": cfg.col_venta, "margen": cfg.col_margen,
+              "decimales": cfg.decimales_historial, "sql": " ".join(SQL_FUENTE.split())}
+    if cfg.col_galones:            # sólo si están: sin ellas la huella queda como antes
+        huella.update(galones=cfg.col_galones, decimales_galones=cfg.decimales_galones)
+    if cfg.col_venta_promo:
+        huella["promo"] = cfg.col_venta_promo
+    base = json.dumps(huella, sort_keys=True)
     return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
 
 
@@ -304,11 +366,42 @@ def ddl_sugerido(cfg: StatsConfig) -> str:
             f"{', '.join(cfg.claves())}. Se reemplaza completa en cada ejecución.';\n\n"
             f"{comentarios}\n\n"
             f"-- In-Memory: si la usás, conviene excluir el historial del column store\n"
-            f"-- ALTER TABLE {TABLA_DESTINO} INMEMORY NO INMEMORY (BD_HISTORIAL);\n")
+            f"-- ALTER TABLE {TABLA_DESTINO} INMEMORY NO INMEMORY (BD_HISTORIAL);\n"
+            + (f"\n{ddl_procedimiento()}" if MODO_CARGA == "procedimiento" else ""))
+
+
+def ddl_procedimiento() -> str:
+    """Lo que corre el dueño de la tabla, una sola vez, para MODO_CARGA = "procedimiento"."""
+    usuario = ORA_DEST_USER or "<usuario de ORA_DEST_USER>"
+    return (f"-- MODO_CARGA = \"procedimiento\": lo corre el DUEÑO de {TABLA_DESTINO}, una sola vez.\n"
+            f"-- AUTHID DEFINER: trunca con los permisos del dueño, y sólo esta tabla.\n"
+            f"CREATE OR REPLACE PROCEDURE {PROCEDIMIENTO_VACIAR} AUTHID DEFINER AS\n"
+            f"BEGIN\n"
+            f"    EXECUTE IMMEDIATE 'TRUNCATE TABLE {TABLA_DESTINO}';\n"
+            f"END;\n/\n\n"
+            f"GRANT EXECUTE ON {PROCEDIMIENTO_VACIAR} TO {usuario};\n")
+
+
+MODOS_CARGA = ("delete", "truncate", "procedimiento", "delete_paralelo", "delete_lotes")
+#: marca de una tabla a medio borrar ("delete_lotes" cortado): la incremental no la usa
+HUELLA_VACIANDO = "VACIANDO"
 
 
 def validar_tabla(conn, cfg: StatsConfig) -> None:
     _exigir(conn, "destino", f"validar_tabla({TABLA_DESTINO})")
+    if MODO_CARGA not in MODOS_CARGA:
+        raise ValueError(f"MODO_CARGA debe ser uno de {MODOS_CARGA}")
+    if MODO_CARGA == "procedimiento":
+        esquema, _, proc = PROCEDIMIENTO_VACIAR.rpartition(".")
+        sql = "SELECT COUNT(*) AS N FROM ALL_PROCEDURES WHERE OBJECT_NAME = :p"
+        params = {"p": proc.upper()}
+        if esquema:
+            sql += " AND OWNER = :o"
+            params["o"] = esquema.upper()
+        if not int(_fetch_df(conn, sql, params)["N"].iloc[0]):
+            raise RuntimeError(f"El usuario de destino ({ORA_DEST_USER}) no ve el procedimiento "
+                               f"{PROCEDIMIENTO_VACIAR}. Pedile al dueño de la tabla que corra:\n\n"
+                               f"{ddl_procedimiento()}")
     owner, _, tabla = TABLA_DESTINO.rpartition(".")
     sql = "SELECT OWNER, COLUMN_NAME FROM ALL_TAB_COLUMNS WHERE TABLE_NAME = :t"
     params = {"t": tabla.upper()}
@@ -324,10 +417,14 @@ def validar_tabla(conn, cfg: StatsConfig) -> None:
         propio = [d for d in duenos if d.upper() == ORA_DEST_USER.upper()]
         enc = enc[enc["OWNER"] == (propio[0] if propio else duenos[0])]
     existentes = {c.upper() for c in enc["COLUMN_NAME"]}
-    faltan = [(c, t) for c, t, _ in columnas_destino(cfg) if c not in existentes]
+    faltan = [(c, t, d) for c, t, d in columnas_destino(cfg) if c not in existentes]
     if faltan:
-        raise RuntimeError(f"A {TABLA_DESTINO} le faltan columnas: {', '.join(c for c, _ in faltan)}\n\n"
-                           f"ALTER TABLE {TABLA_DESTINO} ADD ({', '.join(f'{c} {t}' for c, t in faltan)});")
+        ancho = max(len(c) for c, _, _ in faltan)
+        cuerpo = ",\n".join(f"    {c.ljust(ancho)}  {t}" for c, t, _ in faltan)
+        comentarios = "\n".join(f"COMMENT ON COLUMN {TABLA_DESTINO}.{c} IS '{d.replace(chr(39), chr(39) * 2)}';"
+                                for c, _, d in faltan)
+        raise RuntimeError(f"A {TABLA_DESTINO} le faltan columnas: {', '.join(c for c, _, _ in faltan)}\n\n"
+                           f"ALTER TABLE {TABLA_DESTINO} ADD (\n{cuerpo}\n);\n\n{comentarios}")
     log.info("tabla %s.%s validada: %d columnas", enc["OWNER"].iloc[0], tabla.upper(),
              len(columnas_destino(cfg)))
 
@@ -360,10 +457,13 @@ def _diagnosticar(conn, cfg: StatsConfig):
                MIN(FECHA_DATOS_DESDE)            AS DATOS_DESDE,
                COUNT(DISTINCT HUELLA_CONFIG)     AS N_HUELLAS,
                MIN(HUELLA_CONFIG)                AS HUELLA,
-               SUM(CASE WHEN BD_HISTORIAL IS NULL THEN 1 ELSE 0 END) AS SIN_HISTORIAL
+               SUM(CASE WHEN BD_HISTORIAL IS NULL THEN 1 ELSE 0 END) AS SIN_HISTORIAL,
+               SUM(CASE WHEN HUELLA_CONFIG = '{HUELLA_VACIANDO}' THEN 1 ELSE 0 END) AS VACIANDO
           FROM {TABLA_DESTINO}""").iloc[0]
     if int(e["FILAS"]) == 0:
         return "la tabla destino está vacía", None
+    if int(e["VACIANDO"] or 0) > 0:
+        return "la carga anterior se cortó a mitad del borrado: la tabla está incompleta", None
     if int(e["N_CORTES"]) != 1:
         return f"la tabla tiene {int(e['N_CORTES'])} fechas de corte distintas (carga incompleta o mezclada)", None
     if int(e["N_DESDE"]) != 1:
@@ -439,7 +539,10 @@ def leer_fuente(conn, cfg: StatsConfig, plan: Plan) -> pd.DataFrame:
                            f"{f.ayer.date()}. ¿Se cargó la fuente?")
     df = _tipar(df, cfg)
     df[cfg.col_fecha] = pd.to_datetime(df[cfg.col_fecha]).dt.normalize()
-    for c in (cfg.col_venta, cfg.col_margen):
+    faltan = [c for c in cfg.medidas().values() if c.upper() not in df.columns]
+    if faltan:
+        raise RuntimeError(f"SQL_FUENTE menciona {faltan} pero la consulta no las devuelve: revisá su alias")
+    for c in cfg.medidas().values():
         df[c] = pd.to_numeric(df[c], errors="coerce")
     ultimo = df[cfg.col_fecha].max()
     if MAX_DIAS_SIN_DATOS is not None and (f.ayer - ultimo).days > MAX_DIAS_SIN_DATOS:
@@ -489,7 +592,7 @@ def combinar(estado: Optional[pd.DataFrame], fuente: pd.DataFrame, cfg: StatsCon
         "diferencia_usd": round(float(m["ahora"].fillna(0).sum() - m["antes"].fillna(0).sum()), 2),
         "dias_posteriores": int((fuente[f] > plan.corte_anterior).sum()),
     }
-    columnas = list(cfg.categorias) + [f, v, cfg.col_margen]
+    columnas = list(cfg.categorias) + [f, *cfg.medidas().values()]
     historia = pd.concat([estado.loc[estado[f] < plan.releer_desde, columnas], fuente[columnas]],
                          ignore_index=True)
     if plan.releer_desde > plan.corte_anterior:
@@ -589,29 +692,98 @@ def guardar(conn, df: pd.DataFrame, cfg: StatsConfig) -> int:
     if ajustes:
         log.warning("valores fuera del rango de Oracle NUMBER ajustados: %s", ajustes)
 
+    if MODO_CARGA not in MODOS_CARGA:
+        raise ValueError(f"MODO_CARGA debe ser uno de {MODOS_CARGA}")
     t0 = time.time()
     try:
-        with conn.cursor() as cur:
-            if MODO_CARGA == "truncate":
-                cur.execute(f"TRUNCATE TABLE {TABLA_DESTINO}")
-                log.info("tabla %s truncada", TABLA_DESTINO)
-            else:
-                cur.execute(f"DELETE FROM {TABLA_DESTINO}")
-                log.info("borradas %s filas de %s", f"{cur.rowcount:,}", TABLA_DESTINO)
+        _vaciar(conn)
+        t_vaciar = time.time() - t0
         with conn.cursor() as cur:
             cur.setinputsizes(*[_tipo_bind(t) for t in tipos])
             for i in range(0, len(df), BATCH_ROWS):
                 lote = [_a_python(a[i:i + BATCH_ROWS], t) for a, t in zip(datos, tipos)]
                 cur.executemany(sql, list(zip(*lote)))
+        t_insertar = time.time() - t0 - t_vaciar
         conn.commit()
     except Exception:
         conn.rollback()
-        log.error("falló la carga%s", ": la tabla quedó como estaba" if MODO_CARGA == "delete"
-                  else ": con TRUNCATE la tabla puede haber quedado vacía")
+        log.error("falló la carga: %s", "la tabla quedó como estaba" if MODO_CARGA == "delete" else
+                  "la tabla quedó VACÍA%s (lo insertado se deshizo); la próxima corrida será completa"
+                  % (" o a medio borrar" if MODO_CARGA == "delete_lotes" else ""))
         raise
-    log.info("insertadas %s filas x %d columnas en %s (%.1fs)", f"{len(df):,}",
-             len(nombres) + 1, TABLA_DESTINO, time.time() - t0)
+    log.info("insertadas %s filas x %d columnas en %s (%.1fs: vaciar %.1fs [%s], insertar %.1fs, "
+             "commit %.1fs)", f"{len(df):,}", len(nombres) + 1, TABLA_DESTINO, time.time() - t0,
+             t_vaciar, MODO_CARGA, t_insertar, time.time() - t0 - t_vaciar - t_insertar)
     return len(df)
+
+
+def _vaciar(conn) -> None:
+    """Vacía la tabla destino según MODO_CARGA. Salvo "delete", lo confirma (no hay vuelta atrás)."""
+    with conn.cursor() as cur:
+        if MODO_CARGA == "truncate":
+            cur.execute(f"TRUNCATE TABLE {TABLA_DESTINO}")
+            log.info("tabla %s truncada", TABLA_DESTINO)
+        elif MODO_CARGA == "procedimiento":
+            cur.callproc(PROCEDIMIENTO_VACIAR)
+            log.info("tabla %s vaciada con %s", TABLA_DESTINO, PROCEDIMIENTO_VACIAR)
+        elif MODO_CARGA == "delete_paralelo":
+            # después de un DML paralelo Oracle no deja tocar la tabla en la misma transacción
+            # (ORA-12838): el borrado se confirma antes de insertar
+            cur.execute("ALTER SESSION ENABLE PARALLEL DML")
+            cur.execute(f"DELETE /*+ PARALLEL(t {int(PARALELO_DELETE)}) */ FROM {TABLA_DESTINO} t")
+            n = cur.rowcount
+            conn.commit()
+            cur.execute("ALTER SESSION DISABLE PARALLEL DML")
+            log.info("borradas %s filas de %s en paralelo (%d)", f"{n:,}", TABLA_DESTINO,
+                     int(PARALELO_DELETE))
+        elif MODO_CARGA == "delete_lotes":
+            _borrar_en_lotes(conn, cur)
+        else:
+            cur.execute(f"DELETE FROM {TABLA_DESTINO}")
+            log.info("borradas %s filas de %s", f"{cur.rowcount:,}", TABLA_DESTINO)
+
+
+def _borrar_en_lotes(conn, cur) -> None:
+    """DELETE por ROWID de a LOTE_DELETE filas, con COMMIT en cada lote.
+
+    1. Lee todos los ROWID en un solo recorrido, ANTES de borrar: leer de un cursor abierto
+       mientras se confirma sobre la misma tabla termina en ORA-01555 (snapshot too old).
+       Se guardan como bytes: 9 millones ocupan ~160 MB.
+    2. Marca la última fila que se va a borrar con HUELLA_CONFIG = 'VACIANDO' y confirma.
+       Si el borrado se corta a la mitad, esa fila queda y la próxima corrida sabe que la
+       tabla está incompleta (hace una completa en vez de una incremental sobre medio estado).
+    3. Borra por ROWID en orden, confirmando cada lote. La marcada cae en el último.
+    """
+    t0 = time.time()
+    cur.arraysize = ARRAYSIZE
+    cur.execute(f"SELECT ROWIDTOCHAR(ROWID) FROM {TABLA_DESTINO}")
+    partes = []
+    while True:
+        filas = cur.fetchmany()
+        if not filas:
+            break
+        partes.append(np.array([f[0].encode("ascii") for f in filas]))
+    if not partes:
+        log.info("la tabla %s ya estaba vacía", TABLA_DESTINO)
+        return
+    rowids = np.concatenate(partes)
+    total = len(rowids)
+    log.info("%s ROWID leídos de %s en %.1fs; se borran de a %s con COMMIT", f"{total:,}", TABLA_DESTINO,
+             time.time() - t0, f"{int(LOTE_DELETE):,}")
+    cur.execute(f"UPDATE {TABLA_DESTINO} SET HUELLA_CONFIG = :h WHERE ROWID = CHARTOROWID(:r)",
+                {"h": HUELLA_VACIANDO, "r": rowids[-1].decode()})
+    conn.commit()
+    lote = max(int(LOTE_DELETE), 1)
+    sql = f"DELETE FROM {TABLA_DESTINO} WHERE ROWID = CHARTOROWID(:1)"
+    siguiente_aviso = 0.1
+    for i in range(0, total, lote):
+        cur.executemany(sql, [(r.decode(),) for r in rowids[i:i + lote]])
+        conn.commit()
+        hecho = min(i + lote, total) / total
+        if hecho >= siguiente_aviso or hecho == 1:
+            log.info("borrado %3.0f%% (%s de %s filas, %.0fs)", 100 * hecho, f"{min(i + lote, total):,}",
+                     f"{total:,}", time.time() - t0)
+            siguiente_aviso = hecho + 0.1
 
 
 # ─── control ────────────────────────────────────────────────────────────────
