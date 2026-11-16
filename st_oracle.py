@@ -27,7 +27,7 @@ CÓMO FUNCIONA LA INCREMENTAL
 ----------------------------
 1. Valida la tabla destino con una consulta agregada, sin traer los CLOB:
    que tenga filas, una sola fecha de corte, una sola "fecha de datos desde",
-   la misma configuración que la actual (HUELLA_CONFIG) y historial en todas.
+   la misma configuración que la actual (BD_HUELLA_CONFIG) y historial en todas.
 2. Decide desde cuándo releer: el 1° del mes RELEER_MESES antes del mes en curso.
    Si la última carga quedó más atrás (el pipeline no corrió unos días), relee
    desde el día siguiente a esa carga: nunca quedan huecos.
@@ -95,7 +95,7 @@ TIPOS_CATEGORIA: dict = {}
 SEGMENTOS_ACTIVIDAD: list = []
 MIN_CLIENTES_SEGMENTO = 1_000     # un segmento más chico usa los parámetros del panel completo
 
-COL_FECHA = "FECHA"
+COL_FECHA = "AT_FECHA"
 COL_VENTA = "MT_VENTA"
 COL_MARGEN = "MT_MARGEN"          # margen bruto en USD (venta - costo)
 
@@ -185,10 +185,20 @@ COL_VENTA_PROMO = "MT_VENTA_PROMO"
 DIAS_VENTANA = {"R6": 183, "R12": 365, "R24": 730, "R36": 1095}     # "hasta ayer"
 MESES_VENTANA = {"R6": 6, "R12": 12, "R24": 24, "R36": 36}          # "a mes cerrado"
 VENTANAS_VENTA = ["YTD", "YTD_MC", "R12", "R12_MC", "R6", "R6_MC", "R24", "R24_MC", "R36", "R36_MC"]
+VENTANAS_AP = ["YTD", "YTD_MC", "R12", "R12_MC", "R6", "R6_MC"]   # con su año pasado (_AP); R24 y R36 sin
 VENTANAS_MARGEN = ["R12", "R24", "R36"]      # MT_MARGENBRUTO_*, además del histórico
 VENTANAS_GALONES = ["R12", "R24", "R36"]     # MT_GALONES_*
 VARIANTES = ["R12", "R24", "R36"]            # frecuencia, ticket e IDD, además del histórico
 DECIMALES_GALONES = 3                        # con cuántos decimales se guardan en BD_HISTORIAL
+VENTANAS_MESES_COMPRA = ["R12", "R24", "R36", "YTD"]   # MT_MESES_CON_COMPRA_* (meses cerrados)
+ESPERADAS_ESTACIONAL = True    # compras esperadas del resto del año según la estacionalidad del cliente
+RACHA_PORCENTAJE = 0.8         # MT_RACHA_MESES_CUMPLE: meses seguidos con venta >= 80% de su promedio
+RACHA_BASE = "historico"       # su mes promedio de toda la historia | "mes": promedio de ese mes calendario
+
+# Umbrales de BD_ETAPA_CLIENTE. Sólo los que se quieran cambiar; el resto queda como en
+# StatsConfig (etapa_nuevo_dias=180, etapa_riesgo_prob=0.5, etapa_leal_meses=10, ...).
+# Ejemplo: ETAPA = {"etapa_riesgo_prob": 0.4, "etapa_leal_meses": 11}
+ETAPA = {}
 
 
 def en_fuente(col: Optional[str]) -> Optional[str]:
@@ -213,6 +223,7 @@ def build_config(fecha_ejecucion: str | None = None) -> StatsConfig:
         meses_ventana=dict(MESES_VENTANA),
         variantes=tuple(VARIANTES),
         ventanas_venta=tuple(VENTANAS_VENTA),
+        ventanas_ap=tuple(VENTANAS_AP),
         ventanas_margen=tuple(VENTANAS_MARGEN),
         ventanas_galones=tuple(VENTANAS_GALONES),
 
@@ -233,6 +244,12 @@ def build_config(fecha_ejecucion: str | None = None) -> StatsConfig:
         incluir_historial=True,   # la incremental lo necesita
         decimales_historial=2,
         decimales_galones=DECIMALES_GALONES,
+
+        ventanas_meses_compra=tuple(VENTANAS_MESES_COMPRA),
+        esperadas_estacional=ESPERADAS_ESTACIONAL,
+        racha_porcentaje=RACHA_PORCENTAJE,
+        racha_base=RACHA_BASE,
+        **ETAPA,
     )
 
 
@@ -323,13 +340,19 @@ def huella_config(cfg: StatsConfig) -> str:
     return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
 
 
+# Nombres que tenían las columnas de control antes de llevar prefijo (AT_ fechas, BD_ textos):
+# si la tabla los tiene, validar_tabla pide RENAME COLUMN en lugar de agregar columnas.
+NOMBRES_ANTERIORES = {"AT_FECHA_CORTE": "FECHA_CORTE", "AT_FECHA_DATOS_DESDE": "FECHA_DATOS_DESDE",
+                      "AT_FECHA_RELECTURA_DESDE": "FECHA_RELECTURA_DESDE", "BD_TIPO_CORRIDA": "TIPO_CORRIDA",
+                      "BD_HUELLA_CONFIG": "HUELLA_CONFIG", "AT_FECHA_CARGA": "FECHA_CARGA"}
+
 COLUMNAS_CONTROL = [
-    ("FECHA_CORTE", "DATE", "Último día incluido en el cálculo (el día anterior a la ejecución)."),
-    ("FECHA_DATOS_DESDE", "DATE", "Primer día de la fuente contenido en la historia: desde cuándo hay datos."),
-    ("FECHA_RELECTURA_DESDE", "DATE", "Desde qué día se releyó la fuente en la corrida que escribió la fila. "
-                                      "En una corrida completa coincide con FECHA_DATOS_DESDE."),
-    ("TIPO_CORRIDA", "VARCHAR2(20)", "COMPLETA o INCREMENTAL."),
-    ("HUELLA_CONFIG", "VARCHAR2(40)", "Resumen de la configuración (categorías, SQL de la fuente, historial). "
+    ("AT_FECHA_CORTE", "DATE", "Último día incluido en el cálculo (el día anterior a la ejecución)."),
+    ("AT_FECHA_DATOS_DESDE", "DATE", "Primer día de la fuente contenido en la historia: desde cuándo hay datos."),
+    ("AT_FECHA_RELECTURA_DESDE", "DATE", "Desde qué día se releyó la fuente en la corrida que escribió la fila. "
+                                      "En una corrida completa coincide con AT_FECHA_DATOS_DESDE."),
+    ("BD_TIPO_CORRIDA", "VARCHAR2(20)", "COMPLETA o INCREMENTAL."),
+    ("BD_HUELLA_CONFIG", "VARCHAR2(40)", "Resumen de la configuración (categorías, SQL de la fuente, historial). "
                                       "Si cambia, la próxima corrida es completa."),
 ]
 
@@ -345,7 +368,7 @@ def columnas_destino(cfg: StatsConfig) -> List[Tuple[str, str, str]]:
         cols.append((c.upper(), tipo_categoria(c), desc))
     cols += [(m.nombre, m.tipo, m.descripcion) for m in catalogo(cfg)]
     cols += COLUMNAS_CONTROL
-    cols.append(("FECHA_CARGA", "DATE", "Fecha y hora en que se cargó la fila."))
+    cols.append(("AT_FECHA_CARGA", "DATE", "Fecha y hora en que se cargó la fila."))
     return cols
 
 
@@ -354,7 +377,7 @@ def ddl_sugerido(cfg: StatsConfig) -> str:
     cols = columnas_destino(cfg)
     largos = [c for c, _, _ in cols if len(c) > 30]
     ancho = max(len(c) for c, _, _ in cols)
-    cuerpo = ",\n".join(f"    {c.ljust(ancho)}  {t}" + ("  DEFAULT SYSDATE" if c == "FECHA_CARGA" else "")
+    cuerpo = ",\n".join(f"    {c.ljust(ancho)}  {t}" + ("  DEFAULT SYSDATE" if c == "AT_FECHA_CARGA" else "")
                         for c, t, _ in cols)
     comentarios = "\n".join(
         f"COMMENT ON COLUMN {TABLA_DESTINO}.{c} IS '{d.replace(chr(39), chr(39) * 2)}';"
@@ -419,12 +442,18 @@ def validar_tabla(conn, cfg: StatsConfig) -> None:
     existentes = {c.upper() for c in enc["COLUMN_NAME"]}
     faltan = [(c, t, d) for c, t, d in columnas_destino(cfg) if c not in existentes]
     if faltan:
-        ancho = max(len(c) for c, _, _ in faltan)
-        cuerpo = ",\n".join(f"    {c.ljust(ancho)}  {t}" for c, t, _ in faltan)
+        # columnas de control con el nombre de antes (sin AT_ / BD_): se renombran, no se agregan
+        renombrar = {c: NOMBRES_ANTERIORES[c] for c, _, _ in faltan if NOMBRES_ANTERIORES.get(c) in existentes}
+        agregar = [(c, t) for c, t, _ in faltan if c not in renombrar]
+        partes = [f"ALTER TABLE {TABLA_DESTINO} RENAME COLUMN {v} TO {n};" for n, v in renombrar.items()]
+        if agregar:
+            ancho = max(len(c) for c, _ in agregar)
+            cuerpo = ",\n".join(f"    {c.ljust(ancho)}  {t}" for c, t in agregar)
+            partes.append(f"ALTER TABLE {TABLA_DESTINO} ADD (\n{cuerpo}\n);")
         comentarios = "\n".join(f"COMMENT ON COLUMN {TABLA_DESTINO}.{c} IS '{d.replace(chr(39), chr(39) * 2)}';"
                                 for c, _, d in faltan)
         raise RuntimeError(f"A {TABLA_DESTINO} le faltan columnas: {', '.join(c for c, _, _ in faltan)}\n\n"
-                           f"ALTER TABLE {TABLA_DESTINO} ADD (\n{cuerpo}\n);\n\n{comentarios}")
+                           + "\n".join(partes) + f"\n\n{comentarios}")
     log.info("tabla %s.%s validada: %d columnas", enc["OWNER"].iloc[0], tabla.upper(),
              len(columnas_destino(cfg)))
 
@@ -451,14 +480,14 @@ def _diagnosticar(conn, cfg: StatsConfig):
         return "el historial está desactivado y la incremental lo necesita", None
     e = _fetch_df(conn, f"""
         SELECT COUNT(*)                          AS FILAS,
-               COUNT(DISTINCT FECHA_CORTE)       AS N_CORTES,
-               MIN(FECHA_CORTE)                  AS CORTE,
-               COUNT(DISTINCT FECHA_DATOS_DESDE) AS N_DESDE,
-               MIN(FECHA_DATOS_DESDE)            AS DATOS_DESDE,
-               COUNT(DISTINCT HUELLA_CONFIG)     AS N_HUELLAS,
-               MIN(HUELLA_CONFIG)                AS HUELLA,
+               COUNT(DISTINCT AT_FECHA_CORTE)       AS N_CORTES,
+               MIN(AT_FECHA_CORTE)                  AS CORTE,
+               COUNT(DISTINCT AT_FECHA_DATOS_DESDE) AS N_DESDE,
+               MIN(AT_FECHA_DATOS_DESDE)            AS DATOS_DESDE,
+               COUNT(DISTINCT BD_HUELLA_CONFIG)     AS N_HUELLAS,
+               MIN(BD_HUELLA_CONFIG)                AS HUELLA,
                SUM(CASE WHEN BD_HISTORIAL IS NULL THEN 1 ELSE 0 END) AS SIN_HISTORIAL,
-               SUM(CASE WHEN HUELLA_CONFIG = '{HUELLA_VACIANDO}' THEN 1 ELSE 0 END) AS VACIANDO
+               SUM(CASE WHEN BD_HUELLA_CONFIG = '{HUELLA_VACIANDO}' THEN 1 ELSE 0 END) AS VACIANDO
           FROM {TABLA_DESTINO}""").iloc[0]
     if int(e["FILAS"]) == 0:
         return "la tabla destino está vacía", None
@@ -467,7 +496,7 @@ def _diagnosticar(conn, cfg: StatsConfig):
     if int(e["N_CORTES"]) != 1:
         return f"la tabla tiene {int(e['N_CORTES'])} fechas de corte distintas (carga incompleta o mezclada)", None
     if int(e["N_DESDE"]) != 1:
-        return "no se puede saber desde cuándo hay datos (FECHA_DATOS_DESDE vacía o mezclada)", None
+        return "no se puede saber desde cuándo hay datos (AT_FECHA_DATOS_DESDE vacía o mezclada)", None
     if int(e["N_HUELLAS"]) != 1 or e["HUELLA"] != huella_config(cfg):
         return ("la configuración cambió desde la última carga (categorías, SQL de la fuente o formato "
                 "del historial)"), None
@@ -616,10 +645,10 @@ def anotar(out: pd.DataFrame, cfg: StatsConfig, plan: Plan, fuente: pd.DataFrame
         releida = desde
     else:
         desde, releida = plan.datos_desde, plan.releer_desde
-    out["FECHA_DATOS_DESDE"] = desde
-    out["FECHA_RELECTURA_DESDE"] = releida
-    out["TIPO_CORRIDA"] = plan.tipo
-    out["HUELLA_CONFIG"] = huella_config(cfg)
+    out["AT_FECHA_DATOS_DESDE"] = desde
+    out["AT_FECHA_RELECTURA_DESDE"] = releida
+    out["BD_TIPO_CORRIDA"] = plan.tipo
+    out["BD_HUELLA_CONFIG"] = huella_config(cfg)
     return out
 
 
@@ -673,13 +702,13 @@ def guardar(conn, df: pd.DataFrame, cfg: StatsConfig) -> int:
     if df.empty:
         log.warning("no hay nada para guardar")
         return 0
-    cols = [(c, t) for c, t, _ in columnas_destino(cfg) if c != "FECHA_CARGA"]
+    cols = [(c, t) for c, t, _ in columnas_destino(cfg) if c != "AT_FECHA_CARGA"]
     faltan = [c for c, _ in cols if c not in df.columns]
     if faltan:
         raise KeyError(f"El resultado no tiene las columnas {faltan} (¿falta llamar a anotar()?)")
     nombres = [c for c, _ in cols]
     tipos = [t.split("(")[0] for _, t in cols]
-    sql = (f"INSERT INTO {TABLA_DESTINO} ({', '.join(nombres)}, FECHA_CARGA)\n"
+    sql = (f"INSERT INTO {TABLA_DESTINO} ({', '.join(nombres)}, AT_FECHA_CARGA)\n"
            f"VALUES ({', '.join(f':{i + 1}' for i in range(len(nombres)))}, SYSDATE)")
     datos = [df[c].to_numpy() for c in nombres]
     ajustes = {}
@@ -749,7 +778,7 @@ def _borrar_en_lotes(conn, cur) -> None:
     1. Lee todos los ROWID en un solo recorrido, ANTES de borrar: leer de un cursor abierto
        mientras se confirma sobre la misma tabla termina en ORA-01555 (snapshot too old).
        Se guardan como bytes: 9 millones ocupan ~160 MB.
-    2. Marca la última fila que se va a borrar con HUELLA_CONFIG = 'VACIANDO' y confirma.
+    2. Marca la última fila que se va a borrar con BD_HUELLA_CONFIG = 'VACIANDO' y confirma.
        Si el borrado se corta a la mitad, esa fila queda y la próxima corrida sabe que la
        tabla está incompleta (hace una completa en vez de una incremental sobre medio estado).
     3. Borra por ROWID en orden, confirmando cada lote. La marcada cae en el último.
@@ -770,7 +799,7 @@ def _borrar_en_lotes(conn, cur) -> None:
     total = len(rowids)
     log.info("%s ROWID leídos de %s en %.1fs; se borran de a %s con COMMIT", f"{total:,}", TABLA_DESTINO,
              time.time() - t0, f"{int(LOTE_DELETE):,}")
-    cur.execute(f"UPDATE {TABLA_DESTINO} SET HUELLA_CONFIG = :h WHERE ROWID = CHARTOROWID(:r)",
+    cur.execute(f"UPDATE {TABLA_DESTINO} SET BD_HUELLA_CONFIG = :h WHERE ROWID = CHARTOROWID(:r)",
                 {"h": HUELLA_VACIANDO, "r": rowids[-1].decode()})
     conn.commit()
     lote = max(int(LOTE_DELETE), 1)

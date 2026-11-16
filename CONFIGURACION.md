@@ -33,17 +33,22 @@ Variables de entorno comunes: `ORA_USER`, `ORA_PASSWORD`, `ORA_DSN` para el orig
 | `MIN_BASE_PORCENTAJE` | venta mínima para calcular un margen % (ver abajo) | si tenés ventas microscópicas |
 | `SUMA_EXACTA`, `MAX_DECIMALES`, `TOLERANCIA_CERO` | cómo se suma el dinero (ver abajo) | casi nunca |
 | `COL_GALONES`, `COL_VENTA_PROMO` | alias de galones y de venta de promociones en `SQL_FUENTE`. Cada uno se usa sólo si la consulta lo devuelve; si no, sus columnas no salen | si cambian los alias |
-| `VENTANAS_VENTA` | ventanas de `MT_VENTA_*` y de `MT_VENTA_PROMO_*`, cada una con su año pasado (`_AP`) | para sumar o quitar ventanas |
+| `VENTANAS_VENTA` | ventanas de `MT_VENTA_*` y de `MT_VENTA_PROMO_*` | para sumar o quitar ventanas |
+| `VENTANAS_AP` | cuáles de esas ventanas tienen además su año pasado (`_AP`). Por defecto YTD, R6 y R12 (con sus _MC); R24 y R36 van sin `_AP` | para sumar o quitar años pasados |
 | `VENTANAS_MARGEN`, `VENTANAS_GALONES` | ventanas de `MT_MARGENBRUTO_*` y de `MT_GALONES_*` | ídem |
 | `DIAS_VENTANA`, `MESES_VENTANA`, `VARIANTES` | cuántos días / meses es cada `Rn`, y las variantes de frecuencia, ticket e IDD | rara vez |
 | `DECIMALES_GALONES` | decimales de los galones en `BD_HISTORIAL` (la incremental los relee de ahí) | si los galones traen más de 3 |
+| `VENTANAS_MESES_COMPRA` | ventanas de `MT_MESES_CON_COMPRA_*`, en meses cerrados (`Rn` = últimos n meses, `YTD` = los del año) | para sumar o quitar ventanas |
+| `ESPERADAS_ESTACIONAL` | reparte `MT_COMPRAS_ESPERADAS_RESTO_ANIO` según los meses fuertes y flojos del cliente (con 24 meses o más de historia) | `False` para usar sólo el modelo |
+| `RACHA_PORCENTAJE`, `RACHA_BASE` | `MT_RACHA_MESES_CUMPLE`: meses seguidos con venta de al menos ese % (0,8) de su promedio; `historico` = su mes promedio de toda la historia, `mes` = el promedio de ese mes calendario (no corta la racha en los meses flojos de su temporada) | si la racha sale muy corta o muy larga |
+| `ETAPA` | umbrales del árbol de `BD_ETAPA_CLIENTE` que se quieran cambiar, por ejemplo `{"etapa_riesgo_prob": 0.4}`. Los nombres y valores por defecto están en `StatsConfig` (`etapa_*`) | si las etapas no reparten bien a la cartera |
 
 Una ventana se escribe `YTD`, `YTD_MC`, `Rn` (los últimos `DIAS_VENTANA[Rn]` días hasta ayer) o
 `Rn_MC` (los últimos `MESES_VENTANA[Rn]` meses cerrados). Para una ventana nueva, por ejemplo
 `R48`, se agrega a `DIAS_VENTANA` y `MESES_VENTANA` y después a la lista que corresponda.
 
 **Venta de promociones**: es la parte de la venta que vino de promociones, y tiene las mismas
-columnas que la venta por ventana (`MT_VENTA_PROMO_YTD` … `MT_VENTA_PROMO_R36_MC_AP`) más
+columnas que la venta por ventana (`MT_VENTA_PROMO_YTD` … `MT_VENTA_PROMO_R36_MC`, con `_AP` en las mismas ventanas) más
 `MT_VOLUMENCOMPRA_PROMO`. Si en la fuente no viene en su propia columna sino marcada por fila,
 en `SQL_FUENTE` va `SUM(CASE WHEN v.ES_PROMO = 1 THEN v.VENTA ELSE 0 END) AS MT_VENTA_PROMO`.
 
@@ -64,7 +69,7 @@ puede hacer `TRUNCATE` (no es dueño de la tabla, o no se permite DDL desde el p
 `delete_lotes` es para tablas grandes donde un solo `DELETE` se queda sin undo. No usa
 `WHERE ROWNUM <= N` repetido, porque cada vuelta recorre de nuevo todo lo ya borrado. Lee una vez
 los `ROWID` (9 millones ocupan unos 160 MB en memoria) y borra cada lote yendo directo a sus
-filas. Antes de empezar marca la última fila a borrar con `HUELLA_CONFIG = 'VACIANDO'`: si el
+filas. Antes de empezar marca la última fila a borrar con `BD_HUELLA_CONFIG = 'VACIANDO'`: si el
 borrado se corta, esa fila queda y la próxima corrida sabe que la tabla está incompleta.
 
 El procedimiento es `AUTHID DEFINER`: trunca con los permisos del dueño y sólo esa tabla, y el
@@ -83,6 +88,13 @@ tal cual.
 Al sumar columnas, el notebook corta en la validación de la tabla e imprime el `ALTER TABLE ... ADD`
 con el `COMMENT` de cada columna nueva. Como cambia `SQL_FUENTE`, la primera corrida después es
 completa sola (la huella no coincide); de ahí en adelante vuelve a ser incremental.
+
+**Columnas de control con prefijo**: siguen la regla de nombres (`AT_` fechas, `BD_` textos):
+`AT_FECHA_CORTE`, `AT_FECHA_DATOS_DESDE`, `AT_FECHA_RELECTURA_DESDE`, `BD_TIPO_CORRIDA`,
+`BD_HUELLA_CONFIG` y `AT_FECHA_CARGA`. Si la tabla todavía tiene los nombres sin prefijo, el
+notebook corta e imprime un `ALTER TABLE ... RENAME COLUMN` por cada una (no las agrega de nuevo,
+así no se pierde nada). La fecha de la fuente se llama `AT_FECHA` (`COL_FECHA`); un
+`st_oracle.py` con `COL_FECHA = "FECHA"` sigue funcionando igual.
 
 Variables de entorno: `ST_MODO`, `ST_RELEER_MESES`, `ST_RELEER_DESDE`, `ST_FECHA_EJECUCION`, `ST_DRY_RUN`.
 

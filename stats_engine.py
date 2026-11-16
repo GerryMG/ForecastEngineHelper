@@ -5,11 +5,11 @@ stats_engine
 Motor de estadísticas descriptivas por cliente (o por cualquier combinación de
 categorías), misma filosofía que ``forecast_engine``.
 
-Entrada  : tabla larga -> [categorías..., FECHA, MT_VENTA, MT_MARGEN]
+Entrada  : tabla larga -> [categorías..., AT_FECHA, MT_VENTA, MT_MARGEN]
            (+ MT_GALONES y MT_VENTA_PROMO si están configuradas)
            a cualquier granularidad; el motor la lleva a grano diario.
 Salida   : una fila por combinación de claves con todas las métricas del
-           catálogo (ver ``catalogo()``) más BD_HISTORIAL y FECHA_CORTE.
+           catálogo (ver ``catalogo()``) más BD_HISTORIAL y AT_FECHA_CORTE.
 
 Categorías
 ----------
@@ -135,7 +135,7 @@ class StatsConfig:
     """Parámetros del cálculo. Los defaults son las definiciones acordadas."""
 
     categorias: Sequence[str] = field(default_factory=list)
-    col_fecha: str = "FECHA"
+    col_fecha: str = "AT_FECHA"
     col_venta: str = "MT_VENTA"
     col_margen: str = "MT_MARGEN"
     #: galones (volumen físico). None = la fuente no los trae y sus columnas no salen.
@@ -155,10 +155,14 @@ class StatsConfig:
         "R6": 6, "R12": 12, "R24": 24, "R36": 36})
     #: variantes de frecuencia, ticket e IDD (además del histórico)
     variantes: Tuple[str, ...] = ("R12", "R24", "R36")
-    #: ventanas de MT_VENTA_* y MT_VENTA_PROMO_*, cada una con su año pasado (_AP).
+    #: ventanas de MT_VENTA_* y MT_VENTA_PROMO_*.
     #: YTD, YTD_MC, Rn (días hasta ayer) o Rn_MC (meses cerrados)
     ventanas_venta: Tuple[str, ...] = ("YTD", "YTD_MC", "R12", "R12_MC", "R6", "R6_MC",
                                        "R24", "R24_MC", "R36", "R36_MC")
+    #: cuáles de esas ventanas tienen además su año pasado (MT_VENTA_*_AP y MT_VENTA_PROMO_*_AP).
+    #: Es un filtro: una ventana que no esté en ventanas_venta se ignora.
+    #: Por defecto las que ya lo tenían; R24 y R36 van sin _AP.
+    ventanas_ap: Tuple[str, ...] = ("YTD", "YTD_MC", "R12", "R12_MC", "R6", "R6_MC")
     #: ventanas de MT_MARGENBRUTO_* (además del histórico)
     ventanas_margen: Tuple[str, ...] = ("R12", "R24", "R36")
     #: ventanas de MT_GALONES_*
@@ -196,6 +200,38 @@ class StatsConfig:
     segmentos_actividad: Sequence[str] = ()
     #: un segmento con menos grupos que esto usa los parámetros del panel completo
     min_clientes_segmento: int = 1_000
+
+    #: ventanas de MT_MESES_CON_COMPRA_* (meses cerrados): Rn = últimos n meses, YTD = los del año
+    ventanas_meses_compra: Tuple[str, ...] = ("R12", "R24", "R36", "YTD")
+    #: compras esperadas en lo que queda del año: repartirlas según la estacionalidad del
+    #: cliente (MT_PROM_*) cuando tiene al menos esta cantidad de meses cerrados de historia
+    esperadas_estacional: bool = True
+    esperadas_min_meses_estacional: int = 24
+    #: MT_RACHA_MESES_CUMPLE: meses seguidos en que la venta llegó al menos a este % de su promedio
+    racha_porcentaje: float = 0.8
+    #: contra qué promedio: "historico" (su mes promedio de toda la historia) o "mes" (el
+    #: promedio de ese mes calendario, MT_PROM_<mes>: no castiga los meses flojos de su temporada)
+    racha_base: str = "historico"
+
+    #: BD_ETAPA_CLIENTE: árbol de decisión, se evalúa en este orden y gana la primera regla
+    etapa_nuevo_dias: int = 180                  #: NUEVO: primera compra hace menos de N días
+    etapa_perdido_prob: float = 0.2              #: PERDIDO: probabilidad de actividad menor que esto,
+    etapa_perdido_dias: int = 365                #: o sin comprar más de N días
+    etapa_perdido_veces_frecuencia: float = 4.0  #:   y más de N veces su frecuencia
+    etapa_riesgo_prob: float = 0.5               #: EN RIESGO: probabilidad menor que esto,
+    etapa_riesgo_desvios: float = 2.0            #:   o atraso de más de N desvíos
+    etapa_alerta_desvios: float = 1.0            #: EN ALERTA: atraso de más de N desvíos
+    etapa_recuperado_dias: int = 90              #: RECUPERADO: volvió en los últimos N días
+    etapa_recuperado_hueco: int = 180            #:   después de más de N días sin comprar
+    etapa_recuperado_veces_frecuencia: float = 3.0  #:  y de más de N veces su frecuencia
+    etapa_declive_ratio: float = 0.7             #: EN DECLIVE: último año < N x el año anterior
+    etapa_leal_meses: int = 10                   #: LEAL: compró en N o más de los últimos 12 meses
+    etapa_leal_cv: float = 0.5                   #:   con desvío / frecuencia menor que esto
+    etapa_ocasional_meses: int = 4               #: OCASIONAL: compró en N meses o menos de los últimos 12
+    #: piso del desvío al medir el atraso: un cliente que compra exacto cada 7 días (desvío 0)
+    #: no queda "infinitamente atrasado" por un día
+    etapa_desvio_minimo: float = 1.0
+
     incluir_historial: bool = True     #: armar BD_HISTORIAL
     decimales_historial: int = 2
     decimales_galones: int = 3         #: galones en BD_HISTORIAL
@@ -232,6 +268,8 @@ class StatsConfig:
             raise ValueError("max_decimales debe estar entre 0 y 15")
         if not 0 <= self.tolerancia_cero < 1:
             raise ValueError("tolerancia_cero debe estar entre 0 y 1 (0 = sin limpieza)")
+        if self.racha_base not in ("historico", "mes"):
+            raise ValueError("racha_base debe ser 'historico' o 'mes'")
         if self.modelo_actividad not in MODELOS_ACTIVIDAD:
             raise ValueError(f"modelo_actividad debe ser uno de {list(MODELOS_ACTIVIDAD)}")
         fuera = [c for c in self.segmentos_actividad if c not in self.categorias]
@@ -240,8 +278,11 @@ class StatsConfig:
         faltan =[v for v in self.variantes if v not in self.dias_ventana or v not in self.meses_ventana]
         if faltan:
             raise ValueError(f"Variantes sin ventana definida: {faltan}")
-        malas = [v for v in (*self.ventanas_venta, *self.ventanas_margen, *self.ventanas_galones)
+        malas = [v for v in (*self.ventanas_venta, *self.ventanas_margen, *self.ventanas_galones,
+                             *(f"{v}_MC" for v in self.ventanas_meses_compra if v != "YTD"))
                  if not self.ventana_valida(v)]
+        if "R12" not in self.dias_ventana or "R24" not in self.dias_ventana or "R12" not in self.meses_ventana:
+            raise ValueError("BD_ETAPA_CLIENTE necesita R12 y R24 en dias_ventana y R12 en meses_ventana")
         if malas:
             raise ValueError(f"Ventanas sin definir en dias_ventana / meses_ventana: {malas}")
         if len(set(self.medidas().values())) != len(self.medidas()):
@@ -635,6 +676,11 @@ def volumen_compra(ctx: Contexto, medida: str = "venta") -> np.ndarray:
     return ctx.suma(ctx.gid, ctx.medida(medida), neta=True)
 
 
+def volumen_galones(ctx: Contexto) -> np.ndarray:
+    """Galones de toda la historia, en su propia escala decimal (exacta)."""
+    return ctx.suma(ctx.gid, ctx.medida("galones"), neta=True, escala=ctx.escala_galones)
+
+
 def _intervalos_en_ventana(ctx: Contexto, ventana: Optional[str]):
     iv = ctx.intervalos
     if ventana is None:
@@ -838,6 +884,110 @@ def venta_cumplida_actual(ctx: Contexto) -> np.ndarray:
     return ctx.suma(ctx.gid, ctx.venta, (ctx.dia >= ini) & (ctx.dia <= ctx.f.d_ayer), neta=True)
 
 
+# ── I. Hábito ───────────────────────────────────────────────────────────────
+def _meses_ventana(ctx: Contexto, ventana: str) -> Tuple[int, int]:
+    """(primer mes, último mes) cerrados de la ventana, como índices de mes."""
+    fin = ctx.f.m_mc
+    if ventana == "YTD":
+        return _mes_idx(pd.Timestamp(year=ctx.f.hoy.year, month=1, day=1)), fin
+    return fin - ctx.cfg.meses_ventana[ventana] + 1, fin
+
+
+def meses_con_compra(ctx: Contexto, ventana: str) -> np.ndarray:
+    """En cuántos meses cerrados de la ventana hubo compra (YTD en enero = 0)."""
+    ini, fin = _meses_ventana(ctx, ventana)
+    mm = ctx.mensual
+    return ctx.conteo(mm["gid"], (mm["mes"] >= ini) & (mm["mes"] <= fin))
+
+
+def _racha(ctx: Contexto, k: np.ndarray) -> np.ndarray:
+    """Largo del tramo de meses seguidos que termina en el último mes cerrado, contando
+    sólo las filas de ctx.mensual marcadas en `k` (un mes que no está corta la racha)."""
+    mm = ctx.mensual
+    k = k & (mm["mes"] <= ctx.f.m_mc)
+    g, m = mm["gid"][k], mm["mes"][k]
+    out = np.zeros(ctx.G)
+    if not len(g):
+        return out
+    corte = np.r_[True, (g[1:] != g[:-1]) | (m[1:] != m[:-1] + 1)]
+    inicio_tramo = np.flatnonzero(corte)[np.cumsum(corte) - 1]
+    ultimo = np.r_[g[1:] != g[:-1], True]               # última fila de cada grupo
+    i = np.flatnonzero(ultimo)
+    out[g[i]] = np.where(m[i] == ctx.f.m_mc, i - inicio_tramo[i] + 1, 0)
+    return out
+
+
+def racha_meses(ctx: Contexto) -> np.ndarray:
+    """Meses cerrados seguidos con compra, terminando en el último mes cerrado (0 si ese
+    mes no compró)."""
+    return _racha(ctx, np.ones(len(ctx.mensual["gid"]), dtype=bool))
+
+
+def racha_meses_cumple(ctx: Contexto) -> np.ndarray:
+    """Meses cerrados seguidos, hasta el último mes cerrado, en que la venta del mes llegó
+    al menos al `racha_porcentaje` de su promedio. racha_base = "historico": el promedio
+    mensual de toda su historia (meses cerrados desde su primer mes, sin compra = 0);
+    "mes": el promedio de ese mes calendario (MT_PROM_<mes>), que respeta la temporada.
+    Nulo si el promedio no es positivo."""
+    cfg = ctx.cfg
+    mm = ctx.mensual
+    if cfg.racha_base == "mes":
+        return _racha_cumple_mes(ctx)
+    else:
+        lo = ctx.primer_mes
+        dentro = (mm["mes"] >= lo[mm["gid"]]) & (mm["mes"] <= ctx.f.m_mc)
+        n = np.maximum(ctx.f.m_mc - lo + 1, 0).astype(float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            prom = ctx.suma(mm["gid"], mm["venta"], dentro) / n
+        umbral_fila = cfg.racha_porcentaje * prom[mm["gid"]]
+        valido = prom > 0
+    with np.errstate(invalid="ignore"):
+        cumple = mm["venta"] >= umbral_fila
+    return np.where(valido, _racha(ctx, cumple), np.nan)
+
+
+def _racha_cumple_mes(ctx: Contexto) -> np.ndarray:
+    """Racha contra el promedio de cada mes calendario. Un mes sin compra corta la racha
+    sólo si en ese mes calendario el cliente suele comprar (promedio > 0): el que compra
+    sólo en diciembre no "falla" en marzo. La racha es la distancia entre el último mes
+    cerrado y el último mes que falló (o el mes anterior a su primera compra).
+
+    Todo en O(filas del mensual), sin matrices densas de meses: el último mes faltante de
+    cada mes calendario sale de cuántos años seguidos hacia atrás aparece ese mes."""
+    cfg = ctx.cfg
+    mm = ctx.mensual
+    fin, lo = ctx.f.m_mc, ctx.primer_mes
+    prom = ctx.estacional[0]                                         # G x 12 (NaN sin años)
+    k = mm["mes"] <= fin
+    g, m, v = mm["gid"][k], mm["mes"][k], mm["venta"][k]
+    c = m % 12
+    ultima_falla = lo.astype(float) - 1.0                            # nada falló: desde el inicio
+    if len(g):
+        # 1) meses con compra que no llegaron al umbral
+        with np.errstate(invalid="ignore"):
+            falla = ~(v >= cfg.racha_porcentaje * prom[g, c])
+        np.maximum.at(ultima_falla, g[falla], m[falla].astype(float))
+        # 2) meses sin compra de un mes calendario en que suele comprar: por cada (grupo, mes
+        #    calendario), cuántos años seguidos aparece contando desde el más reciente
+        orden = np.lexsort((-m, c, g))
+        g2, c2, m2 = g[orden], c[orden], m[orden]
+        bloque = np.r_[True, (g2[1:] != g2[:-1]) | (c2[1:] != c2[:-1])]
+        inicio = np.flatnonzero(bloque)
+        rango = np.arange(len(g2)) - inicio[np.cumsum(bloque) - 1]
+        ultimo_cal = fin - (fin - c2) % 12                           # último mes de ese calendario
+        seguido = m2 == ultimo_cal - 12 * rango
+        corridos = np.add.reduceat(seguido.astype(np.int64), inicio)
+        gb, cb = g2[inicio], c2[inicio]
+        faltante = (fin - (fin - cb) % 12) - 12 * corridos           # primer año que no aparece
+        with np.errstate(invalid="ignore"):
+            cuenta = (prom[gb, cb] > 0) & (faltante >= lo[gb])
+        np.maximum.at(ultima_falla, gb[cuenta], faltante[cuenta].astype(float))
+    racha = fin - ultima_falla
+    with np.errstate(invalid="ignore"):
+        valido = (np.nansum(prom, axis=1) > 0) & (lo <= fin)
+    return np.where(valido, np.maximum(racha, 0.0), np.nan)
+
+
 # ── G. Actividad ────────────────────────────────────────────────────────────
 MODELOS_ACTIVIDAD = {"bgnbd": "BG/NBD", "mbgnbd": "MBG/NBD", "pareto": "Pareto/NBD"}
 _NOMBRES_PARAMS = {"bgnbd": ("r", "alpha", "a", "b"), "mbgnbd": ("r", "alpha", "a", "b"),
@@ -1018,6 +1168,181 @@ def prob_activo(params, x, tx, T, modelo: str = "pareto", hilos: Optional[int] =
         return _mapear(lambda a, b, c: _prob_activo(params, a, b, c, modelo), (x, tx, T), pool, hilos)
 
 
+def compras_esperadas_modelo(params, x, tx, T, t, prob, modelo: str = "pareto") -> np.ndarray:
+    """Días de compra esperados en los próximos `t` días, dado (x, tx, T): E[Y(t) | x, tx, T].
+
+    Pareto/NBD: Schmittlein, Morrison & Colombo (1987). BG/NBD: Fader, Hardie & Lee (2005),
+    ec. 10. MBG/NBD: Batislam, Denizel & Filiztekin (2007). `prob` es P(activo) del mismo
+    modelo, que ya está calculada. En BG y MBG la hipergeométrica se pasa por la
+    transformación de Euler, que la deja acotada aunque el cliente tenga miles de compras.
+    """
+    from scipy.special import hyp2f1
+    x, tx, T = (np.asarray(v, float) for v in (x, tx, T))
+    t = np.broadcast_to(np.asarray(t, float), x.shape)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        if modelo == "pareto":
+            r, alpha, s, beta = params
+            L = np.log(beta + T) - np.log(beta + T + t)                     # <= 0
+            k = s - 1.0
+            # (1 - ((b+T)/(b+T+t))^(s-1)) / (s-1); con s = 1 queda -L
+            factor = -np.expm1(k * L) / k if abs(k) > 1e-9 else -L
+            return (r + x) * (beta + T) / (alpha + T) * factor * prob
+        r, alpha, a, b = params
+        if a <= 1.0:                       # la esperanza no es finita con a <= 1
+            return np.full(x.shape, np.nan)
+        z = t / (alpha + T + t)
+        if modelo == "mbgnbd":
+            pre = (a + b + x) / (a - 1.0)
+            f = hyp2f1(a + b - r, a - 1.0, a + b + x, z)
+        else:
+            pre = (a + b + x - 1.0) / (a - 1.0)
+            f = hyp2f1(a + b - 1.0 - r, a - 1.0, a + b + x - 1.0, z)
+        return pre * (1.0 - (1.0 - z) ** (a - 1.0) * f) * prob
+
+
+def _dias_resto_anio(f: Fechas) -> np.ndarray:
+    """Días desde hoy hasta el 31 de diciembre, por mes calendario (12 posiciones)."""
+    dias = pd.date_range(f.hoy, pd.Timestamp(year=f.hoy.year, month=12, day=31), freq="D")
+    return np.bincount(dias.month - 1, minlength=12).astype(float)
+
+
+def compras_esperadas(ctx: Contexto, horizonte: str) -> np.ndarray:
+    """horizonte "12M" = los próximos 365 días; "RESTO_ANIO" = de hoy al 31 de diciembre,
+    repartido según la estacionalidad del cliente si tiene historia suficiente."""
+    cfg = ctx.cfg
+    prob = ctx.actividad
+    x = ctx.dias_compra - 1
+    tx = (ctx.ultima - ctx.primera).astype(float)
+    T = (ctx.f.d_ayer - ctx.primera).astype(float)
+    por_mes = _dias_resto_anio(ctx.f) if horizonte == "RESTO_ANIO" else None
+    t = 365.0 if por_mes is None else float(por_mes.sum())
+    out = np.full(ctx.G, np.nan)
+    for seg in np.unique(ctx.segmento_usado):
+        idx = np.flatnonzero(ctx.segmento_usado == seg)
+        params = tuple(ctx.parametros_actividad[seg].values())
+        out[idx] = compras_esperadas_modelo(params, x[idx], tx[idx], T[idx], t, prob[idx], cfg.modelo_actividad)
+    if por_mes is not None and cfg.esperadas_estacional and t > 0:
+        prom = np.clip(ctx.estacional[0], 0.0, None)                    # G x 12
+        base = prom.mean(axis=1)
+        meses = ctx.f.m_mc - ctx.primer_mes + 1
+        with np.errstate(divide="ignore", invalid="ignore"):
+            factor = (prom @ por_mes) / (base * t)
+        ok = (meses >= cfg.esperadas_min_meses_estacional) & (base > 0) & np.isfinite(factor)
+        out = np.where(ok, out * factor, out)
+    return out
+
+
+# ── J. Etapa del cliente ────────────────────────────────────────────────────
+ETAPAS = ("NUEVO", "PERDIDO", "EN RIESGO", "EN ALERTA", "RECUPERADO", "EN DECLIVE", "LEAL", "OCASIONAL",
+          "ACTIVO")
+
+
+def _num(v: float, dec: int = 0) -> str:
+    """Número a la española: 12.345,6."""
+    s = f"{v:,.{dec}f}"
+    return s.replace(",", "§").replace(".", ",").replace("§", ".")
+
+
+def _etapa(ctx: Contexto) -> Tuple[np.ndarray, np.ndarray]:
+    """Árbol de decisión: cada regla se evalúa en orden y el cliente queda en la primera
+    que cumple. Devuelve (etapa, motivo)."""
+    if hasattr(ctx, "_etapa_cache"):
+        return ctx._etapa_cache
+    cfg = ctx.cfg
+    G = ctx.G
+    sin_compra = dias_sin_compra(ctx)
+    desde_primera = (ctx.f.d_ayer - ctx.primera).astype(float)
+    prob = ctx.actividad
+    frec_h = frecuencia_compra(ctx)
+    frec = frecuencia_compra(ctx, "R12")
+    desv = frecuencia_compra_std(ctx, "R12")
+    usa_h = np.isnan(frec)                                   # sin intervalos en R12: el histórico
+    frec = np.where(usa_h, frec_h, frec)
+    desv = np.where(usa_h, frecuencia_compra_std(ctx), desv)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        atraso = (sin_compra - frec) / np.maximum(desv, cfg.etapa_desvio_minimo)
+        cv = desv / frec
+    meses12 = meses_con_compra(ctx, "R12")
+    v12 = venta_ventana(ctx, "R12")
+    v_ant = venta_ventana(ctx, "R24") - v12
+    # el hueco más largo que terminó en los últimos `etapa_recuperado_dias` (la vuelta) y hace
+    # cuántos días fue esa vuelta: el cliente puede haber comprado varias veces después
+    iv = ctx.intervalos
+    hueco = np.full(G, np.nan)
+    volvio = np.full(G, np.nan)
+    rec = iv["hasta"] >= ctx.f.d_ayer - cfg.etapa_recuperado_dias
+    if rec.any():
+        g, dd, hasta = iv["gid"][rec], iv["dias"][rec], iv["hasta"][rec]
+        orden = np.lexsort((dd, g))                          # por grupo, el hueco más largo al final
+        g, dd, hasta = g[orden], dd[orden], hasta[orden]
+        ult = np.r_[g[1:] != g[:-1], True]
+        hueco[g[ult]] = dd[ult]
+        volvio[g[ult]] = ctx.f.d_ayer - hasta[ult]
+
+    with np.errstate(invalid="ignore"):
+        reglas = [
+            ("NUEVO", desde_primera < cfg.etapa_nuevo_dias),
+            ("PERDIDO", (prob < cfg.etapa_perdido_prob)
+             | ((sin_compra > cfg.etapa_perdido_dias)
+                & ~(sin_compra <= cfg.etapa_perdido_veces_frecuencia * frec))),
+            ("EN RIESGO", (prob < cfg.etapa_riesgo_prob) | (atraso > cfg.etapa_riesgo_desvios)),
+            ("EN ALERTA", atraso > cfg.etapa_alerta_desvios),
+            ("RECUPERADO", (hueco > cfg.etapa_recuperado_hueco)
+             & (hueco > cfg.etapa_recuperado_veces_frecuencia * frec_h)),
+            ("EN DECLIVE", (v_ant > 0) & (v12 < cfg.etapa_declive_ratio * v_ant)),
+            ("LEAL", (meses12 >= cfg.etapa_leal_meses) & (cv < cfg.etapa_leal_cv)),
+            ("OCASIONAL", meses12 <= cfg.etapa_ocasional_meses),
+            ("ACTIVO", np.ones(G, dtype=bool)),
+        ]
+    etapa = np.empty(G, dtype=object)
+    motivo = np.empty(G, dtype=object)
+    libre = np.ones(G, dtype=bool)
+
+    def ritmo(i):
+        return (f"compra cada {_num(frec[i])} días, lleva {_num(sin_compra[i])} sin comprar"
+                if np.isfinite(frec[i]) else f"lleva {_num(sin_compra[i])} días sin comprar")
+
+    def texto(nombre, i):
+        if nombre == "NUEVO":
+            return f"primera compra hace {_num(desde_primera[i])} días"
+        if nombre in ("PERDIDO", "EN RIESGO"):
+            umbral = cfg.etapa_perdido_prob if nombre == "PERDIDO" else cfg.etapa_riesgo_prob
+            if prob[i] < umbral:
+                return f"probabilidad de actividad {_num(prob[i], 2)}; {ritmo(i)}"
+            if nombre == "EN RIESGO":
+                return f"atraso de {_num(atraso[i], 1)} desvíos ({ritmo(i)})"
+            return ritmo(i)
+        if nombre == "EN ALERTA":
+            return f"atraso de {_num(atraso[i], 1)} desvíos ({ritmo(i)})"
+        if nombre == "RECUPERADO":
+            return f"volvió hace {_num(volvio[i])} días después de {_num(hueco[i])} sin comprar"
+        if nombre == "EN DECLIVE":
+            return (f"último año {_num(v12[i])}, {_num(100 * v12[i] / v_ant[i])}% del anterior "
+                    f"({_num(v_ant[i])})")
+        if nombre == "LEAL":
+            return f"compró en {_num(meses12[i])} de los últimos 12 meses, ritmo parejo"
+        if nombre == "OCASIONAL":
+            return f"compró en {_num(meses12[i])} de los últimos 12 meses, dentro de su ritmo"
+        return f"al día con su ritmo ({ritmo(i)})"
+
+    for nombre, cumple in reglas:
+        toca = libre & cumple
+        idx = np.flatnonzero(toca)
+        etapa[idx] = nombre
+        motivo[idx] = [texto(nombre, i) for i in idx]
+        libre &= ~toca
+    ctx._etapa_cache = (etapa, motivo)
+    return ctx._etapa_cache
+
+
+def etapa_cliente(ctx: Contexto) -> np.ndarray:
+    return _etapa(ctx)[0]
+
+
+def etapa_motivo(ctx: Contexto) -> np.ndarray:
+    return _etapa(ctx)[1]
+
+
 # ── H. Historial ────────────────────────────────────────────────────────────
 def historial_json(ctx: Contexto) -> np.ndarray:
     """JSON por grupo: {"f0": primera compra, "d": días desde f0, "v": venta, "m": margen},
@@ -1132,27 +1457,29 @@ def catalogo(cfg: Optional[StatsConfig] = None) -> List[Metrica]:
     # A. Venta por ventana
     for v in cfg.ventanas_venta:
         add(f"MT_VENTA_{v}", f"Venta {periodo(v)}. USD.", venta_ventana, ventana=v)
-        add(f"MT_VENTA_{v}_AP", f"Año pasado de MT_VENTA_{v}: la misma ventana corrida un año atrás. USD.",
-            venta_ventana, ventana=v, ap=True)
+        if v in cfg.ventanas_ap:
+            add(f"MT_VENTA_{v}_AP", f"Año pasado de MT_VENTA_{v}: la misma ventana corrida un año atrás. USD.",
+                venta_ventana, ventana=v, ap=True)
 
     # A. Venta de promociones por ventana: las mismas ventanas que la venta
     if cfg.col_venta_promo:
         for v in cfg.ventanas_venta:
             add(f"MT_VENTA_PROMO_{v}", f"Venta que vino de promociones {periodo(v)}. USD.",
                 venta_ventana, ventana=v, medida="promo")
-            add(f"MT_VENTA_PROMO_{v}_AP",
-                f"Año pasado de MT_VENTA_PROMO_{v}: la misma ventana corrida un año atrás. USD.",
-                venta_ventana, ventana=v, ap=True, medida="promo")
+            if v in cfg.ventanas_ap:
+                add(f"MT_VENTA_PROMO_{v}_AP",
+                    f"Año pasado de MT_VENTA_PROMO_{v}: la misma ventana corrida un año atrás. USD.",
+                    venta_ventana, ventana=v, ap=True, medida="promo")
 
     # A. Galones por ventana
     if cfg.col_galones:
         for v in cfg.ventanas_galones:
-            add(f"MT_GALONES_{v}", f"Galones comprados {periodo(v)} (neto de devoluciones).",
+            add(f"MT_GALONES_{v}", f"Galones comprados {periodo(v)}.",
                 galones_ventana, ventana=v)
 
     # B. Comportamiento
     add("MT_MAXMONEY", "Máxima venta en un día de compra (suma del día). USD.", max_money)
-    add("MT_MINMONEY", "Mínima venta en un día de compra; negativa si hubo devolución neta. USD.", min_money)
+    add("MT_MINMONEY", "Mínima venta en un día de compra. USD.", min_money)
     add("MT_MAXDAYS", "Máximo de días sin comprar entre dos días de compra (dos días seguidos = 0). Nulo con un solo día de compra.", max_days)
     add("MT_MINDAYS", "Mínimo de días sin comprar entre dos días de compra (dos días seguidos = 0). Nulo con un solo día de compra.", min_days)
     add("MT_RANGODIAS", "Días entre el primer y el último día de compra.", rango_dias)
@@ -1176,11 +1503,14 @@ def catalogo(cfg: Optional[StatsConfig] = None) -> List[Metrica]:
             margen_bruto, ventana=v)
 
     # B (cont.)
-    add("MT_DIASCOMPRADOS", "Cantidad de días distintos con compra, incluidos días con devolución.", dias_comprados)
+    add("MT_DIASCOMPRADOS", "Cantidad de días distintos con compra.", dias_comprados)
     add("MT_VOLUMENCOMPRA", "Venta total de toda la historia. USD.", volumen_compra)
     if cfg.col_venta_promo:
         add("MT_VOLUMENCOMPRA_PROMO", "Venta total de toda la historia que vino de promociones. USD.",
             volumen_compra, medida="promo")
+    if cfg.col_galones:
+        add("MT_VOLUMENCOMPRA_GALONES", "Galones comprados en toda la historia.",
+            volumen_galones)
 
     variantes("MT_FRECUENCIACOMPRA",
               "Cada cuántos días compra en promedio: promedio de días entre días de compra consecutivos (compra diaria = 1). Histórico.",
@@ -1198,6 +1528,20 @@ def catalogo(cfg: Optional[StatsConfig] = None) -> List[Metrica]:
               "Desvío estándar de la venta por día de compra. Histórico. USD.",
               lambda v: f"Desvío estándar de la venta por día de compra en los últimos {d[v]} días. USD.",
               ticket_promedio_std)
+
+    # I. Hábito
+    for v in cfg.ventanas_meses_compra:
+        desde = ("del año en curso (0 en enero)" if v == "YTD"
+                 else f"de los últimos {cfg.meses_ventana[v]}")
+        add(f"MT_MESES_CON_COMPRA_{v}", f"En cuántos meses cerrados {desde} compró.", meses_con_compra, ventana=v)
+    add("MT_RACHA_MESES", "Meses cerrados seguidos con compra hasta el último mes cerrado (0 si ese mes no compró).",
+        racha_meses)
+    base_racha = ("su venta mensual promedio de toda la historia" if cfg.racha_base == "historico"
+                  else "el promedio de ese mes calendario (MT_PROM_)")
+    add("MT_RACHA_MESES_CUMPLE",
+        f"Meses cerrados seguidos, hasta el último mes cerrado, en que la venta del mes llegó al menos al "
+        f"{cfg.racha_porcentaje:.0%} de {base_racha}. Nulo si ese promedio no es positivo.",
+        racha_meses_cumple)
 
     # G. Actividad
     modelo = MODELOS_ACTIVIDAD[cfg.modelo_actividad]
@@ -1245,6 +1589,23 @@ def catalogo(cfg: Optional[StatsConfig] = None) -> List[Metrica]:
     add("MT_VENTA_CUMPLIDA_ACTUAL", "Venta real del mes en curso, desde el día 1 hasta ayer. USD.", venta_cumplida_actual)
 
     add("MT_PROB_INACTIVO", f"Probabilidad de que el cliente esté inactivo: 1 - MT_PROB_ACTIVO ({modelo}).", prob_inactivo_col)
+
+    # G. Compras esperadas
+    add("MT_COMPRAS_ESPERADAS_12M",
+        f"Días de compra esperados en los próximos 12 meses (modelo {modelo}; ya descuenta la probabilidad de que el cliente se haya ido).",
+        compras_esperadas, horizonte="12M")
+    est = (f", repartidos según su estacionalidad si tiene {cfg.esperadas_min_meses_estacional} meses o más de historia"
+           if cfg.esperadas_estacional else "")
+    add("MT_COMPRAS_ESPERADAS_RESTO_ANIO",
+        f"Días de compra esperados desde hoy hasta el 31 de diciembre (modelo {modelo}{est}).",
+        compras_esperadas, horizonte="RESTO_ANIO")
+
+    # J. Etapa del cliente
+    add("BD_ETAPA_CLIENTE",
+        "Etapa del cliente según un árbol de decisión (gana la primera regla que cumple): " + ", ".join(ETAPAS) + ".",
+        etapa_cliente, tipo="VARCHAR2(20)")
+    add("BD_ETAPA_MOTIVO", "Por qué el cliente quedó en su etapa, con los números que la deciden.",
+        etapa_motivo, tipo="VARCHAR2(200)")
 
     # H. Historial
     extra = ((", p = venta de promociones USD" if cfg.col_venta_promo else "")
@@ -1365,7 +1726,7 @@ class StatsEngine:
             t0 = time.time()
             salida[m.nombre] = m.calcular(ctx)
             self.tiempos_[m.nombre] = time.time() - t0
-        salida["FECHA_CORTE"] = np.full(ctx.G, f.ayer)
+        salida["AT_FECHA_CORTE"] = np.full(ctx.G, f.ayer)
 
         out = pd.DataFrame(salida)
         if ctx.bases_chicas:
